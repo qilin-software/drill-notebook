@@ -41,8 +41,7 @@ class SessionContextUsageTest {
         wiring = ChatLegacyWiring.wire(source, jdbc);
         ai = new AiService(new AiConfigRepository(jdbc), wiring.sessions(), new ApiKeyEncryptor(),
                 new ObjectMapper(), null, wiring.turnService(), wiring.cipher(), null);
-        ai.setContextOccupancy(new SessionContextOccupancyService(source, wiring.cipher(), null,
-                wiring.turnService(), new ObjectMapper()));
+        ai.setContextOccupancy(new SessionContextOccupancyService(source, wiring.turnService(), new ObjectMapper()));
         ai.saveConfig(TestModelLimits.config("provider", "mock", "endpoint", "mock://local", "model", "local-demo", "apiKey", "test-only"));
         sessionId = wiring.sessions().create("累计用量", null);
     }
@@ -77,7 +76,7 @@ class SessionContextUsageTest {
     private static long number(Map<?, ?> values, String key) { return ((Number) values.get(key)).longValue(); }
 
     @Test void sumsMultipleTurnsAndToolRequestsButKeepsLatestContextIndependent() throws Exception {
-        long prefix = number((Map<?, ?>) ai.sessionContextUsage(sessionId).get("current"), "tokens");
+        assertNull(ai.sessionContextUsage(sessionId).get("current"), "没有实际请求时不能把配置前缀当成模型上下文");
         String first = turn(sessionId);
         observe(first, 10000, 6000, 300);
         observe(first, 12400, 10000, 400);
@@ -91,7 +90,7 @@ class SessionContextUsageTest {
         wiring.sessions().recordTurnContext(second, 14400, 1000000, 12900, 979);
         Map<String, Object> read = ai.sessionContextUsage(sessionId);
         assertEquals(14400, ((Map<?, ?>) read.get("latest")).get("inputTokens"));
-        assertEquals(prefix + 36, number((Map<?, ?>) read.get("current"), "tokens"));
+        assertNull(read.get("current"), "缺失请求快照时不拿历史存储或累计用量拼出窗口占用");
         Map<?, ?> usage = (Map<?, ?>) read.get("cumulative");
         assertEquals(3, number(usage, "requests"));
         assertEquals(36800, number(usage, "inputTokens"));
@@ -109,7 +108,7 @@ class SessionContextUsageTest {
         String request = turn(sessionId); observe(request, 100, 60, 10);
         var before = ai.sessionContextUsage(sessionId);
         var failed = org.mockito.Mockito.mock(SessionContextOccupancyService.class);
-        org.mockito.Mockito.when(failed.read(org.mockito.ArgumentMatchers.eq(sessionId), org.mockito.ArgumentMatchers.any(ContextTokenBreakdown.class)))
+        org.mockito.Mockito.when(failed.read(sessionId))
                 .thenThrow(new IllegalStateException("fixture read failure"));
         ai.setContextOccupancy(failed);
         var after = ai.sessionContextUsage(sessionId);
@@ -117,6 +116,21 @@ class SessionContextUsageTest {
         assertEquals(before.get("model"), after.get("model"));
         assertEquals(before.get("contextWindow"), after.get("contextWindow"));
         assertEquals(before.get("cumulative"), after.get("cumulative"));
+    }
+
+    @Test void theCircleKeepsTheActualRequestsFrozenModelAndWindowAfterSelectionChanges() throws Exception {
+        String request = turn(sessionId);
+        var input = new RequestContextAnalyzer(new ObjectMapper()).analyze(Map.of("model", "accepted-model", "messages",
+                List.of(Map.of("role", "user", "content", "实际请求"))), 32000, "CHAT", Set.of());
+        var state = wiring.metadata().read(sessionId).orElseThrow();
+        var snapshot = ModelContextSnapshot.from(input, state.contextGeneration(), state.historyRevision()).withOutput(50);
+        var saved = wiring.cipher().withModelContext(wiring.cipher().encrypt("fixture-result", "test-only"), snapshot);
+        jdbc.update("UPDATE ai_chat_turn SET result_meta_crypto = ? WHERE request_id = ?", saved.meta(), request);
+        var actual = ai.sessionContextUsage(sessionId);
+        assertEquals("accepted-model", actual.get("model"), "配置选择已是 local-demo，实际请求仍按受理模型计算");
+        assertEquals(32000, actual.get("contextWindow"));
+        assertEquals((long) input.estimatedInputTokens() + 50, number((Map<?, ?>) actual.get("current"), "tokens"));
+        assertEquals(0, number((Map<?, ?>) actual.get("cumulative"), "requests"), "读取快照不创建模型请求");
     }
 
     @Test void normalizesOpenAiAndAnthropicCachesWithoutChangingChargedLedger() throws Exception {

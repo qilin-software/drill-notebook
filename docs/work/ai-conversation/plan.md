@@ -121,9 +121,9 @@ SessionModelChoiceTest,AiSessionTitleServiceTest,DatabaseInitializerTest,Schema9
 
 ## 上下文统计与逐请求详情（2026-11-15）
 
-当前圆环 / 卡片顶部使用全局保留上下文占用，下方为累计输入总量、缓存命中、未命中和输出；模型名在左下与详情入口同一行。「查看上下文详情」打开「上下文」，顶部为当前会话卡片，其下提供按请求选择、分类展开与前次请求增减对比；底部本轮累计块已移除。参考 [dsh-context](https://github.com/bowenliang123/dsh-context/tree/eadff0dd29cd2312e33501ffc9f6075e0b529eae) 的组成浏览方式，本项目保留中日韩加权估算器，分项标 `≈`，实测用量独立，不复制费用仪表盘或插件代码。阈值触发压缩和统一上下文策略一起规划在 [v0.8.3](../../state/v0.8.3-features.md)；当前发送仍采用既有有界投影与输入预算。
+当前圆环 / 卡片顶部使用最后实际主请求及其响应快照，下方为会话累计输入总量、缓存命中、未命中和输出；模型名在左下与详情入口同一行。「查看上下文详情」打开「上下文」，顶部为当前会话卡片，其下提供按请求选择、分类展开与前次请求增减对比；底部本轮累计块已移除。参考 [dsh-context](https://github.com/bowenliang123/dsh-context/tree/eadff0dd29cd2312e33501ffc9f6075e0b529eae) 的组成浏览方式，本项目保留中日韩加权估算器，分项标 `≈`，实测用量独立。阈值触发压缩和窗口驱动的历史保留一起规划在 [v0.8.3](../../state/v0.8.3-features.md)；当前发送仍采用既有有界投影与输入预算。
 
-以下为全局占用修正前的累计与逐请求详情验证基线；现行全局占用和本次复验结果见本节末。
+以下为累计与逐请求详情、旧全局正文占用的历史验证基线。逐行计全部本地历史的口径已被修正，现行定义与最终复验见本节末「实际请求快照统计修正」。
 
 | 检查 | 结果与范围 |
 |---|---|
@@ -149,6 +149,8 @@ SessionContextUsageTest,RequestContextAnalyzerTest,ChatInPlaceRetryTest,ChatHist
 
 ### 全局占用与卡片布局修正（2026-11-15）
 
+> 历史实现记录：本节逐行统计全库正文的口径已由下文的实际请求快照修正替代，不是现行窗口统计规则。
+
 `SessionContextOccupancyService` 逐行读取当前代未清理的全部正文与 RECEIVED 插话，不受历史驻留或单请求预算限制。有效摘要按 coverage 替换旧原文，最近两轮与缺口保留；固定前缀、当前轮额外组成及尚未落库的回复各计一份。新加密元数据保存版本化数值，旧密文按需解密、只缓存数字；当前占用无法完整估算时保留下界。发送仍使用原有投影 / 输入预算，v0.8.3 再加入按设置阈值触发的压缩。
 
 | 检查 | 本次结果 |
@@ -173,6 +175,8 @@ SessionContextOccupancyTest,SessionContextExtrasTest,TokenEstimatorTest,ChatMess
 
 ### 当前卡片与名称调整（2026-11-15）
 
+> 历史验证记录：布局与名称继续沿用；占用来源已改为最后实际主请求及其响应，见下文。
+
 按用户确认的设计，标题统一为「上下文」、入口为「查看上下文详情」；移除原底部「本轮累计用量」，在上下文浏览器上方加入当前会话卡片。占用总量、分类及流式快照来自同一次计数，当前卡片与圆环共享会话查询，不随历史请求选择变化。未保存有效分类的旧额外内容归入 OTHER，累计用量继续在输入区小卡片与现有账本保留。
 
 pi、Codex、OpenCode 和 Claude Code 的调查结果、当前发送 / 占用差异及统一方向已写入 [v0.8.3 规划](../../state/v0.8.3-features.md)，与阈值压缩一起实现。本次不改外发历史预算或压缩策略。
@@ -187,3 +191,24 @@ pi、Codex、OpenCode 和 Claude Code 的调查结果、当前发送 / 占用差
 本次后端复跑：`pwsh -NoProfile -File temp/context-inspector-20261115/run-validation.ps1`；打包追加 `-Package`，同步用同目录 `sync-artifacts.ps1 -Backend` / `-Frontend`。前端从根目录执行 `npm --workspace frontend run test -- src/components/ai-memory/CurrentContextCard.test.tsx src/components/ai-memory/ChatContextInspector.test.tsx src/components/ai-memory/RequestContextBrowser.test.tsx src/components/ai-memory/MemoryUsageBadge.test.tsx src/components/ai-session/ContextMeter.test.tsx src/components/AiAssistant.context.test.tsx src/components/AiAssistant.window.test.tsx`，构建输出在新建根 temp/ 下。落盘审计使用 `scripts/portable-audit.ps1 -AppRoot temp/context-inspector-20261115 -RunScript temp/context-inspector-20261115/run-portable.ps1`，静态扫描沿用 `cache/portable-registry-audit.ps1`。
 
 当前清单、接口、数据模型、规格、UI/UX 和 QA 已同步，v0.8.3 仍为规划。真实供应商 Token 对账、浏览器视觉 / Electron 实机和完整发行验收未执行；没有修改用户数据库、暂存、提交或发布。
+
+### 实际请求快照统计修正（2026-11-15）
+
+按用户最终澄清，上下文总量及圆环表示最后一次主模型实际请求的快照，并计入该次正在生成或已生成的输出；输入 / 输出 / 缓存行表示会话累计用量。移除运行链中全库正文与额外组成的拼接计数，沿用现有最终请求分析器建立数值快照；每次主请求替换快照，NATIVE_WEB 子请求只记账。流式计数只含该次响应，终态保存同一快照，不用整轮拼接回答重算。历史版本不匹配、换代及缺失快照保持未知；旧请求缺完整输出和断流未完整回报时保留下界。模型与窗口随真实请求冻结，较小请求可以降低占用。
+
+| 检查 | 最终结果与范围 |
+|---|---|
+| 后端相关回归 | 15 类 / 189 项全部通过，0 失败、0 错误、0 跳过；14 类合跑 178 项，原生联网补测 11 项，仅按所选类的最终报告合并，不重复计数 |
+| 实际请求与隔离 | 自动恢复 26 项含两种协议连续两轮、HTTP 实际接收请求、流式续接与该次输出；联网对话 11 项含原生子请求期间主快照保持、子请求 20 Token 只计累计而主输出仅加 5 Token |
+| 快照与兼容 | 占用 13 项、累计 14 项、投影 20 项及既有原地重试 / 派发 / 生命周期 / 附件 / 容量回归通过；覆盖 602 条本地消息不额外进入窗口、同请求分类合计、较小请求降低占用、流式 → 终态 → 重开一致、清理 / 换代、损坏数值、Long、旧数据下界与窗口冻结 |
+| 前端相关回归 | 3 文件 / 41 项全部通过：ContextMeter 14、CurrentContextCard 6、ChatContextInspector 21；窗口 / 累计独立、上下顺序、共享刷新、空值 / 下界 / 超窗、历史请求选择与迟到响应隔离 |
+| 构建与开发产物 | TypeScript / Vite、后端隔离打包通过；正式源码 264 文件与测试 190 文件在新目录编译。124 个前端输出逐一核对并同步，696 个应用 class 与 JAR 逐一同哈希，开发 JAR 已同步，SHA-256 `431AF7FE5F409238050DF662CEFC2D29FEFDC9A0BE5ABCDD27F85768DCF39E0F` |
+| 便携审计 | 178 项后端回归包裹在现有运行时落盘审计中，通过且受监控外部新增 / 改写为 0；静态扫描 768 个文件，仅既有合法 Process 环境恢复。快照复用现有 APP_ROOT 数据库，无新增表 / 列或系统持久化落点 |
+
+原生联网补测首次有 2 项因 Mockito 的 when 覆盖提前执行旧响应断言而失败；改为 doAnswer 覆盖后该类 11 项全部复验通过，生产联网协议未改变。保留既有编译、Mockito 与 Vite 大分块提示。
+
+后端完整复跑：`pwsh -NoProfile -File temp/context-snapshot-20261115-final/run-validation.ps1`，默认选择上述 15 类；打包追加 `-Package`，同步使用同目录 `sync-artifacts.ps1 -Frontend -Backend`。本次报告位于该新目录的 backend-build/surefire-reports，未使用前次目录中的旧 class 或报告。
+
+前端根目录命令：`npm --workspace frontend run test -- src/components/ai-session/ContextMeter.test.tsx src/components/ai-memory/CurrentContextCard.test.tsx src/components/ai-memory/ChatContextInspector.test.tsx`；构建使用新目录 `run-frontend.ps1`。运行时审计命令：`pwsh -NoProfile -File scripts/portable-audit.ps1 -AppRoot temp/context-snapshot-20261115-final -RunScript temp/context-snapshot-20261115-final/run-validation.ps1`，本次审计执行的是加入联网补测前的 14 类 / 178 项；证据在 `temp/portable-audit-a27352bb-0f9a-4e2e-b93c-8e519da39229/`。静态扫描沿用 `cache/portable-registry-audit.ps1`。
+
+当前清单、接口、数据模型、规格、UI/UX 与 QA 已同步最后请求快照口径。输入与分类仍为对实际外发内容的本地估算，累计不使用估算补数；真实供应商精确 Token 对账、Electron 实机、业务全量和完整发行验收未执行。测试使用工作区隔离数据，当前仍为 v0.8.2，窗口保留策略与压缩留在 v0.8.3；未暂存、提交或推送。完全退出软件后重新打开以加载修正后的后端。

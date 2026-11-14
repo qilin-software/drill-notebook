@@ -58,6 +58,7 @@ class WebToolChatPathTest {
         session = wiring.sessions().create("联网验收", "stub");
         ai = new AiService(new AiConfigRepository(jdbc), wiring.sessions(), new ApiKeyEncryptor(), json, null,
                 wiring.turnService(), wiring.cipher(), stack.contexts());
+        ai.setContextOccupancy(new SessionContextOccupancyService(ds, wiring.turnService(), json));
         toolSettings = new AiToolSettingsRepository(jdbc); ai.setToolSettings(toolSettings);
         webSettings = new WebSearchSettingsService(new WebSearchSettingsRepository(jdbc), new ApiKeyEncryptor());
         policy = new PublicWebPolicy(host -> new InetAddress[]{InetAddress.getByName("8.8.8.8")});
@@ -190,6 +191,11 @@ class WebToolChatPathTest {
                 "tools", true, "streaming", false));
         webSettings.save(json.valueToTree(Map.of("revision", 0, "preferNative", true)));
         var main = mock(AiUpstreamClient.class); ReflectionTestUtils.setField(ai, "upstreamClient", main);
+        var builder = new AiUpstreamClient(null, json);
+        when(main.buildChatCompletionRequest(any(), anyList(), anyBoolean(), anyList())).thenAnswer(call ->
+                builder.buildChatCompletionRequest(call.getArgument(0), call.getArgument(1), call.getArgument(2), call.getArgument(3)));
+        when(main.buildAnthropicRequest(any(), anyList(), anyBoolean(), anyList())).thenAnswer(call ->
+                builder.buildAnthropicRequest(call.getArgument(0), call.getArgument(1), call.getArgument(2), call.getArgument(3)));
         when(main.callWithTools(any(), anyList(), anyList(), anyBoolean(), any(), anyInt(), any())).thenAnswer(call -> {
             mainTargets.add(call.getArgument(0));
             requests.add(json.valueToTree(Map.of("messages", call.getArgument(1), "tools", call.getArgument(2))));
@@ -207,10 +213,25 @@ class WebToolChatPathTest {
                 Map.of("type", "web_search_call", "status", "completed", "action", Map.of("type", "search", "sources", List.of(Map.of("url", URL, "title", "真实标题")))),
                 Map.of("type", "message", "content", List.of(Map.of("type", "output_text", "text", SEARCH_TEXT,
                         "annotations", List.of(Map.of("type", "url_citation", "url", URL, "title", "真实标题")))))), "usage", Map.of("input_tokens", 50, "output_tokens", 20));
-        when(nativeHttp.request(anyString(), any(), anyMap(), anyString(), anyInt(), any())).thenReturn(
-                new WebHttpClient.Reply(200, "application/json", json.writeValueAsBytes(response), null, null, null));
+        when(nativeHttp.request(anyString(), any(), anyMap(), anyString(), anyInt(), any())).thenAnswer(call -> {
+            var current = (Map<?, ?>) ai.sessionContextUsage(session).get("current");
+            assertEquals(lastMainInput() + 5, current.get("tokens"), "原生联网子请求不能替换仍在等待工具结果的主上下文");
+            return new WebHttpClient.Reply(200, "application/json", json.writeValueAsBytes(response), null, null, null);
+        });
         ai.setNativeWebClient(new NativeWebClient(nativeHttp, policy));
         return nativeHttp;
+    }
+
+    private long lastMainInput() throws Exception {
+        long input = -1;
+        for (String value : jdbc.queryForList("SELECT context_breakdown FROM ai_usage_attempt"
+                + " WHERE purpose='CHAT' ORDER BY created_at, id", String.class)) {
+            if (value == null) continue;
+            var context = json.readTree(value);
+            if ("CHAT".equals(context.path("kind").asText())) input = context.path("estimatedInputTokens").asLong();
+        }
+        assertTrue(input >= 0, "主请求必须保存实际构造的输入摘要");
+        return input;
     }
 
     @ParameterizedTest @ValueSource(booleans = {false, true})
@@ -225,6 +246,8 @@ class WebToolChatPathTest {
         assertEquals(3, jdbc.queryForObject("SELECT count(*) FROM ai_usage_attempt WHERE settled_at IS NOT NULL AND purpose='CHAT'", Integer.class));
         assertEquals(70, jdbc.queryForObject("SELECT sum(input_tokens) FROM ai_usage_attempt WHERE purpose='CHAT'", Integer.class));
         assertEquals(30, jdbc.queryForObject("SELECT sum(output_tokens) FROM ai_usage_attempt WHERE purpose='CHAT'", Integer.class));
+        var current = (Map<?, ?>) ai.sessionContextUsage(session).get("current");
+        assertEquals(lastMainInput() + 5, current.get("tokens"), "主上下文只追加最后主请求的 5 Token，原生子请求的 20 Token 仅记入累计");
         String fingerprint = UsageRepository.targetFingerprint(anthropic ? "https://api.anthropic.com/v1" : "https://api.openai.com/v1",
                 anthropic ? "anthropic_messages" : "openai_responses", anthropic ? "claude-sonnet-4-6" : "gpt-5.2");
         assertEquals(20, jdbc.queryForObject("SELECT sum(output_tokens) FROM ai_usage_attempt WHERE target_fingerprint=?", Integer.class, fingerprint));
@@ -253,11 +276,11 @@ class WebToolChatPathTest {
                 Map.of("type", "web_search_call", "status", "completed", "action", Map.of("type", "search", "sources", List.of(Map.of("url", URL, "title", "来源")))),
                 Map.of("type", "message", "content", List.of(Map.of("type", "output_text", "text", SEARCH_TEXT)))));
         var reply = new WebHttpClient.Reply(200, "application/json", json.writeValueAsBytes(response), null, null, null);
-        when(nativeHttp.request(anyString(), any(), anyMap(), anyString(), anyInt(), any())).thenAnswer(call -> {
+        doAnswer(call -> {
             ai.saveConfig(TestModelLimits.config("provider", "custom", "endpoint", "https://api.openai.com/v1", "apiKey", "fake-native-key",
                     "model", "gpt-5.4", "apiFormat", "chat_completions", "tools", true, "streaming", false));
             return reply;
-        });
+        }).when(nativeHttp).request(anyString(), any(), anyMap(), anyString(), anyInt(), any());
         assertEquals("COMPLETED", ai.chat(body()).get("status"));
         assertEquals(List.of("gpt-5.2", "gpt-5.2"), mainTargets.stream().map(AiUpstreamClient.Upstream::model).toList());
         verify(nativeHttp).request(anyString(), any(), anyMap(), argThat(value -> value.contains("\"model\":\"gpt-5.2\"")), anyInt(), any());
@@ -265,10 +288,10 @@ class WebToolChatPathTest {
 
     @Test void stoppingDuringNativeRetrievalSettlesUsageAndDoesNotRunFallbackOrAnotherModelRequest() throws Exception {
         var nativeHttp = nativeFixture(false); var body = body();
-        when(nativeHttp.request(anyString(), any(), anyMap(), anyString(), anyInt(), any())).thenAnswer(call -> {
+        doAnswer(call -> {
             WebRequestContext context = call.getArgument(5); context.handle().requestCancel(); context.check();
             throw new AssertionError("cancel should have stopped this attempt");
-        });
+        }).when(nativeHttp).request(anyString(), any(), anyMap(), anyString(), anyInt(), any());
         assertEquals("ABORTED", ai.chat(body).get("status"));
         assertEquals(1, requests.size());
         assertEquals(2, jdbc.queryForObject("SELECT count(*) FROM ai_usage_attempt WHERE settled_at IS NOT NULL AND purpose='CHAT'", Integer.class));

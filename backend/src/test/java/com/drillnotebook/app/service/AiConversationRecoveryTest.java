@@ -21,6 +21,7 @@ import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import org.junit.jupiter.api.*;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
@@ -49,8 +50,7 @@ class AiConversationRecoveryTest {
         session = wiring.sessions().create("恢复验收", "stub");
         ai = new AiService(new AiConfigRepository(jdbc), wiring.sessions(), new ApiKeyEncryptor(), json, null,
                 wiring.turnService(), wiring.cipher(), stack.contexts());
-        ai.setContextOccupancy(new SessionContextOccupancyService(ds, wiring.cipher(), stack.projection(),
-                wiring.turnService(), json));
+        ai.setContextOccupancy(new SessionContextOccupancyService(ds, wiring.turnService(), json));
         server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
         server.createContext("/", exchange -> {
             JsonNode request = json.readTree(exchange.getRequestBody()); requests.add(request);
@@ -113,6 +113,42 @@ class AiConversationRecoveryTest {
         }
         return contexts;
     }
+
+    private long receivedInput(int index, Map<?, ?> current, Set<String> tools) {
+        Map<String, Object> wire = json.convertValue(requests.get(index),
+                new com.fasterxml.jackson.core.type.TypeReference<Map<String, Object>>() { });
+        return new RequestContextAnalyzer(json).analyze(wire, ((Number) current.get("contextWindow")).intValue(),
+                "CHAT", tools).estimatedInputTokens();
+    }
+
+    @ParameterizedTest @ValueSource(strings = { "chat_completions", "anthropic" })
+    void twoNormalTurnsUseOnlyTheLastReceivedRequestAndItsResponse(String apiFormat) throws Exception {
+        scenario = "success"; format = apiFormat; config();
+        var first = run(body(), ignored -> { });
+        var secondBody = new java.util.HashMap<String, Object>(body());
+        secondBody.put("input", Map.of("userText", "第二轮新的问题"));
+        var second = run(secondBody, ignored -> { });
+        assertEquals("COMPLETED", first.status()); assertEquals("COMPLETED", second.status());
+        assertEquals(2, requests.size());
+        var current = (Map<?, ?>) ai.sessionContextUsage(session).get("current");
+        long output = apiFormat.equals("chat_completions") ? 5 : new TokenEstimator(json).estimateText(second.text());
+        long lastInput = receivedInput(1, current, Set.of());
+        assertEquals(lastInput + output, current.get("tokens"));
+        assertNotEquals(receivedInput(0, current, Set.of()) + lastInput + output * 2, current.get("tokens"),
+                "两个请求的消耗不能累计成当前窗口占用");
+        assertEquals(secondBody.get("requestId"), current.get("requestId"));
+        assertTrue(requests.get(1).toString().contains(first.text()), "上轮回答只随实际历史进入本次输入");
+        assertEquals(2, jdbc.queryForObject("SELECT COUNT(*) FROM ai_chat_turn", Integer.class));
+        var cumulative = (Map<?, ?>) ai.sessionContextUsage(session).get("cumulative");
+        assertEquals(2L, cumulative.get("requests"));
+        if (apiFormat.equals("chat_completions")) {
+            assertEquals(20L, cumulative.get("inputTokens"));
+            assertEquals(10L, cumulative.get("outputTokens"));
+            assertEquals(30L, cumulative.get("totalTokens"));
+        } else assertNull(cumulative.get("totalTokens"), "供应商未回报的累计用量不能用估算填充");
+        assertEquals(current, new SessionContextOccupancyService(Schema9Fixture.dataSource(root), wiring.turnService(), json).read(session),
+                "重开数据库仍读取同一份最后请求快照");
+    }
     @Test void httpFailureRecoversWithinOneTurnAndKeepsRealAttemptCounts() {
         config(); var body = body(); var result = run(body, ignored -> {});
         assertEquals("COMPLETED", result.status()); assertEquals(2, requests.size());
@@ -125,7 +161,7 @@ class AiConversationRecoveryTest {
         assertFalse(recovery.toString().contains("fake-fixture-key"));
     }
 
-    @Test void streamRecoveryKeepsLiveAndStoredGlobalOccupancyConsistent() {
+    @Test void streamRecoveryKeepsTheActualContinuationRequestAndItsOwnResponseAsCurrentContext() throws Exception {
         scenario = "partial"; config(); var request = body();
         var live = new ArrayList<Long>();
         var result = ai.chatStream(request, (kind, text) -> {
@@ -141,7 +177,10 @@ class AiConversationRecoveryTest {
         assertTrue(live.get(1) > live.get(0));
         var stored = (Map<?, ?>) ai.sessionContextUsage(session).get("current");
         assertEquals(false, stored.get("active"));
-        assertEquals(live.get(1), stored.get("tokens"), "落库后不重复加入还在注册表的输出数值");
+        var contexts = recordedContexts();
+        assertEquals(receivedInput(1, stored, Set.of()) + 5, stored.get("tokens"),
+                "最后一次续接请求已包含前半句，只追加该次供应商回报的输出，不再加整轮拼接后的回答");
+        assertEquals(receivedInput(1, stored, Set.of()), (long) contexts.get(1).estimatedInputTokens());
         assertEquals(true, stored.get("complete"));
         assertEquals(2, requests.size(), "统计不会多发供应商请求");
     }
@@ -193,6 +232,19 @@ class AiConversationRecoveryTest {
         assertEquals(1, requests.size()); assertEquals("ABORTED", result.status()); assertEquals("保留前半句。", result.text());
         assertEquals("stopped", ((AiRecovery) result.resultView().get("recovery")).state());
         assertEquals(0, ((AiRecovery) result.resultView().get("recovery")).attempt());
+    }
+
+    @Test void anInterruptedUnreportedOutputPersistsOnlyTheKnownContextLowerBound() {
+        scenario = "partial"; format = "anthropic"; config(); var body = body();
+        var result = run(body, value -> {
+            if (value.state().equals("waiting")) wiring.turnService().cancelActive((String) body.get("requestId"));
+        });
+        assertEquals("ABORTED", result.status()); assertEquals(1, requests.size());
+        var current = (Map<?, ?>) ai.sessionContextUsage(session).get("current");
+        assertEquals(false, current.get("complete"), "缺少终止帧和输出回报时不能把已捕获片段当作完整输出");
+        assertEquals(receivedInput(0, current, Set.of()) + new TokenEstimator(json).estimateText(result.text()), current.get("tokens"));
+        assertEquals(false, current.get("active"));
+        assertEquals(current, new SessionContextOccupancyService(Schema9Fixture.dataSource(root), wiring.turnService(), json).read(session));
     }
 
     @Test void nonStreamAuthFailurePersistsRecoveryWithoutLeavingAnActiveTurn() {
@@ -281,6 +333,9 @@ class AiConversationRecoveryTest {
         var cumulative = (Map<?, ?>) ai.sessionContextUsage(session).get("cumulative");
         assertEquals(3L, cumulative.get("requests"));
         assertEquals(45L, cumulative.get("totalTokens"));
+        var current = (Map<?, ?>) ai.sessionContextUsage(session).get("current");
+        assertEquals(receivedInput(2, current, Set.of("create_material")) + 5, current.get("tokens"),
+                "工具结果与中断前回答只随最后请求输入计算，该次输出只追加一次");
         assertFalse(jdbc.queryForList("SELECT context_breakdown FROM ai_usage_attempt").toString().contains("fixture-saved"));
     }
 

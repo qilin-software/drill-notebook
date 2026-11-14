@@ -35,6 +35,7 @@ public class ActiveTurnRegistry {
         private volatile AiRecovery recovery;
         /** 当前轮尚未落库的回复长度；只保存数值，不保留流式正文。 */
         private volatile ContextTokens contextTokens = new ContextTokens(0, null);
+        private volatile ModelContextSnapshot modelContext;
 
         Handle(String requestId, long sessionId) {
             this.requestId = requestId;
@@ -61,6 +62,14 @@ public class ActiveTurnRegistry {
         public void recovery(AiRecovery value) { recovery = value; }
 
         public ContextTokens contextTokens() { return contextTokens; }
+        public ModelContextSnapshot modelContext() { return modelContext; }
+        public synchronized void modelContext(ModelContextSnapshot value) { modelContext = value; }
+        public synchronized void modelContextOutputTokens(long value) {
+            if (modelContext != null) modelContext = modelContext.withOutput(Math.max(0, value));
+        }
+        public synchronized void modelContextIncomplete() {
+            if (modelContext != null) modelContext = modelContext.incomplete();
+        }
         public long contextOutputTokens() { return contextTokens.outputTokens(); }
         public synchronized void contextOutputTokens(long value) {
             contextTokens = new ContextTokens(Math.max(0, value), contextTokens.extraTokens(), contextTokens.extraCategories());

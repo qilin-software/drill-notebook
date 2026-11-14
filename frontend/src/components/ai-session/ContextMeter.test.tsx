@@ -26,7 +26,7 @@ const current = (tokens: number, requestId = 'r1') => ({ tokens, requestId, esti
 beforeEach(() => { vi.clearAllMocks(); readContext.mockResolvedValue(audit()); });
 
 describe('上下文占用', () => {
-  it('用当前会话全局上下文计算窗口占用，累计用量与最近请求都不会顶替它', async () => {
+  it('用当前主请求及响应快照计算窗口占用，累计用量与旧请求实测不会顶替它', async () => {
     apiGet.mockResolvedValue({ sessionId: 5, model: 'deepseek-reasoner', contextWindow: 128000, outputReserve: 8192,
       latest: { requestId: 'r1', inputTokens: 52400, contextWindow: 128000, model: 'DeepSeek · deepseek-reasoner',
         cacheReadTokens: 40000, outputTokens: 1250 }, current: current(64000), cumulative: cumulative(154800, 120000, 12500) });
@@ -56,7 +56,7 @@ describe('上下文占用', () => {
     expect(screen.queryByRole('dialog')).toBeNull();
   });
 
-  it('供应商未回报时仍可显示全局上下文估算，不编造计费用量', async () => {
+  it('供应商未回报时仍可估算实际请求上下文，不编造计费用量', async () => {
     apiGet.mockResolvedValue({ sessionId: 5, model: 'm', contextWindow: 32000, outputReserve: 4096, latest: null, current: current(8000, 'r2') });
     mount();
     fireEvent.click(await screen.findByRole('button', { name: '上下文占用 25%（估算）' }));
@@ -66,7 +66,7 @@ describe('上下文占用', () => {
     expect([...document.querySelectorAll('.context-meter-rows dd')].map((node) => node.textContent)).toEqual(['未回报', '未回报', '未回报', '未回报']);
   });
 
-  it('供应商只回报输入时缓存与输出标为未回报，全局占用独立增长', async () => {
+  it('供应商只回报输入时缓存与输出标为未回报，实际请求占用独立统计', async () => {
     apiGet.mockResolvedValue({ sessionId: 5, model: 'm', contextWindow: 100000, outputReserve: null,
       latest: { requestId: 'r1', inputTokens: 20000, contextWindow: 100000, model: 'm', cacheReadTokens: null, outputTokens: null }, current: current(23000),
       cumulative: { ...cumulative(20000, 0, 0), cacheReadTokens: null, cacheMissTokens: null, outputTokens: null,

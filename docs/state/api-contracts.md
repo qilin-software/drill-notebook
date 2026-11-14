@@ -496,17 +496,17 @@ runtime 响应为 `{sessions:[{sessionId,requestId,status,phase?,paused?,queueCo
 - v0.8.2 起模型与思考档位由助手输入区按会话选择。`/ai/connections/chat-model` 有 sessionId 时仅改该会话并更新新会话继承默认；无 sessionId 时保存新草稿的继承默认，不覆盖已有会话。额外响应 `sessionChoice` 为 `{sessionId, modelConfigId, reasoningEffort, revision}`；会话视图返回独立的 modelChoiceRevision，标题版本与模型版本分别合并，迟到响应不能覆盖更新选择。
 - `POST /ai/sessions` 可显式携带 modelConfigId / reasoningEffort，未提供时继承最近默认并固定；`PUT /ai/sessions/{id}` 可更新该会话的独立选择。模型须存在且连接 / 容量完整，显式档位须属于目标模型支持的 effort；助手只换模型且旧档位不适用时回到模型默认。旧空选择优先恢复最近实际模型，无法唯一匹配时只继承一次默认；已有选择不持续跟随全局。受理、排队与自动恢复冻结目标会话配置，其它会话改选不影响运行。模型不可用时拒绝外发，历史仍返回当时实际使用的 `model`（供应商 · 模型）与 `reasoningEffort`。
 
-- `GET /ai/sessions/{id}/context-usage`（只读）返回 `{sessionId,current,latest,cumulative,model,contextWindow,outputReserve}`。后三项使用目标会话自己的当前模型，模型不可用时为 null；占用读取暂时失败只令 current=null，保留有效模型窗口与累计实测。
-- `current:{tokens,categories,estimated,complete,estimatorVersion,contextGeneration,historyRevision,requestId,active,summaryRevision}` 是当前会话保留的全局上下文。tokens 为 Long、本地估算；complete 表示已知组成是否完整，缺失旧内容时保留已知下界。当前代、未清理的提问 / 回答与 RECEIVED 插话逐份计一次，初始代包含 legacy；不受 500 条驻留、32 轮扫描或单请求预算截断。有效摘要按 coverage 替代旧原文，最近两轮和缺口保留；尚未落库的回复读活跃数值，终态使用正文，二者不叠加。
-- `current.categories:[{kind,tokens}]` 只含正数分类，kind 沿用 SYSTEM / TOOL_DEFINITIONS / USER / INJECTED_CONTEXT / ASSISTANT / TOOL_CALLS / TOOL_RESULTS / IMAGE / OTHER，tokens 为 Long。分类与总量来自同一次计数，合计等于 current.tokens；缺失或合计无效的旧额外分类归入 OTHER，已知总量保持。该列表不来自所选历史请求或累计计费，不保存正文 / 工具原始数据。
-- current 包含一份固定规则 / 当前模型可用工具定义和一份当前轮保留的工具、注入资料、图片及续接指令；图片用固定估算，独立思考列按正常历史重放规则不计。requestId 指向当前工作集对应轮次，活跃轮优先，较早轮原地重试完成后使用该次结果；只读刷新不触发检索、维护、压缩或模型调用。
-- `latest:{requestId,inputTokens,contextWindow,model,cacheReadTokens,outputTokens}` 保留当前代里最近一次回报输入的请求实测或 null，用于请求对账。圆环和顶部只使用 `current.tokens / 当前 contextWindow`；最近请求输入和累计输入均不能顶替全局占用。图形封顶 100%，总量及实际百分比允许超过窗口。
+- `GET /ai/sessions/{id}/context-usage`（只读）返回 `{sessionId,current,latest,cumulative,model,contextWindow,outputReserve}`。有 current 时，model / contextWindow 使用该实际主请求冻结的模型与窗口，后续改选不重算旧请求；没有快照时可返回目标会话当前选择的模型窗口，current 仍为 null。outputReserve 仅在有效配置与快照模型匹配时提供；读取失败不清空累计实测。
+- `current:{tokens,categories,estimated,complete,estimatorVersion,model,contextWindow,contextGeneration,historyRevision,requestId,active,summaryRevision}` 是最后一次主模型实际请求及其响应的数值快照。tokens 为 Long，等于最终请求输入组成估算加该次输出；输出优先用供应商回报，否则估算该次文字、思考与调用。estimated 当前为 true，complete=false 表示响应捕获 / 回报不完整的已知下界。summaryRevision 当前为 null。
+- `current.categories:[{kind,tokens}]` 只含正数分类，kind 沿用 SYSTEM / TOOL_DEFINITIONS / USER / INJECTED_CONTEXT / ASSISTANT / TOOL_CALLS / TOOL_RESULTS / IMAGE / OTHER，tokens 为 Long。分类与快照总量同源，合计等于 current.tokens；该次输出加入 ASSISTANT 分类。分类不来自全库正文、浏览器选择的旧请求或累计计费，不保存提示词 / 工具原始数据。
+- 每次主请求（含工具往返、断流续接、新轮次和原地重试）替换输入快照并重新计该次输出。历史、资料、工具结果与协议思考状态仅在实际外发时计入；前次响应若已进入续接输入不重复追加。NATIVE_WEB 辅助请求只记账，不替换主快照。运行时读活跃数值，终态保存同一快照供重启读取；较小请求可降低占用。清理 / 编辑造成历史版本不匹配或上下文换代时旧快照失效；无实际快照返回 null。旧版本仅回退到同轮最后一份 CHAT 请求摘要及其输出，输出缺失为下界。
+- `latest:{requestId,inputTokens,contextWindow,model,cacheReadTokens,outputTokens}` 保留当前代里最近一次回报输入的请求实测或 null，用于请求对账。圆环和顶部使用 `current.tokens / 该快照 contextWindow`，而非多次请求的累计；只有最后请求的输入而缺少该次输出也不是完整占用。图形封顶 100%，总量及实际百分比允许超过窗口。
 - v0.8.2 的 `cumulative:{requests,inputTokens,outputTokens,cacheReadTokens,cacheMissTokens,totalTokens,inputComplete,outputComplete,cacheReadComplete,cacheMissComplete,totalComplete}` 来自持久化账本，包含该会话所有对应 CHAT 的已结算 / UNKNOWN 请求及旧重试回执，排除标题、维护、其它会话和未发送预留。输入归一化后包括缓存读写，total 为输入加输出；OpenAI 包含桶不再相加，Anthropic 独立桶加回。原始计费账本保持。
 - 缺失数字为 null，部分回报仍返回已知 subtotal 并令对应 Complete=false，前端显示 `≥`；没有请求也不造全零。只有累计输入与命中都完整且输入大于 0 才计算命中率。旧缓存口径无法从独立日账本核实时保持未知；上下文换代 / 正文清理不改变已发生的累计，500 条驻留限制不截断统计。聚合使用 Long。
 - 历史助手消息的 `usage` 使用同一份本轮累计和完整性字段，包含旧原地重试尝试；用户消息的 `page:{title,link?}` 保留提交时的业务页面。没有对应请求 / 页面记录时不返回，不补估算。
 
 - 会话置顶（v0.8）：`PUT /ai/sessions/{id}` 接受布尔 `pinned`，会话视图返回 `pinnedAt`（ISO 时刻或 null）。重复置顶保留最初的时刻，置顶不改变 `updatedAt`；列表接口的顺序不变，置顶分组与排序由前端按 `pinnedAt` 升序处理。
-- v0.8.2 小卡片顶部显示当前全局「上下文总量」与窗口进度，圆环悬停提示保留「估算」；下方为 cumulative 的输入总量、缓存命中、未命中及输出。缓存命中率使用累计命中 / 累计输入，独立于圆环的窗口占用率；模型名在左下与「查看上下文详情」入口同一行。详情标题为「上下文」，顶部「当前上下文」复用 current / model / contextWindow，位于逐请求浏览器上方；移除底部累计块，接口的本轮 usage 仍保留供现有历史 / 对账使用。
+- v0.8.2 小卡片顶部显示最后实际主请求及其响应的「上下文总量」与窗口进度，圆环悬停提示保留「估算」；下方为 cumulative 的输入总量、缓存命中、未命中及输出。缓存命中率使用累计命中 / 累计输入，独立于圆环的窗口占用率；模型名在左下与「查看上下文详情」入口同一行。详情标题为「上下文」，顶部「当前上下文」复用 current / model / contextWindow，位于逐请求浏览器上方；移除底部累计块，接口的本轮 usage 仍保留供现有历史 / 对账使用。
 - 上下文占用响应里的顶层 `model` 与 `latest.model` 只返回模型 ID，不加供应商前缀；历史助手消息的实际模型显示仍为「供应商 · 模型」。
 - 窗口固定（v0.8，Electron IPC）：`assistant:set-fixed` 接受布尔值开关助手窗口的 `alwaysOnTop`；助手窗口状态 `assistant:get-state` / `assistant:state` 增加 `fixed` 字段。
 

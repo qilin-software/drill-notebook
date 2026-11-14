@@ -548,7 +548,7 @@ public class AiService {
 
     /**
      * 记下这次请求实际送入模型的长度（含缓存命中的部分）、缓存命中数与输出长度，只在供应商回报时记录。
-     * 同一轮有多次请求时覆盖为最近一次：这是请求实测，独立于当前会话全局上下文占用。
+     * 同一轮有多次请求时覆盖为最近一次；累计账本仍逐次相加。
      */
     private void recordTurnContext(TurnCall call, AiUpstreamClient.Usage usage) {
         if (usage == null || !usage.reported() || usage.inputTokens() == null) return;
@@ -566,18 +566,42 @@ public class AiService {
 
     private void recordRequestContext(String attempt, Map<String, Object> wire, TurnCall call, String kind,
                                       java.util.Set<String> toolNames) {
-        if (attempt == null) return;
         try {
-            chatTurns.recordUsageContext(attempt, new RequestContextAnalyzer(mapper)
-                    .analyze(wire, AiModelLimits.contextWindow(call.config()), kind, toolNames));
-        } catch (RuntimeException error) {
+            // 使用与外发完全相同的序列化请求。原生联网子请求只记账，不替换主会话上下文。
+            if ("CHAT".equals(kind)) call.lease().handle().modelContext(null);
+            var context = new RequestContextAnalyzer(mapper)
+                    .analyze(wire, AiModelLimits.contextWindow(call.config()), kind, toolNames);
+            if ("CHAT".equals(kind)) chatTurns.recordModelContext(call.lease(), context);
+            if (attempt != null) chatTurns.recordUsageContext(attempt, context);
+        } catch (RuntimeException | java.sql.SQLException error) {
             log.warn("请求上下文组成未记录: {}", error.getClass().getSimpleName());
         }
     }
 
+    private void recordModelOutput(TurnCall call, AiUpstreamClient.Result response) {
+        if (response == null) {
+            call.lease().handle().modelContextIncomplete();
+            return;
+        }
+        var usage = response.usage();
+        long tokens;
+        if (usage != null && usage.outputTokens() != null) tokens = usage.outputTokens();
+        else {
+            var estimator = new TokenEstimator(mapper);
+            tokens = (long) estimator.estimateText(response.text()) + estimator.estimateText(response.reasoning());
+            if (!response.toolCalls().isEmpty()) tokens += estimator.estimateInput(response.toolCalls());
+            if (!response.thinkingBlocks().isEmpty() && (response.reasoning() == null || response.reasoning().isEmpty()))
+                tokens += estimator.estimateInput(response.thinkingBlocks());
+        }
+        call.lease().handle().modelContextOutputTokens(tokens);
+        if ((usage == null || usage.outputTokens() == null)
+                && (!response.terminalObserved() || response.captureLimited() || response.downstreamGone()))
+            call.lease().handle().modelContextIncomplete();
+    }
+
     /**
-     * 当前全局上下文、最近请求实测和会话累计各自独立。窗口占用使用 current；
-     * latest 保留给请求对账，逐次请求账本用于累计，模型不可用时窗口为 null。
+     * 窗口占用使用当前主请求及其响应快照；latest 用于供应商对账，累计仍来自逐次请求账本。
+     * 请求中的模型和窗口已冻结，不能用后来选择的模型窗口重算正在运行的请求。
      */
     public Map<String, Object> sessionContextUsage(long sessionId) {
         requireSession(sessionId);
@@ -586,50 +610,26 @@ public class AiService {
         result.put("latest", sessions.latestContext(sessionId));
         result.put("cumulative", sessions.cumulativeUsage(sessionId));
         result.put("current", null);
-        AiConfigRepository.ConfigRow config;
+        result.put("model", null); result.put("contextWindow", null); result.put("outputReserve", null);
         try {
-            config = requireChatConfig(sessionId);
-            result.put("model", config.model());
-            result.put("contextWindow", AiModelLimits.contextWindow(config));
-            result.put("outputReserve", AiModelLimits.output(config, runtimeSettings().requestOutputTokens()));
+            var current = contextOccupancy == null ? null : contextOccupancy.read(sessionId);
+            result.put("current", current);
+            if (current != null) {
+                result.put("model", current.get("model"));
+                result.put("contextWindow", current.get("contextWindow"));
+            }
         } catch (RuntimeException error) {
-            result.put("model", null);
-            result.put("contextWindow", null);
-            result.put("outputReserve", null);
-            return result;
-        }
-        try {
-            if (contextOccupancy != null) result.put("current", contextOccupancy.read(sessionId, currentContextPrefix(config)));
-        } catch (RuntimeException error) {
-            // 统计暂时不可用时仍保留当前模型窗口与累计实测，不能让一个读失败抹掉其它口径。
             log.warn("当前会话上下文暂未统计 sessionId={}，{}", sessionId, error.getClass().getSimpleName());
         }
-        return result;
-    }
-
-    /** 固定规则和当前模型实际支持、全局已开启的工具定义只计一次，不随会话轮数相加。 */
-    private ContextTokenBreakdown currentContextPrefix(AiConfigRepository.ConfigRow config) {
-        Map<String, ChatTool> available = new LinkedHashMap<>();
-        List<String> withheld = new ArrayList<>();
-        if (chatToolsEnabled(config)) {
-            AiToolSettings switches = toolSettings();
-            for (ChatTool tool : chatTools) {
-                String name = tool.definition().name();
-                if (switches.enabled(name)) available.put(name, tool); else withheld.add(name);
+        try {
+            var config = requireChatConfig(sessionId);
+            if (result.get("current") == null) {
+                result.put("model", config.model()); result.put("contextWindow", AiModelLimits.contextWindow(config));
             }
-        }
-        List<Map<String, Object>> prefix = List.of(Map.of("role", "system", "content", ChatContextAssembler.SYSTEM_PREFIX));
-        if (!available.isEmpty() || !withheld.isEmpty()) prefix = withToolInstructions(prefix, available, withheld, false);
-        var definitions = available.values().stream().map(ChatTool::definition).toList();
-        var estimator = new TokenEstimator(mapper);
-        long total = estimator.estimateInput(Map.of("messages", prefix, "tools", definitions));
-        long system = estimator.estimateInput(prefix);
-        long tools = definitions.isEmpty() ? 0 : estimator.estimateInput(definitions);
-        var breakdown = new ContextTokenBreakdown.Builder();
-        breakdown.add(com.drillnotebook.app.model.RequestContextAudit.Kind.SYSTEM, system);
-        breakdown.add(com.drillnotebook.app.model.RequestContextAudit.Kind.TOOL_DEFINITIONS, tools);
-        breakdown.add(com.drillnotebook.app.model.RequestContextAudit.Kind.OTHER, total - system - tools);
-        return breakdown.build();
+            if (config.model().equals(result.get("model")))
+                result.put("outputReserve", AiModelLimits.output(config, runtimeSettings().requestOutputTokens()));
+        } catch (RuntimeException ignored) { }
+        return result;
     }
 
     private static Long sessionIdOf(Map<String, Object> body) {
@@ -1428,8 +1428,6 @@ public class AiService {
             messages.add(Math.max(0, messages.size()-1), Map.of("role", "user", "content",
                     call.pageSnapshot().locator(call.lease().requestId(), toolsByName.containsKey("read_current_page"))));
         }
-        int initialMessages = messages.size();
-        Set<Map<String, Object>> contextSupplements = java.util.Collections.newSetFromMap(new java.util.IdentityHashMap<>());
         DeltaBuffer buffer = toolMode ? new DeltaBuffer() : null;
         AiTurnBudget limits = SessionExecution.CURRENT.get() == null ? new AiTurnBudget(call.settings())
                 : SessionExecution.CURRENT.get().budget;
@@ -1452,7 +1450,6 @@ public class AiService {
                     String supplementId = string(supplement.body(), "requestId", "");
                     if (snapshot != null) pageSnapshots.put(supplementId, snapshot);
                     var added = supplementMessages(supplement.body(), toolsByName.containsKey("read_current_page"));
-                    contextSupplements.addAll(added);
                     messages.addAll(added);
                     currentUserText+="\n\n"+string(mapValue(supplement.body().get("input")),"userText","");
                 }
@@ -1467,7 +1464,6 @@ public class AiService {
                         "本轮工具已停止（" + stopReason + "）。请依据已有结果回答并说明尚未完成的任务，不要继续调用工具。"
                                 + "只有已确认成功的写入才能说已保存或已更新，结果未知的操作不要假设成功。"));
             }
-            call.lease().handle().contextExtras(SessionContextExtras.breakdown(messages, initialMessages, contextSupplements, mapper));
             if (!activities.isEmpty()) emitToolActivity(call, activities, "answer");
             int seconds = limits.requestSeconds();
             if (seconds <= 0) return combine(prefix,prefixReasoning,budgetStopped("budget_time"));
@@ -1486,14 +1482,12 @@ public class AiService {
             final var sending=supplements;
             var acknowledged=new java.util.concurrent.atomic.AtomicBoolean();
             var attemptText=new StringBuilder();var attemptReasoning=new StringBuilder();
-            var contextOutput = new TokenEstimator.Counter();
-            contextOutput.append(prefix.toString());
-            call.lease().handle().contextOutputTokens(contextOutput.tokens());
+            var responseTextTokens = new TokenEstimator.Counter();
+            var responseReasoningTokens = new TokenEstimator.Counter();
             AiUpstreamClient.StreamListener receiver=(type,text)->{
-                if ("text".equals(type)) {
-                    contextOutput.append(text);
-                    call.lease().handle().contextOutputTokens(contextOutput.tokens());
-                }
+                if ("text".equals(type)) responseTextTokens.append(text);
+                else if ("reasoning".equals(type)) responseReasoningTokens.append(text);
+                call.lease().handle().modelContextOutputTokens((long) responseTextTokens.tokens() + responseReasoningTokens.tokens());
                 if (call.lease().handle().recovery() != null) emitRecovery(call, null);
                 if(steering!=null&&!sending.isEmpty()&&acknowledged.compareAndSet(false,true))steering.received(sending);
                 if(buffer==null){if("text".equals(type))attemptText.append(text);else if("reasoning".equals(type))attemptReasoning.append(text);}
@@ -1533,6 +1527,7 @@ public class AiService {
                 if (invoked && !rejected) limits.consume(usage, budget); else limits.release(budget);
                 if (attempt != null) chatTurns.settleUsage(attempt, usage);
                 recordTurnContext(call, usage);
+                recordModelOutput(call, partial);
                 if (buffer != null && partial != null) {
                     replay(call, buffer, partial);
                     prefix.append(partial.text()); prefixReasoning.append(partial.reasoning() == null ? "" : partial.reasoning());
@@ -1573,10 +1568,7 @@ public class AiService {
             limits.consume(result.usage(), budget);
             chatTurns.settleUsage(attempt, result.usage());
             recordTurnContext(call, result.usage());
-            if (!call.stream()) {
-                contextOutput.append(result.text());
-                call.lease().handle().contextOutputTokens(contextOutput.tokens());
-            }
+            recordModelOutput(call, result);
             log.info("AI 请求：耗时 {}ms textLen={} reasoningLen={} finish={} terminal={} captureLimited={}",
                     System.currentTimeMillis() - start,
                     result.text() == null ? 0 : result.text().length(),
@@ -1618,8 +1610,6 @@ public class AiService {
             }
             if(!limits.tryStage()) { limits.stop("budget_stages"); continue; }
             messages.add(assistantToolMessage(result));
-            call.lease().handle().contextTokens(new TokenEstimator(mapper).estimateText(prefix.toString()),
-                    SessionContextExtras.breakdown(messages, initialMessages, contextSupplements, mapper));
             for (AiUpstreamClient.ToolCall toolCall : result.toolCalls()) {
                 if (call.lease().handle().cancelRequested()) return new AiUpstreamClient.Result(prefix.toString(), prefixReasoning.toString(), "aborted");
                 ChatTool selected = toolsByName.get(toolCall.name());
@@ -1673,7 +1663,6 @@ public class AiService {
                     call.dispatch().refreshPlan(contexts.refreshAfterMemoryForget(call.dispatch().plan()));
                 }
                 messages.add(toolResultMessage(toolCall.id(), payload.json()));
-                call.lease().handle().contextExtras(SessionContextExtras.breakdown(messages, initialMessages, contextSupplements, mapper));
             }
         }
     }

@@ -5,7 +5,7 @@ import { contextUsageKey, formatTokens, type SessionContextUsage } from '../ai-s
 import { CONTEXT_CATEGORIES, contextCategoryOf } from './RequestContextBrowser';
 import './current-context-card.css';
 
-/** 当前会话的保留上下文；独立于下方浏览器正在选择的历史请求。 */
+/** 当前主模型请求及其响应；独立于下方浏览器选择的历史请求。 */
 export function CurrentContextCard({ sessionId, refreshKey }: { sessionId?: number; refreshKey?: string }) {
   const usage = useQuery({
     queryKey: [...contextUsageKey(sessionId), refreshKey ?? ''],
@@ -59,7 +59,7 @@ export function CurrentContextCardView({ data, loading = false }: { data?: Sessi
           <dd>≈ {formatTokens(item.tokens)}<span>{Math.round(item.tokens / tokens * 100)}%</span></dd>
         </div>)}
       </dl> : tokens > 0 ? <p className="current-context-empty">当前占用未提供分类明细</p> : null}
-      {incomplete ? <p className="current-context-empty">部分旧内容无法统计，显示已知占用下界。</p> : null}
+      {incomplete ? <p className="current-context-empty">部分请求或响应无法完整统计，显示已知占用下界。</p> : null}
     </>}
   </section>;
 }
