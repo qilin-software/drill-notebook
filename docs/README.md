@@ -35,7 +35,7 @@ docs/
 | [state/architecture.md](state/architecture.md) | 项目架构、进程与模块边界、数据与便携约定 |
 | [state/v0.8.2-features.md](state/v0.8.2-features.md) | 当前 v0.8.2：笔记混合检索与联网工具已实现，工程验证通过 |
 | [state/v0.8.1-features.md](state/v0.8.1-features.md) | v0.8.1 功能与既有验证：失败重连、会话内对话跳转、助手模型选择持久化及页面适配 |
-| [state/data-model.md](state/data-model.md) | 当前数据库表与关键约束（schema 19）；完整 DDL 以 `backend/src/main/resources/schema.sql` 为准 |
+| [state/data-model.md](state/data-model.md) | 当前数据库表与关键约束（schema 21）；完整 DDL 以 `backend/src/main/resources/schema.sql` 为准 |
 | [state/api-contracts.md](state/api-contracts.md) | 核心 REST / SSE 契约与错误格式 |
 
 版本启动前先收尾并归档上一版材料，再在 `docs/state/` 编写新版功能需求清单。开发期间原位维护范围与状态，不把规划提前写成全局已交付能力。切片验收完成后更新该版清单，同步已落地的数据结构、接口等状态文档；施工材料继续保留在 `docs/work/`，标明完成状态，不因单个功能完成立即归档。涉及全局设计规范或专题说明时原位维护。
@@ -90,7 +90,7 @@ v0.8.0 的功能清单、助手窗口与软件内更新施工材料、交互草�
 | [reference/knowledge-point-import.md](reference/knowledge-point-import.md) | 知识点 Markdown 导入 |
 | [reference/quiz-markdown-flow.md](reference/quiz-markdown-flow.md) | 刷题 Markdown 解析与渲染 |
 
-`docs/release/v<版本>-release-notes.md` 保存各版发行记录，当前 [v0.8.1 发行准备说明](release/v0.8.1-release-notes.md)已补齐，云端与本地打包默认版本同步为 v0.8.1。[v0.8.0 发行说明](release/v0.8.0-release-notes.md)继续原位保留，不随施工材料迁移；历史工程验证、人工验收及发布边界见[归档入口](archive/v0.8.0/README.md)。实际发行状态以标签、GitHub Actions 与 Release 为准。**v1.0 之前均为不保证稳定性的预发行版**，没有预发行后缀也不代表稳定。工作流固定使用 Pre-release，不标记 Latest；正式发行渠道在 v1.0 时另行确认。正文按标签的完整基础版本选择，例如 `v0.8.1-rc.1` 选择 v0.8.1，缺失或空白即失败。
+`docs/release/v<版本>-release-notes.md` 保存各版发行记录，当前 [v0.8.2 发行准备说明](release/v0.8.2-release-notes.md)已补齐，云端与本地打包默认版本同步为 v0.8.2。[v0.8.1](release/v0.8.1-release-notes.md)与 [v0.8.0 发行说明](release/v0.8.0-release-notes.md)继续原位保留，不随施工材料迁移；历史工程验证、人工验收及发布边界见[归档入口](archive/v0.8.0/README.md)。实际发行状态以标签、GitHub Actions 与 Release 为准。**v1.0 之前均为不保证稳定性的预发行版**，没有预发行后缀也不代表稳定。工作流固定使用 Pre-release，不标记 Latest；正式发行渠道在 v1.0 时另行确认。正文按标签的完整基础版本选择，例如 `v0.8.2-rc.1` 选择 v0.8.2，缺失或空白即失败。
 
 ## 5. 交接记忆
 

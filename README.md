@@ -1,6 +1,6 @@
 # Drill Notebook（面向开发者）
 
-**v0.8.2 笔记混合检索与联网搜索已实现并通过工程验证，尚未发布**：助手按需混合检索笔记、搜索互联网与读取公开网页，保留精确关键词和按 ID 读取；联网支持免配置默认服务、Tavily / TinyFish 自定义配置与原生 Web 优先。范围和验证见[当前功能清单](docs/state/v0.8.2-features.md)。[v0.8.1](docs/state/v0.8.1-features.md) 的失败重连、会话内对话跳转与模型持久化已完成工程验证，[发行准备说明](docs/release/v0.8.1-release-notes.md)继续保留；本次未调整发行配置。v0.8.0 相关材料已[归档](docs/archive/v0.8.0/README.md)，发行与升级记录见[v0.8.0 说明](docs/release/v0.8.0-release-notes.md)。**v1.0 之前的所有版本均为不保证稳定性的预发行版。**
+**v0.8.2 已进入发布准备，尚未发布**：笔记混合检索、联网搜索 / 网页读取、原地重试、会话独立选模和上下文统计已实现并通过相关工程验证。范围与验证见[当前功能清单](docs/state/v0.8.2-features.md)，发行产物与升级说明见[v0.8.2 说明](docs/release/v0.8.2-release-notes.md)；云端与本地打包默认版本已同步为 v0.8.2。[v0.8.1 说明](docs/release/v0.8.1-release-notes.md)继续保留；v0.8.0 相关材料已[归档](docs/archive/v0.8.0/README.md)。**v1.0 之前的所有版本均为不保证稳定性的预发行版。**
 
 | 项 | 说明 |
 |---|---|
@@ -491,11 +491,11 @@ python scripts/seed-test-bank.py  # 造题种子（v0.5+）
 公开发行包在 GitHub Actions 构建；前后端全量测试在本地完成，云端保留发布配置检查、类型检查、编译、打包与产物校验。发布者按 [测试规范](docs/test/TESTING_GUIDELINES.md) 确认待发布提交已通过本地验证；软件内更新专项可在工作区 `temp/` 使用隔离验证产物，本地不执行发布。
 
 1. 更新对应的 `docs/release/<版本>-release-notes.md`，完成测试并提交、推送准备发布的代码。
-2. 在该提交上创建并推送标签：`git tag v0.8.0`，随后 `git push <remote> v0.8.0`（本工作区远程名为 `github`，按实际仓库替换 `<remote>`）。
-3. `release-portable.yml` 校验版本与发布说明，使用 `npm ci` 安装依赖；先编译 Electron 与发布元数据模块，再运行发布配置回归，随后构建前端、Rust 更新助手、后端 JAR 与内嵌 JRE，生成 `Drill-Notebook-0.8.0-win-x64-portable.zip` 和对应 `.zip.sha256`。ZIP 内含程序文件清单；云端不重复执行前后端业务全量测试，后端使用 `-DskipTests package`。
-4. 标签推送自动创建 **Pre-release**，不标记为 Latest，正文载入本版发布说明并附自动生成的提交说明。手动触发默认 `v0.8.0`，默认仅上传构建产物，勾选 `publish_release` 才发布。v1.0 之前全部为预发行版，不保证稳定性；正式发行渠道届时另行确认。
+2. 在该提交上创建并推送标签：`git tag v0.8.2`，随后 `git push <remote> v0.8.2`（本工作区远程名为 `github`，按实际仓库替换 `<remote>`）。
+3. `release-portable.yml` 校验版本与发布说明，使用 `npm ci` 安装依赖；先编译 Electron 与发布元数据模块，再运行发布配置回归，随后构建前端、Rust 更新助手、后端 JAR 与内嵌 JRE，生成 `Drill-Notebook-0.8.2-win-x64-portable.zip` 和对应 `.zip.sha256`。ZIP 内含程序文件清单；云端不重复执行前后端业务全量测试，后端使用 `-DskipTests package`。
+4. 标签推送自动创建 **Pre-release**，不标记为 Latest，正文载入本版发布说明并附自动生成的提交说明。手动触发默认 `v0.8.2`，默认仅上传构建产物，勾选 `publish_release` 才发布。v1.0 之前全部为预发行版，不保证稳定性；正式发行渠道届时另行确认。
 
-工作流按完整基础版本选择发布说明，`v0.8.0-rc.1` 共用 `v0.8.0-release-notes.md`；说明缺失或空白会在安装依赖前失败。发行版本由标签注入，工程内部 `package.json` 和后端 JAR 的 `0.1.0` 不代表发行版本。升级前备份完整便携目录；schema 18 的迁移与回退边界见 [发布说明](docs/release/v0.8.0-release-notes.md)。
+工作流按完整基础版本选择发布说明，`v0.8.2-rc.1` 共用 `v0.8.2-release-notes.md`；说明缺失或空白会在安装依赖前失败。发行版本由标签注入，工程内部 `package.json` 和后端 JAR 的 `0.1.0` 不代表发行版本。升级前备份完整便携目录；schema 21 的迁移与回退边界见 [发布说明](docs/release/v0.8.2-release-notes.md)。
 
 云端 JAR 构建直接使用 runner 预装的 `mvn`（日志打印版本），不再由 wrapper 下载 Maven 本体；本地全量测试仍保留 `mvnw.cmd`。Java 17、依赖与打包内容不变，Maven 不随软件分发；项目依赖下载仍需要访问 Maven 仓库。
 
