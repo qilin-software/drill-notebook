@@ -288,8 +288,12 @@ public class ChatTurnService {
             ChatMessageCipher.Encrypted result = cipher.encrypt(resultMeta(status, reply, audit,
                             lease.handle().toolActivities(), lease.handle().recovery()),
                     lease.masterPassword());
-            var contextTokens = lease.handle().contextTokens();
-            result = cipher.withContextExtraTokens(result, contextTokens.extraTokens(), contextTokens.extraCategories());
+            var modelContext = lease.handle().modelContext();
+            if (modelContext != null) {
+                // 终态事务只推进一次历史版本；保存同一份请求 / 响应快照，不改用整段历史正文重算。
+                long revision = sessions.read(lease.sessionId()).orElseThrow().historyRevision() + 1;
+                result = cipher.withModelContext(result, modelContext.atRevision(revision));
+            }
             TerminalOutcome outcome = turns.finalizeTurn(lease.requestId(),
                     new Terminal(status, content == null ? "" : null, content == null ? null : content.cipher(),
                             content == null ? null : content.meta(),
@@ -369,6 +373,15 @@ public class ChatTurnService {
     /** 只读活跃轮次的数值快照；终态正文由历史存储提供，避免重复计算。 */
     public ActiveTurnRegistry.ContextTokens currentContextTokens(String requestId) {
         return registry.find(requestId).map(ActiveTurnRegistry.Handle::contextTokens).orElse(null);
+    }
+
+    public void recordModelContext(Lease lease, com.drillnotebook.app.model.RequestContextAudit input) throws SQLException {
+        var state = sessions.read(lease.sessionId()).orElseThrow();
+        lease.handle().modelContext(ModelContextSnapshot.from(input, state.contextGeneration(), state.historyRevision()));
+    }
+
+    public ModelContextSnapshot currentModelContext(String requestId) {
+        return registry.find(requestId).map(ActiveTurnRegistry.Handle::modelContext).orElse(null);
     }
 
     private void settle(String attemptId, ActualUsage actual) {

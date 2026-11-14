@@ -143,6 +143,15 @@ public class ChatMessageCipher {
         return withTokenCount(value, "supplementTextTokens", tokens);
     }
 
+    public Encrypted withModelContext(Encrypted value, ModelContextSnapshot snapshot) {
+        if (snapshot == null) return value;
+        try {
+            Map<String, Object> meta = new LinkedHashMap<>(readMeta(value.meta()));
+            meta.put("modelContext", snapshot);
+            return new Encrypted(value.cipher(), mapper.writeValueAsString(meta));
+        } catch (Exception error) { throw new ChatCryptoException("模型上下文快照无法保存", error); }
+    }
+
     private Encrypted withTokenCount(Encrypted value, String key, Long tokens) {
         if (tokens == null) return value;
         if (tokens < 0) throw new ChatCryptoException("上下文数值无效");

@@ -8,7 +8,8 @@ export interface SessionContextUsage {
   sessionId: number;
   current: { tokens: number; estimated: boolean; complete: boolean; requestId: string | null;
     contextGeneration: number; historyRevision: number; active: boolean; estimatorVersion: string;
-    summaryRevision: number | null; categories?: { kind: string; tokens: number }[] } | null;
+    summaryRevision: number | null; model?: string; contextWindow?: number;
+    categories?: { kind: string; tokens: number }[] } | null;
   latest: { requestId: string; inputTokens: number; contextWindow: number; model: string | null;
     cacheReadTokens: number | null; outputTokens: number | null } | null;
   cumulative?: ContextTokenTotals;
@@ -33,7 +34,7 @@ export const formatMeasuredTokens = (value: number | null | undefined, complete?
   value == null ? '未回报' : `${complete === false ? '≥ ' : ''}${formatTokens(value)}`;
 
 /**
- * 当前会话保留的全局上下文用于窗口占用，输入 / 命中 / 未命中与输出使用会话累计的实测用量；
+ * 当前主模型请求及其响应快照用于窗口占用，输入 / 命中 / 未命中与输出使用会话累计的实测用量；
  * 窗口大小已经在第一行和进度条里，输出预留、分项估算、摘要与省略原因都不在这里重复，
  * 需要时去「查看上下文详情」看。
  */
@@ -100,7 +101,7 @@ export function ContextMeter({ sessionId, streaming = false, refreshKey, onInspe
           <div><dt>缓存未命中</dt><dd>{formatMeasuredTokens(miss, cumulative?.cacheMissComplete)}</dd></div>
           <div><dt>输出</dt><dd>{formatMeasuredTokens(output, cumulative?.outputComplete)}</dd></div>
         </dl> : null}
-        {incomplete ? <p>部分旧内容无法估算，显示已知占用下界。</p> : null}
+        {incomplete ? <p>部分请求或响应无法完整统计，显示已知占用下界。</p> : null}
         {high ? <p className="context-meter-warn">已接近模型窗口上限。</p> : null}
       </div>
       <div className="context-meter-foot">

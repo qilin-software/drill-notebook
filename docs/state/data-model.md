@@ -95,9 +95,9 @@ v0.7.3 的六个资料读取工具本身不改变表结构。资料直接读取�
 
 工具活动复用 `ai_chat_turn.result_meta_cipher/result_meta_crypto` 加密保存，最多 1200 项白名单摘要。开始和完成时更新检查点，首条活动建立助手占位，最终回答复用同一消息；检查点不推进历史 revision。活动不保存工具原始参数/结果，历史查询只读取，不重放工具。终止原因保存在 `finish_reason` 及结果元数据。
 
-全局上下文占用复用现有加密元数据：新 `*_meta` 保存 `tokenEstimatorVersion/textTokens`；人工待发的 `payload_meta.supplementTextTokens` 只记录提问文字估算，只有 RECEIVED 插话进入全局计数。终态 `result_meta_crypto.contextExtraTokens` 保存当前轮保留的工具、注入资料、图片及续接指令合计数值；同处可选 `contextExtraCategories` 只保存固定分类名到 Long 的映射，分类和必须等于该合计。缺失 / 无效的旧分类不重建，已知合计在当前卡片归入 OTHER；输出、分类及额外合计从同一活跃快照保存，流式 / 终态不重复叠加。它不是累计输入或工具结果正文。新增元数据字节继续由同一容量事务计量，schema 21 不再为此增表或增列。
+当前模型占用复用 `ai_chat_turn.result_meta_crypto.modelContext` 保存 `ModelContextSnapshot`：schemaVersion / estimatorVersion、实际模型及窗口、contextGeneration / historyRevision、固定分类到 Long 的输入映射、该次 outputTokens 和完整性。只有最终外发主请求建立快照，终态保存同一份数值，新增字节由既有容量事务计量；没有提示词、工具正文或附件字节，不新增 schema / 表 / 列。旧 textTokens、supplementTextTokens、contextExtraTokens / contextExtraCategories 仍作兼容元数据保留，当前窗口统计不再把它们与本地历史拼接。
 
-`SessionContextOccupancyService` 按当前代和未清理标记逐行读取全部正文，初始代包含 legacy；有效摘要按 coverage 替代旧轮，最近两轮及缺口保留。固定前缀、当前轮额外组成和当前活跃回复各计一份，终态改用存储正文；独立 reasoning 列不按历史重放计入。全局合计用 Long，最新请求事实和累计计费仍各自独立。旧密文仅按需解密，最多 4096 项缓存只保存 SHA-256 身份与数字；无法读取时返回已知下界。活跃回复使用进程内计数器，保留分帧余数和跨帧代理对，不另存流式正文；只读统计不修改旧摘要检查点或触发维护。
+`SessionContextOccupancyService` 运行中读取活跃主请求快照，完成后读取最近实际执行轮次的持久快照，较早轮的原地重试也可成为最新快照。快照输入来自最终请求分析，输出只计该次响应，合计用 Long；每次主请求替换而非累计，原生联网子请求不替换它。模型窗口被冻结，清理 / 编辑后的历史版本不匹配或换代会使旧快照失效。旧版本回退到同轮最后一份 CHAT 的 context_breakdown / output_tokens，不加整轮回答；输出缺失显示下界，没有请求摘要为未知。占用读取无需解密旧消息或扫描全库正文，重启读回同一份数值；只读统计不改账本、摘要检查点或触发维护。
 
 v0.8.2 联网服务的密钥沿用 AES-GCM / Argon2id 与本机指纹材料，只保存在 `ai_web_settings.document` 的密文值中；接口仅返回 `hasKey`。空输入保留，明确 clear 才删除；配置损坏报错，不换用默认供应商。全局权限仍属于 `ai_tool_settings`，关闭联网不清除服务配置。HTTP / DNS 状态、Exa 单次会话标识与限流冷却只在内存中；网页正文和查询不进入工具活动历史。原生联网的额外模型请求按 `ai_usage_attempt` 逐次记录实际用量，与主对话共用输出 / 阶段预算。
 
