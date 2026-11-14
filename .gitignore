@@ -21,9 +21,12 @@ backend/target/
 dist/
 release/
 out/
-# Portable release assets copied to the repository root are generated files.
+# Portable release assets, unpacked directories and manifests are generated files.
 /Drill-Notebook-*-win-x64-portable.zip
 /Drill-Notebook-*-win-x64-portable.zip.sha256
+/Drill-Notebook-*-win-x64-portable/
+/win-unpacked/
+/drill-program-manifest.json
 electron-builder-cache/
 .mvn/wrapper/dists/
 *.tsbuildinfo
