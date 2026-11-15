@@ -7,6 +7,10 @@ import { generateUuidV7 } from '../lib/uuidV7';
 import type { RetrievalOptions } from '../lib/types';
 import { readToolActivities } from '../lib/toolActivity';
 import type { ToolActivity, ToolPhase } from '../lib/toolActivity';
+import type { ChatSupplement } from '../lib/chatQueue';
+import type { PageSnapshot } from '../lib/pageSnapshot';
+import { readRecovery } from '../lib/aiRecovery';
+import type { AiRecovery } from '../lib/aiRecovery';
 
 /**
  * 聊天轮次的唯一出口（执行方案 §12、contracts §4.1/§4.2/§4.5）。
@@ -36,11 +40,28 @@ export interface TurnInput {
   userText: string;
   attachments?: TurnAttachment[];
   pageContext?: TurnPageContext;
+  pageSnapshot?: PageSnapshot;
   retrievalOptions?: RetrievalOptions;
+  /** 重新生成：指回要重答的那一轮。服务端据此沿用写入类工具的原回执，不重复写入。 */
+  retryOf?: string;
+}
+
+/** 点击重新生成时才读取的原输入；只在内存里使用，不缓存到浏览器存储。 */
+export interface OriginalTurnInput {
+  requestId: string;
+  sessionId: number;
+  input: { userText: string; attachments?: TurnAttachment[] };
 }
 
 /** GET /turns/{requestId} 的可见事实（§4.5）：界面只能拿这些字段描述这一轮。 */
 export interface TurnStatusView {
+  retryOf?: string | null;
+  recovery?: AiRecovery | null;
+  supplements?: ChatSupplement[];
+  reply?: string;
+  reasoning?: string;
+  userText?: string;
+  phase?: string;
   toolActivities?: ToolActivity[];
   requestId?: string;
   sessionId?: number;
@@ -53,6 +74,9 @@ export interface TurnStatusView {
 }
 
 export type TurnEvent =
+  | { type: 'recovery'; requestId: string; recovery: AiRecovery | null }
+  | { type: 'supplements'; requestId: string; supplements: ChatSupplement[] }
+  | { type: 'snapshot'; requestId: string; status: TurnStatusView }
   | { type: 'activity'; requestId: string; activities: ToolActivity[]; phase: ToolPhase }
   | { type: 'reconciled'; requestId: string; status: TurnStatusView }
   | { type: 'begun'; requestId: string }
@@ -84,11 +108,21 @@ interface ActiveTurn {
   abort: (() => void) | null;
 }
 
+export interface SessionRuntime {
+  sessionId: number;
+  requestId: string;
+  status: string;
+  phase?: string;
+  queueCount: number;
+  paused?: boolean;
+}
+export const isSessionRunning = (value?: SessionRuntime): boolean => !!value && ['RUNNING', 'QUEUED'].includes(value.status);
+
 /** 状态读不到时的退避节奏；耗尽后如实报未知，不猜终态。 */
 const STATUS_BACKOFF_MS = [400, 1200, 3000];
 
 /** 请求体只在这里拼一次：流式与非流式回退复用同一份，才撞得到服务端的同一身份上。 */
-function buildTurnBody(requestId: string, input: TurnInput): Record<string, unknown> {
+export function buildTurnBody(requestId: string, input: TurnInput): Record<string, unknown> {
   const attachments = (input.attachments ?? []).map((item) => ({
     ...item,
     ...(item.kind === 'image' && item.dataBase64
@@ -100,7 +134,10 @@ function buildTurnBody(requestId: string, input: TurnInput): Record<string, unkn
     protocolVersion: 2,
     requestId,
     sessionId: input.sessionId,
+    ...(input.retryOf ? { retryOf: input.retryOf } : {}),
     input: { role: 'user', userText: input.userText, ...(attachments.length ? { attachments } : {}) },
+    ...(input.pageSnapshot ? { pageSnapshot: { ...input.pageSnapshot,
+      ...(input.pageSnapshot.selectedIds ? { selectedIds: [...input.pageSnapshot.selectedIds] } : {}) } } : {}),
     ...(pageContext
       ? {
         pageContext: {
@@ -133,13 +170,26 @@ export function useAiChatTurn({ sessionId, onEvent }: UseAiChatTurnOptions): {
   stop: () => void;
   busy: boolean;
   requestId: string | null;
+  activeSessionId?: number;
+  runtimes: SessionRuntime[];
+  reconnecting: boolean;
+  stopSession: (id: number) => Promise<void>;
 } {
-  const activeRef = useRef<ActiveTurn | null>(null);
+  const activeRef = useRef(new Map<number, ActiveTurn>());
   const sessionRef = useRef(sessionId);
+  sessionRef.current = sessionId;
   const emitRef = useRef(onEvent);
   const mountedRef = useRef(true);
-  const [busy, setBusy] = useState(false);
-  const [requestId, setRequestId] = useState<string | null>(null);
+  const [, refresh] = useState(0);
+  const [runtimes, setRuntimes] = useState<SessionRuntime[]>([]);
+  const [reconnecting, setReconnecting] = useState(false);
+  const runtimesRef = useRef(runtimes);
+  runtimesRef.current = runtimes;
+  const runtimeReadyRef = useRef(false);
+  const runtime = runtimes.find((item) => item.sessionId === sessionId);
+  const local = sessionId === undefined ? undefined : activeRef.current.get(sessionId);
+  const busy = !!local || isSessionRunning(runtime);
+  const requestId = local?.requestId ?? (isSessionRunning(runtime) ? runtime!.requestId : null);
 
   useEffect(() => {
     sessionRef.current = sessionId;
@@ -149,10 +199,43 @@ export function useAiChatTurn({ sessionId, onEvent }: UseAiChatTurnOptions): {
   }, [onEvent]);
   useEffect(() => {
     mountedRef.current = true;
-    return () => { mountedRef.current = false; activeRef.current?.abort?.(); };
+    return () => { mountedRef.current = false; activeRef.current.forEach((turn) => turn.abort?.()); };
   }, []);
 
-  const isCurrent = (turn: ActiveTurn): boolean => activeRef.current === turn;
+  useEffect(() => {
+    let disposed = false;
+    let timer: number;
+    const poll = async (): Promise<void> => {
+      try {
+        const value = await get<{ sessions: SessionRuntime[]; current?: TurnStatusView }>(`/api/ai/sessions/runtime${sessionId === undefined ? '' : `?sessionId=${sessionId}`}`);
+        if (disposed || !Array.isArray(value?.sessions)) return;
+        runtimeReadyRef.current = true;
+        setRuntimes(value.sessions); setReconnecting(false);
+        const snapshot = value.current;
+        if (snapshot?.requestId && sessionRef.current === sessionId) {
+          const tracked = sessionId === undefined ? undefined : activeRef.current.get(sessionId);
+          // SSE supplies deltas for a live local subscription; snapshots recover switched/external/disconnected runs.
+          if (!tracked || (!tracked.abort && tracked.requestId === snapshot.requestId)) {
+            emitRef.current({ type: 'snapshot', requestId: snapshot.requestId, status: snapshot });
+          }
+          if (!snapshot.active && tracked?.requestId === snapshot.requestId) finish(tracked);
+        }
+        for (const state of value.sessions) {
+          const tracked = activeRef.current.get(state.sessionId);
+          if (!isSessionRunning(state) && tracked?.requestId === state.requestId && !tracked.abort) finish(tracked);
+        }
+      } catch { if (!disposed && runtimeReadyRef.current) setReconnecting(true); }
+      finally { if (!disposed) timer = window.setTimeout(() => void poll(), 900); }
+    };
+    void poll();
+    return () => {
+      disposed = true; window.clearTimeout(timer);
+      const tracked = sessionId === undefined ? undefined : activeRef.current.get(sessionId);
+      if (tracked) { tracked.abort?.(); tracked.abort = null; }
+    };
+  }, [sessionId]);
+
+  const isCurrent = (turn: ActiveTurn): boolean => activeRef.current.get(turn.sessionId) === turn;
 
   // 切会话后不再把旧轮的增量投进新会话的列表；终态清理照旧执行。
   const emit = (turn: ActiveTurn, event: TurnEvent): void => {
@@ -162,9 +245,10 @@ export function useAiChatTurn({ sessionId, onEvent }: UseAiChatTurnOptions): {
 
   const finish = (turn: ActiveTurn): void => {
     if (!isCurrent(turn)) return;
-    activeRef.current = null;
-    setBusy(false);
-    setRequestId(null);
+    activeRef.current.delete(turn.sessionId);
+    turn.abort?.();
+    turn.abort = null;
+    refresh((value) => value + 1);
   };
 
   /** 非流式通道：与流式共用同一个 requestId 与同一份请求体。 */
@@ -205,6 +289,11 @@ export function useAiChatTurn({ sessionId, onEvent }: UseAiChatTurnOptions): {
       try {
         const status = await get<TurnStatusView>(`/api/ai/turns/${turn.requestId}`);
         if (!isCurrent(turn)) return;
+        if (status.active && ['RUNNING', 'QUEUED'].includes(status.status ?? '')) {
+          turn.abort = null;
+          emit(turn, { type: 'snapshot', requestId: turn.requestId, status });
+          return;
+        }
         emit(turn, {
           type: 'status',
           requestId: turn.requestId,
@@ -246,9 +335,12 @@ export function useAiChatTurn({ sessionId, onEvent }: UseAiChatTurnOptions): {
         turn.produced = true;
         emit(turn, { type: 'reasoning', requestId: turn.requestId, delta });
       },
-      onMetadata: () => {
+      onMetadata: (metadata) => {
         turn.begun = true;
         emit(turn, { type: 'begun', requestId: turn.requestId });
+        if (metadata.supplements) emit(turn, { type: 'supplements', requestId: turn.requestId, supplements: metadata.supplements });
+        const recovery = readRecovery(metadata.recovery);
+        if (recovery !== undefined) emit(turn, { type: 'recovery', requestId: turn.requestId, recovery });
       },
       onToolActivity: (event) => {
         if (event.requestId !== turn.requestId) return;
@@ -279,7 +371,8 @@ export function useAiChatTurn({ sessionId, onEvent }: UseAiChatTurnOptions): {
               sessionId: failure.sessionId,
               stateDurable: failure.stateDurable,
               persistenceStatus: failure.persistenceStatus,
-              toolActivities: failure.toolActivities
+              toolActivities: failure.toolActivities,
+              recovery: failure.recovery
             }
           });
           finish(turn);
@@ -294,12 +387,12 @@ export function useAiChatTurn({ sessionId, onEvent }: UseAiChatTurnOptions): {
           : '这一轮没有收到结束帧，正在向服务端确认结果');
       }
     });
-    if (isCurrent(turn)) turn.abort = abort;
+    if (isCurrent(turn) && turn.sessionId === sessionRef.current) turn.abort = abort;
     else abort();
   }
 
   const send = (input: TurnInput): void => {
-    if (activeRef.current) return;
+    if (activeRef.current.has(input.sessionId) || isSessionRunning(runtimesRef.current.find((item) => item.sessionId === input.sessionId))) return;
     const id = generateUuidV7(Date.now());
     const turn: ActiveTurn = {
       requestId: id,
@@ -311,9 +404,9 @@ export function useAiChatTurn({ sessionId, onEvent }: UseAiChatTurnOptions): {
       fallbackTried: false,
       abort: null
     };
-    activeRef.current = turn;
-    setBusy(true);
-    setRequestId(id);
+    activeRef.current.set(input.sessionId, turn);
+    refresh((value) => value + 1);
+    emit(turn, { type: 'begun', requestId: id });
     // 正文是否分段由模型配置决定；状态事件始终使用 SSE，关闭正文流式仍能看到真实工具进度。
     void runStream(turn);
   };
@@ -333,16 +426,24 @@ export function useAiChatTurn({ sessionId, onEvent }: UseAiChatTurnOptions): {
     }
   }
 
-  const stop = (): void => {
-    const turn = activeRef.current;
-    if (!turn) return;
-    turn.abort?.();
-    // 只断前端连接时，后端要等下一次写失败或总期限才察觉；带着本轮身份主动取消，会话立刻可用。
-    void post(`/api/ai/turns/${turn.requestId}/cancel`, {}).catch(() => undefined).then(() => reconcile(turn));
-    activeRef.current = null;
-    setBusy(false);
-    setRequestId(null);
+  const stopSession = async (id: number): Promise<void> => {
+    const tracked = activeRef.current.get(id);
+    const current = runtimesRef.current.find((item) => item.sessionId === id);
+    const expected = tracked?.requestId ?? current?.requestId;
+    if (!expected) return;
+    for (let attempt = 0; ; attempt++) {
+      try { await post(`/api/ai/turns/${expected}/cancel`, {}); break; }
+      catch (error) {
+        // A fast click can precede the stream's begin receipt. Retry only this identity, never its successor.
+        if (!(error instanceof ApiError) || error.code !== 'TURN_NOT_FOUND' || !tracked
+          || activeRef.current.get(id) !== tracked || attempt >= 3) throw error;
+        await wait([100, 250, 500][attempt]);
+      }
+    }
+    setRuntimes((items) => items.map((item) => item.sessionId === id ? { ...item, phase: 'stopping' } : item));
+    // Keep the subscription and busy state until the server confirms terminal state.
   };
+  const stop = (): void => { if (sessionRef.current !== undefined) void stopSession(sessionRef.current).catch(() => setReconnecting(true)); };
 
-  return { send, stop, busy, requestId };
+  return { send, stop, busy, requestId, activeSessionId: busy ? sessionId : undefined, runtimes, reconnecting, stopSession };
 }

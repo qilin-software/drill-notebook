@@ -66,6 +66,13 @@ public class ChatHistoryRepository {
         this.dataSource = dataSource;
     }
 
+    public List<com.drillnotebook.app.service.ChatSupplement> supplements(String requestId,
+            com.drillnotebook.app.service.ChatMessageCipher cipher,String password) throws SQLException {
+        try(var connection=dataSource.getConnection()) {
+            return com.drillnotebook.app.service.ChatSupplement.read(connection,requestId,cipher,password);
+        }
+    }
+
     /** 倒序取 {@code beforeTurnId} 之前的一批轮次（含非终态与墓碑行，由投影按规则过滤）。 */
     public List<TurnHistory> turnBatch(long sessionId, long beforeTurnId, int limit) throws SQLException {
         String sql = TURN_COLUMNS + " WHERE t.session_id = ? AND t.id < ? ORDER BY t.id DESC LIMIT ?";
@@ -540,6 +547,34 @@ public class ChatHistoryRepository {
         }
     }
 
+    /** 轮次导航只查用户消息身份，正文始终按目标有界读取。 */
+    public long questionCount(long sessionId, Long throughMessageId) throws SQLException {
+        String sql = "SELECT count(*) FROM ai_chat_message WHERE session_id = ? AND role = 'user'"
+                + (throughMessageId == null ? "" : " AND id <= ?");
+        try (var connection = dataSource.getConnection(); var statement = connection.prepareStatement(sql)) {
+            statement.setLong(1, sessionId);
+            if (throughMessageId != null) statement.setLong(2, throughMessageId);
+            try (var result = statement.executeQuery()) { return result.next() ? result.getLong(1) : 0; }
+        }
+    }
+
+    public Optional<Long> questionIdAt(long sessionId, int roundNumber) throws SQLException {
+        if (roundNumber < 1) return Optional.empty();
+        try (var connection = dataSource.getConnection(); var statement = connection.prepareStatement(
+                "SELECT id FROM ai_chat_message WHERE session_id = ? AND role = 'user' ORDER BY id LIMIT 1 OFFSET ?")) {
+            statement.setLong(1, sessionId); statement.setInt(2, roundNumber - 1);
+            try (var result = statement.executeQuery()) { return result.next() ? Optional.of(result.getLong(1)) : Optional.empty(); }
+        }
+    }
+
+    public boolean hasMessageBefore(long sessionId, long messageId) throws SQLException {
+        try (var connection = dataSource.getConnection(); var statement = connection.prepareStatement(
+                "SELECT 1 FROM ai_chat_message WHERE session_id = ? AND id < ? LIMIT 1")) {
+            statement.setLong(1, sessionId); statement.setLong(2, messageId);
+            try (var result = statement.executeQuery()) { return result.next(); }
+        }
+    }
+
     /**
      * 清理范围里的一条消息（含 legacy 行）。字节按 {@link ChatStorageSizer#MESSAGE_BYTES_SQL} 现算，
      * 轮次归属留在行上：执行前要逐条核它还在不在原位，被改写就不许继续删。
@@ -682,5 +717,45 @@ public class ChatHistoryRepository {
                 return result.next() ? result.getLong(1) : 0L;
             }
         }
+    }
+    /**
+     * 各轮的事实记录：实际使用的模型与思考档位，以及供应商回报的累计用量。
+     * 没有记录或供应商未回报的项不返回，由界面留空，不补估算。
+     */
+    public java.util.Map<String, java.util.Map<String, Object>> turnFacts(long sessionId, java.util.Collection<String> requestIds)
+            throws SQLException {
+        java.util.Map<String, java.util.Map<String, Object>> result = new java.util.HashMap<>();
+        if (requestIds.isEmpty()) return result;
+        String marks = String.join(",", java.util.Collections.nCopies(requestIds.size(), "?"));
+        try (Connection connection = dataSource.getConnection()) {
+            try (PreparedStatement statement = connection.prepareStatement("SELECT request_id, model_label, reasoning_effort, page_title, page_link"
+                    + " FROM ai_chat_turn WHERE session_id = ? AND (model_label IS NOT NULL OR page_title IS NOT NULL) AND request_id IN (" + marks + ")")) {
+                statement.setLong(1, sessionId);
+                int index = 2;
+                for (String id : requestIds) statement.setString(index++, id);
+                try (ResultSet rows = statement.executeQuery()) {
+                    while (rows.next()) {
+                        java.util.Map<String, Object> facts = result.computeIfAbsent(rows.getString(1), key -> new java.util.LinkedHashMap<>());
+                        if (rows.getString(2) != null) facts.put("model", rows.getString(2));
+                        if (rows.getString(3) != null && !rows.getString(3).isBlank()) facts.put("reasoningEffort", rows.getString(3));
+                        if (rows.getString(4) != null) {
+                            java.util.Map<String, Object> page = new java.util.LinkedHashMap<>();
+                            page.put("title", rows.getString(4));
+                            if (rows.getString(5) != null) page.put("link", rows.getString(5));
+                            facts.put("page", page);
+                        }
+                    }
+                }
+            }
+            // 与会话累计共用归一化和旧重试回执，缓存读写不重复计入输入。
+            new ChatUsageRepository(dataSource).turns(connection, sessionId, requestIds).forEach((requestId, usage) ->
+                    result.computeIfAbsent(requestId, key -> new java.util.LinkedHashMap<>()).put("usage", usage));
+        }
+        return result;
+    }
+
+    public java.util.Map<String, Object> requestContextPage(long sessionId, String requestId, String beforeAttemptId)
+            throws SQLException {
+        return new ChatUsageRepository(dataSource).requestPage(sessionId, requestId, beforeAttemptId);
     }
 }

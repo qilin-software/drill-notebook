@@ -114,7 +114,7 @@ final class MaintenanceHarness {
         worker.useRetryJitter(0L);
         // 用例自己按假时钟调 drainOnce：后台线程跑起来的话，"排队落在哪一次 drain"就不确定了（§14 P6）
         worker.useBackgroundDrain(false);
-        sessionId = jdbc.queryForObject("SELECT id FROM ai_chat_session ORDER BY id LIMIT 1", Long.class);
+        sessionId = com.drillnotebook.app.repository.ChatLegacyWiring.ensureSession(jdbc);
         // 预算日按 UTC 固定：跨午夜用例不能依赖开发机的系统时区
         setBudgetZone("UTC");
     }
@@ -334,7 +334,8 @@ final class MaintenanceHarness {
         } catch (Exception error) {
             throw new IllegalStateException("测试用 API Key 加密失败", error);
         }
-        new AiConfigRepository(jdbc).upsertChat("custom", CHAT_ENDPOINT, "stub-model", cipherText, keyMeta, "{}");
+        new AiConfigRepository(jdbc).upsertChat("custom", CHAT_ENDPOINT, "stub-model", cipherText, keyMeta,
+                "{\"contextWindow\":128000,\"maxOutputTokens\":32000}");
         MemoryPolicyService.Target target = policy.targetOf(MemoryPolicyService.PURPOSE_MAINTENANCE);
         MemoryApiResult granted = policy.grantConsent(MemoryPolicyService.PURPOSE_MAINTENANCE, target.fingerprint(),
                 MemoryPolicyService.POLICY_VERSION);

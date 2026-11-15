@@ -73,7 +73,7 @@ class ChatContextServiceTest {
                 new MemoryJobRepository(dataSource, wiring.immediate()), wiring.metadata());
         new AiConfigRepository(jdbc).upsertChat("custom", "https://example.invalid/v1", "stub-model", "enc", "{}",
                 "{\"contextWindow\":32000}");
-        sessionId = jdbc.queryForObject("SELECT id FROM ai_chat_session ORDER BY id LIMIT 1", Long.class);
+        sessionId = com.drillnotebook.app.repository.ChatLegacyWiring.ensureSession(jdbc);
     }
 
     @AfterEach
@@ -313,14 +313,14 @@ class ChatContextServiceTest {
     }
 
     @Test
-    void modelInputLimitUsesFitAndNeverTruncatesCurrentQuestion() throws Exception {
+    void modelWindowUsesFitAndNeverTruncatesCurrentQuestion() throws Exception {
         String input = "当前问题".repeat(100);
         ChatTurnService.Lease lease = beginTurn(input, null, PASSWORD);
         try {
             assertThrows(ChatTurnRejectException.class, () -> stack.contexts().plan(lease, input, List.of(),
-                    Map.of(), Map.of("use", false), 32000, true, 100, 64));
+                    Map.of(), Map.of("use", false), 600, true, 64));
             ChatContextPlan plan = stack.contexts().plan(lease, input, List.of(), Map.of(), Map.of("use", false),
-                    32000, true, 3000, 64);
+                    32000, true, 64);
             assertTrue(serialized(plan).contains(input));
         } finally { wiring.turnService().abandon(lease, "test-cleanup"); }
     }

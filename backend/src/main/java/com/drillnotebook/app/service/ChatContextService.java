@@ -94,7 +94,7 @@ public class ChatContextService {
     }
 
     public enum MemoryWriteStatus {
-        CREATED, UPDATED, DUPLICATE, NO_CHANGE, NOT_FOUND, AMBIGUOUS, SUPPRESSED, UNAVAILABLE, STALE,
+        CREATED, UPDATED, DELETED, DUPLICATE, NO_CHANGE, NOT_FOUND, AMBIGUOUS, SUPPRESSED, UNAVAILABLE, STALE,
         INVALID_ARGUMENT, LIMIT_REACHED, REJECTED
     }
 
@@ -111,6 +111,10 @@ public class ChatContextService {
 
         static MemoryWrite updated(String memoryId, int version) {
             return new MemoryWrite(MemoryWriteStatus.UPDATED, memoryId, version, null, null);
+        }
+
+        static MemoryWrite deleted(String memoryId) {
+            return new MemoryWrite(MemoryWriteStatus.DELETED, memoryId, null, null, null);
         }
 
         static MemoryWrite noChange(String memoryId, int version) {
@@ -200,12 +204,12 @@ public class ChatContextService {
                                 Map<String, Object> pageContext, Map<String, Object> memoryOptions,
                                 int contextWindow, boolean windowKnown) throws SQLException {
         return plan(lease, userText, hits, pageContext, memoryOptions, contextWindow, windowKnown,
-                Integer.MAX_VALUE, ContextBudgeter.OUTPUT_RESERVE_TOKENS);
+                ContextBudgeter.OUTPUT_RESERVE_TOKENS);
     }
 
     public ChatContextPlan plan(ChatTurnService.Lease lease, String userText, List<RetrievalHit> hits,
                                 Map<String, Object> pageContext, Map<String, Object> memoryOptions,
-                                int contextWindow, boolean windowKnown, int maxInputTokens, int outputReserve) throws SQLException {
+                                int contextWindow, boolean windowKnown, int outputReserve) throws SQLException {
         ChatSessionMetadataRepository.State state = sessions.read(lease.sessionId())
                 .orElseThrow(() -> new ChatTurnRejectException(404, "SESSION_NOT_FOUND", "会话不存在", Map.of()));
         validatePageContext(pageContext, state);
@@ -228,6 +232,7 @@ public class ChatContextService {
         ChatContextAssembler.Draft draft = assembler.assemble(
                 new ChatContextAssembler.Input(userText, lease.masterPassword(), lease.attachments(), pageContext,
                         pageVersion(pageContext), allowed), projected, selection, hits, audit);
+        draft = assembler.withRetryState(draft, lease.requestId(), lease.retryContext(), audit);
         ContextBudgeter.Target target = new ContextBudgeter.Target(planId, lease.sessionId(),
                 state.contextGeneration(), projected.historyRevision(),
                 // 复核比的是"观测到的检查点版本"而不是"实际采用的摘要"：无效/锁定摘要降级后
@@ -235,7 +240,7 @@ public class ChatContextService {
                 projected.observedSummaryRevision(),
                 envelope.map(MemoryRepository.VaultEnvelope::epoch).orElse(null),
                 envelope.map(MemoryRepository.VaultEnvelope::revision).orElse(null),
-                policyRevision, contextWindow, windowKnown, maxInputTokens, outputReserve);
+                policyRevision, contextWindow, windowKnown, outputReserve);
         return budgeter.fit(draft, projected, target, audit);
     }
 
@@ -493,6 +498,50 @@ public class ChatContextService {
         }
     }
 
+    /**
+     * 模型删除工具入口：定位、作用域与版本复用更新工具的口径，删除本身复用记忆库的遗忘语义
+     * （写入抑制、推进纪元、作废旧摘要检查点）。成功后调用方须用 {@link #refreshAfterMemoryForget}
+     * 更新本轮计划，否则本轮后续请求会把自己造成的变化误判为上下文已变化。
+     */
+    public MemoryWrite deleteMemoryForTool(ChatContextPlan plan, boolean memoryUseRequested, String memoryId,
+                                           Integer expectedVersion, String currentText) {
+        if (plan == null || !matches(plan)) return MemoryWrite.stale();
+        if (!memoryUseRequested) {
+            return MemoryWrite.unavailable(ContextMemorySource.Availability.NOT_REQUESTED);
+        }
+        boolean byText = currentText != null && !currentText.isBlank();
+        boolean byId = memoryId != null && !memoryId.isBlank();
+        if (byText == byId || (byId && (expectedVersion == null || expectedVersion <= 0))
+                || (byText && expectedVersion != null)) {
+            return MemoryWrite.invalid();
+        }
+        try {
+            ToolAccess access = authorizeToolRead(plan);
+            if (access.status() != null) {
+                return access.status() == MemoryLookupStatus.STALE ? MemoryWrite.stale()
+                        : MemoryWrite.unavailable(access.availability());
+            }
+            MemoryKey key = vault.requireKey();
+            UpdateTarget target = byId
+                    ? resolveUpdateTarget(access, memoryId.strip(), expectedVersion)
+                    : resolveUpdateTarget(access, key, currentText.strip());
+            if (target.failure() != null) return target.failure();
+            MemoryApiResult deleted = items.delete(target.memoryId(), target.expectedVersion(), null);
+            if (deleted.status() != 204) return mapEditFailure(deleted);
+            // 204 也覆盖「已不存在」；只有确认当前版本确实消失才报告已删除。
+            if (memory.findCurrentAnyStatus(access.vaultId(), target.memoryId()).isPresent()) {
+                return MemoryWrite.unavailable(null);
+            }
+            rebuildIndexAfterWrite();
+            return MemoryWrite.deleted(target.memoryId());
+        } catch (MemoryCryptoException error) {
+            return MemoryWrite.unavailable(ContextMemorySource.Availability.LOCKED);
+        } catch (SQLException error) {
+            log.warn("对话内删除记忆失败: {}", error.getClass().getSimpleName());
+            return MemoryWrite.unavailable(null);
+        }
+    }
+
     private record UpdateTarget(String memoryId, int expectedVersion, MemoryWrite failure) {
         static UpdateTarget found(String memoryId, int version) {
             return new UpdateTarget(memoryId, version, null);
@@ -617,6 +666,32 @@ public class ChatContextService {
                 return plan;
             }
             return plan.withVaultSnapshot(current.vaultEpoch(), current.vaultRevision());
+        } catch (SQLException | RuntimeException error) {
+            return plan;
+        }
+    }
+
+    /**
+     * 本轮自己删除记忆之后的计划刷新：库纪元、版本与被作废的摘要检查点一起跟随到当前状态。
+     * 只在工具确认删除后调用；历史、generation、策略版本的变化仍交给发送前复核。
+     */
+    public ChatContextPlan refreshAfterMemoryForget(ChatContextPlan plan) {
+        if (plan == null) return null;
+        try {
+            Snapshot current = snapshot(plan.sessionId());
+            if (current.historyRevision() != plan.historyRevision()
+                    || current.contextGeneration() != plan.contextGeneration()
+                    || current.policyRevision() != plan.policyRevision()
+                    || plan.vaultRevision() == null || current.vaultRevision() == null
+                    || current.vaultRevision() != plan.vaultRevision() + 1
+                    || plan.vaultEpoch() == null || current.vaultEpoch() == null
+                    || (current.vaultEpoch() != plan.vaultEpoch().longValue()
+                        && current.vaultEpoch() != plan.vaultEpoch() + 1)
+                    || (current.summaryRevision() != null
+                        && !java.util.Objects.equals(current.summaryRevision(), plan.summaryRevision()))) {
+                return plan;
+            }
+            return plan.withMemorySnapshot(current.summaryRevision(), current.vaultEpoch(), current.vaultRevision());
         } catch (SQLException | RuntimeException error) {
             return plan;
         }

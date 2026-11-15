@@ -80,7 +80,7 @@ class ConversationProjectionTest {
         projection = new ConversationProjection(new ChatHistoryRepository(dataSource),
                 new SessionContextRepository(dataSource), wiring.metadata(), wiring.cipher(), wiring.memory(),
                 crypto, vault, policy, estimator, mapper);
-        sessionId = jdbc.queryForObject("SELECT id FROM ai_chat_session ORDER BY id LIMIT 1", Long.class);
+        sessionId = com.drillnotebook.app.repository.ChatLegacyWiring.ensureSession(jdbc);
         ChatMessageCipher.Encrypted user = wiring.cipher().encrypt(USER_TEXT, "");
         ChatMessageCipher.Encrypted reply = wiring.cipher().encrypt(REPLY_TEXT, "");
         userCipher = user.cipher();
@@ -133,6 +133,38 @@ class ConversationProjectionTest {
         assertEquals(18, result.coveredCandidates().size(), "被替掉的原文要留着：摘要被预算舍弃时回补用");
         assertEquals(1L, result.observedSummaryRevision(), "观测版本与实际采用的摘要分开记（§4.5）");
         assertFalse(result.summary().audit().hasGaps(), "连续且无非完成轮次时不该报缺口");
+    }
+
+    @Test
+    void aValidCheckpointAloneDoesNotInventAnActualModelContext() throws Exception {
+        seedTurns(20); createVault(); enableSummaryAuthorization();
+        checkpoint(1L, 20L, 1L, List.of(new long[]{1, 10}, new long[]{12, 20}));
+        var storageBefore = wiring.ledger().read();
+        var occupancy = new SessionContextOccupancyService(dataSource, wiring.turnService(), new ObjectMapper());
+        assertNotNull(projection.currentSummary(sessionId, 1));
+        assertNull(occupancy.read(sessionId), "有历史和有效摘要但没有外发快照时，模型实际上下文仍未知");
+        assertEquals(storageBefore, wiring.ledger().read());
+        assertEquals(1, jdbc.queryForObject("SELECT COUNT(*) FROM ai_session_context", Integer.class));
+    }
+
+    @Test
+    void readingActualContextNeverDeletesAnInvalidOldCheckpoint() throws Exception {
+        seedTurns(20); createVault(); enableSummaryAuthorization();
+        checkpoint(1L, 20L, 1L, coverage(1, 20));
+        // 当前表 CHECK 只允许 v2；旧 v1 读取结果通过仓储边界注入，不放宽生产约束。
+        var oldCheckpoints = org.mockito.Mockito.mock(SessionContextRepository.class);
+        org.mockito.Mockito.when(oldCheckpoints.read(sessionId)).thenReturn(java.util.Optional.of(
+                new SessionContextRepository.Checkpoint(sessionId, 1L, 20L, 1L, 0L,
+                        null, null, 40L, "2026-10-12T00:00:00.000Z", 1)));
+        var oldProjection = new ConversationProjection(new ChatHistoryRepository(dataSource), oldCheckpoints,
+                wiring.metadata(), wiring.cipher(), wiring.memory(), crypto, vault, policy,
+                new TokenEstimator(new ObjectMapper()), new ObjectMapper());
+        var occupancy = new SessionContextOccupancyService(dataSource, wiring.turnService(), new ObjectMapper());
+        assertNull(oldProjection.currentSummary(sessionId, 1));
+        assertNull(occupancy.read(sessionId));
+        org.mockito.Mockito.verify(oldCheckpoints, org.mockito.Mockito.never()).delete(sessionId);
+        assertEquals(2, jdbc.queryForObject("SELECT schema_version FROM ai_session_context WHERE session_id = ?", Integer.class, sessionId),
+                "只读统计不调用发送路径的旧摘要修复 / 删除逻辑");
     }
 
     @Test

@@ -57,13 +57,64 @@ public class ChatHistoryService {
         for (int index = from; index < rows.size() && messages.size() < bounded; index++) {
             messages.add(view(rows.get(index), password));
         }
+        java.util.Set<String> requestIds = new java.util.HashSet<>();
+        for (Map<String, Object> message : messages) {
+            if (message.get("requestId") instanceof String id) requestIds.add(id);
+        }
+        Map<String, Map<String, Object>> facts = history.turnFacts(sessionId, requestIds);
+        for (Map<String, Object> message : messages) {
+            Map<String, Object> used = facts.get(message.get("requestId"));
+            if (used == null) continue;
+            // 绑定页面属于提问，模型与用量属于回答。
+            boolean question = "user".equals(message.get("role"));
+            for (var entry : used.entrySet()) {
+                if (question == "page".equals(entry.getKey()) && ("user".equals(message.get("role")) || "assistant".equals(message.get("role"))))
+                    message.put(entry.getKey(), entry.getValue());
+            }
+        }
         Map<String, Object> result = new LinkedHashMap<>();
         result.put("sessionId", sessionId);
         result.put("messages", messages);
         result.put("historyRevision", revision(sessionId));
         result.put("hasMore", hasMore);
         result.put("limit", bounded);
+        result.put("totalRounds", history.questionCount(sessionId, null));
+        messages.stream().filter(message -> "user".equals(message.get("role"))).findFirst().ifPresent(message -> {
+            try { result.put("firstRound", history.questionCount(sessionId, ((Number) message.get("id")).longValue())); }
+            catch (SQLException failure) { throw new IllegalStateException("读取轮次位置失败", failure); }
+        });
+        if (afterMessageId != null) result.put("hasOlder", !messages.isEmpty()
+                && history.hasMessageBefore(sessionId, ((Number) messages.get(0).get("id")).longValue()));
         return result;
+    }
+
+    public Map<String, Object> navigation(long sessionId, int roundNumber) throws SQLException {
+        if (sessions.read(sessionId).isEmpty()) throw new ChatTurnRejectException(404, "SESSION_NOT_FOUND", "会话不存在或已删除", Map.of());
+        long total = history.questionCount(sessionId, null);
+        long messageId = history.questionIdAt(sessionId, roundNumber).orElseThrow(() ->
+                new ChatTurnRejectException(404, "CONVERSATION_ROUND_NOT_FOUND", "这轮对话不存在或已清理", Map.of()));
+        var questions = history.page(sessionId, null, messageId - 1, 1);
+        if (questions.isEmpty() || questions.get(0).messageId() != messageId) throw new ChatTurnRejectException(404,
+                "CONVERSATION_ROUND_NOT_FOUND", "这轮对话已清理，请重新选择", Map.of());
+        Long nextQuestion = history.questionIdAt(sessionId, roundNumber + 1).orElse(null);
+        var tail = history.page(sessionId, nextQuestion, null, 1);
+        String password = sessionPassword(sessionId);
+        HistoryRow question = questions.get(0);
+        HistoryRow answer = !tail.isEmpty() && "assistant".equals(tail.get(0).role()) ? tail.get(0) : null;
+        var result = new LinkedHashMap<String, Object>();
+        result.put("roundNumber", roundNumber); result.put("totalRounds", total); result.put("messageId", messageId);
+        result.put("question", previewText(question, password, 240));
+        result.put("answer", answer == null ? "" : previewText(answer, password, 600));
+        result.put("createdAt", question.createdAt());
+        result.put("status", answer == null ? question.turnStatus() : answer.turnStatus());
+        result.put("historyRevision", revision(sessionId));
+        return result;
+    }
+
+    private String previewText(HistoryRow row, String password, int max) {
+        if (row.contentDeleted()) return "消息内容已清理";
+        String text = cipher.readLegacy(row.content(), row.contentCipher(), row.contentMeta(), password).orSentinel();
+        return RetrievalService.truncateCodepoints(text, max);
     }
 
     private Map<String, Object> view(HistoryRow row, String password) {
@@ -90,12 +141,17 @@ public class ChatHistoryService {
         item.put("readable", content.status() == ChatMessageCipher.ReadStatus.DECRYPTED
                 || content.status() == ChatMessageCipher.ReadStatus.EMPTY);
         if ("assistant".equals(row.role()) && !row.contentDeleted()) {
+            try {item.put("supplements",history.supplements(row.requestId(),cipher,password).stream().map(ChatSupplement::view).toList());}
+            catch(SQLException|ChatCryptoException error){item.put("supplementsUnavailable",true);}
             ChatMessageCipher.Read meta = cipher.read(row.resultMetaCipher(), row.resultMetaCrypto(), password);
             if (meta.status() == ChatMessageCipher.ReadStatus.DECRYPTED) {
                 item.put("toolActivities", ToolActivity.readMeta(meta.value(), false));
                 try {
-                    String reason = new com.fasterxml.jackson.databind.ObjectMapper().readTree(meta.value()).path("finishReason").asText("");
+                    var decoded = new com.fasterxml.jackson.databind.ObjectMapper().readTree(meta.value());
+                    String reason = decoded.path("finishReason").asText("");
                     if (reason.matches("[a-z_]{1,40}")) item.put("finishReason", reason);
+                    if (decoded.path("recovery").isObject()) item.put("recovery", new com.fasterxml.jackson.databind.ObjectMapper()
+                            .treeToValue(decoded.path("recovery"), com.drillnotebook.app.model.AiRecovery.class));
                 } catch (com.fasterxml.jackson.core.JsonProcessingException ignored) { /* 旧或损坏元数据不补造原因。 */ }
             }
         }

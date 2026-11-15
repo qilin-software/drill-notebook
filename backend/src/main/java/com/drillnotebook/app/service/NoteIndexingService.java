@@ -190,8 +190,14 @@ public class NoteIndexingService {
     @Transactional
     public Map<String, Object> createAndIndexPage(
             long notebookId, String title, Object content) {
+        return createAndIndexPage(notebookId, title, content, null);
+    }
+
+    @Transactional
+    public Map<String, Object> createAndIndexPage(
+            long notebookId, String title, Object content, Long parentPageId) {
         // Insert the page
-        long pageId = notebooks.insertPage(notebookId, title, content);
+        long pageId = notebooks.insertPage(notebookId, title, content, parentPageId);
         // If content is provided, index it in the same transaction
         if (content != null) {
             return savePageAndIndex(pageId, null, content);
@@ -243,6 +249,9 @@ public class NoteIndexingService {
     @Transactional
     public void deletePage(long pageId) {
         deletePageIndex(pageId);
+        // 子页面改挂到被删页面的上级，不留下指向已删除页面的层级引用。
+        jdbc.update("UPDATE note_page SET parent_id = (SELECT parent_id FROM note_page WHERE id = ?) WHERE parent_id = ?",
+                pageId, pageId);
         jdbc.update("DELETE FROM note_page WHERE id = ?", pageId);
     }
 

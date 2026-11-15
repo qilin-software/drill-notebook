@@ -60,9 +60,9 @@ class ChatUpstreamDispatchTest {
         server = new UpstreamFixtureServer();
         ai = new AiService(new AiConfigRepository(jdbc), wiring.sessions(), new ApiKeyEncryptor(),
                 new ObjectMapper(), null, wiring.turnService(), wiring.cipher(), stack.contexts());
-        ai.saveConfig(Map.of("provider", "custom", "endpoint", server.baseUrl(), "model", "stub-model",
+        ai.saveConfig(TestModelLimits.config("provider", "custom", "endpoint", server.baseUrl(), "model", "stub-model",
                 "apiKey", "stub-key"));
-        sessionId = jdbc.queryForObject("SELECT id FROM ai_chat_session ORDER BY id LIMIT 1", Long.class);
+        sessionId = com.drillnotebook.app.repository.ChatLegacyWiring.ensureSession(jdbc);
     }
 
     @AfterEach
@@ -72,7 +72,7 @@ class ChatUpstreamDispatchTest {
     }
 
     @Test
-    void applyingAnotherModelDuringPreparationOnlyAffectsTheNextTurn() throws Exception {
+    void selectingAnotherModelDuringPreparationOnlyAffectsTheNextTurn() throws Exception {
         var configs = new AiConfigRepository(jdbc);
         var connections = new AiConnectionsService(configs, new ApiKeyEncryptor(), new ObjectMapper());
         connections.view();
@@ -82,13 +82,14 @@ class ChatUpstreamDispatchTest {
         connections.saveModels(null, initial.chatModelId(), Map.of("revision", initial.revision(), "modelId", "stub-model",
                 "streaming", false, "tools", false, "maxOutputTokens", 1000, "reasoningEfforts", List.of("low", "high"), "defaultReasoningEffort", "high"));
         connections.saveModels(providerId, null, Map.of("revision", connections.view().get("revision"), "modelId", "next-model",
-                "streaming", false, "tools", false, "maxOutputTokens", 300));
+                "streaming", false, "tools", false, "contextWindow", 128000, "maxOutputTokens", 300));
         String next = configs.connections().read().providers().get(0).models().get(1).id();
         var switched = new java.util.concurrent.atomic.AtomicBoolean();
 
         ai.chatStream(v2("本轮保持原配置"), (type, text) -> true, metadata -> {
             if (!switched.compareAndSet(false, true)) return;
-            connections.bind(Map.of("revision", connections.view().get("revision"), "purpose", "chat", "modelId", next));
+            connections.selectChatModel(Map.of("revision", connections.view().get("revision"), "modelConfigId", next,
+                    "sessionId", sessionId));
             assertEquals("CONFIG_BUSY", assertThrows(ChatTurnRejectException.class, () -> connections.delete(
                     initial.chatModelId(), false, Map.of("revision", connections.view().get("revision")))).code());
         });
@@ -102,6 +103,11 @@ class ChatUpstreamDispatchTest {
         assertEquals("next-model", mapper.readTree(server.bodies().get(1)).path("model").asText());
         assertEquals(300, mapper.readTree(server.bodies().get(1)).path("max_tokens").asInt());
         assertFalse(mapper.readTree(server.bodies().get(1)).has("reasoning_effort"));
+        List<String> summaries = jdbc.queryForList("SELECT context_breakdown FROM ai_usage_attempt"
+                + " WHERE context_breakdown IS NOT NULL ORDER BY created_at, id", String.class);
+        assertEquals(2, summaries.size());
+        assertEquals("stub-model", mapper.readTree(summaries.get(0)).path("model").asText());
+        assertEquals("next-model", mapper.readTree(summaries.get(1)).path("model").asText());
         connections.delete(initial.chatModelId(), false, Map.of("revision", connections.view().get("revision")));
     }
 
@@ -172,10 +178,14 @@ class ChatUpstreamDispatchTest {
                 "两条路径只共享一轮");
 
         server.close();
-        streaming.handle((result, error) -> null).get(5, java.util.concurrent.TimeUnit.SECONDS);
+        assertEquals(true, wiring.turnService().cancel(requestId).get("cancelSignalled"),
+                "断流后按恢复策略继续运行，显式停止必须命中同一轮的活跃句柄");
+        AiService.ChatResult stopped = streaming.get(5, java.util.concurrent.TimeUnit.SECONDS);
+        assertEquals("ABORTED", stopped.status());
         assertEquals(1, server.bodies().size());
-        assertFalse("RUNNING".equals(jdbc.queryForObject(
-                "SELECT status FROM ai_chat_turn WHERE request_id = ?", String.class, requestId)));
+        assertEquals("ABORTED", jdbc.queryForObject(
+                "SELECT status FROM ai_chat_turn WHERE request_id = ?", String.class, requestId));
+        assertFalse(wiring.handles().isActive(requestId), "停止后释放原轮次句柄");
     }
 
     @Test
@@ -222,7 +232,7 @@ class ChatUpstreamDispatchTest {
                 Long.class).longValue(), "预留与终态同事务结算");
 
         // 修好配置后同一会话还能开新的一轮：悬挂没有占住会话
-        ai.saveConfig(Map.of("provider", "custom", "endpoint", server.baseUrl(), "model", "stub-model",
+        ai.saveConfig(TestModelLimits.config("provider", "custom", "endpoint", server.baseUrl(), "model", "stub-model",
                 "apiKey", "stub-key"));
         assertEquals("COMPLETED", ai.chat(v2("修好之后继续")).get("status"));
     }

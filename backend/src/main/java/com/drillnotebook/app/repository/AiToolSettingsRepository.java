@@ -1,0 +1,54 @@
+package com.drillnotebook.app.repository;
+
+import com.drillnotebook.app.model.AiToolSettings;
+import com.drillnotebook.app.service.ChatTurnRejectException;
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import java.util.LinkedHashMap;
+import java.util.Map;
+import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.stereotype.Repository;
+
+/** 工具开关保存在现有便携数据库；仅无记录时使用默认值，损坏配置不能冒充默认开启。 */
+@Repository
+public class AiToolSettingsRepository {
+    public record Snapshot(long revision, AiToolSettings values) { }
+    private final JdbcTemplate jdbc;
+    private final ObjectMapper mapper = new ObjectMapper();
+
+    public AiToolSettingsRepository(JdbcTemplate jdbc) { this.jdbc = jdbc; }
+
+    public Snapshot read() {
+        var rows = jdbc.query("SELECT revision, document FROM ai_tool_settings WHERE id = 1",
+                (rs, index) -> new Snapshot(rs.getLong("revision"), parse(rs.getString("document"))));
+        return rows.isEmpty() ? new Snapshot(0, AiToolSettings.DEFAULTS) : rows.get(0);
+    }
+
+    public Snapshot save(long revision, AiToolSettings values) {
+        if (revision < 0 || values == null) throw new IllegalArgumentException("设置版本或内容无效");
+        String json;
+        try { json = mapper.writeValueAsString(Map.of("enabled", values.overrides())); }
+        catch (Exception error) { throw new IllegalArgumentException("设置无法保存", error); }
+        int changed = revision == 0
+                ? jdbc.update("INSERT OR IGNORE INTO ai_tool_settings(id, revision, document) VALUES (1, 1, ?)", json)
+                : jdbc.update("UPDATE ai_tool_settings SET revision = revision + 1, document = ? WHERE id = 1 AND revision = ?", json, revision);
+        if (changed != 1) throw new ChatTurnRejectException(409, "AI_SETTINGS_CONFLICT",
+                "设置已在其他窗口修改，请重新载入后保存", Map.of());
+        return new Snapshot(revision + 1, values);
+    }
+
+    /** 忽略其它版本的未知项；已知项损坏则报错，不能意外重新开启用户关闭的工具。 */
+    private AiToolSettings parse(String document) {
+        Map<String, Boolean> enabled = new LinkedHashMap<>();
+        try {
+            JsonNode node = mapper.readTree(document).path("enabled");
+            if (!node.isObject()) throw new IllegalArgumentException("工具开关须为对象");
+            node.fields().forEachRemaining(entry -> {
+                if (!AiToolSettings.managed(entry.getKey())) return;
+                if (!entry.getValue().isBoolean()) throw new IllegalArgumentException("工具开关须为布尔值");
+                enabled.put(entry.getKey(), entry.getValue().booleanValue());
+            });
+        } catch (Exception error) { throw new IllegalStateException("工具设置无法读取，请检查本地数据", error); }
+        return new AiToolSettings(enabled);
+    }
+}

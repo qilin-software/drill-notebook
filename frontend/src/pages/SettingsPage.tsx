@@ -1,14 +1,17 @@
 import { useCallback, useRef, useState, type KeyboardEvent } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { Button, Card, Empty, Form, Input, InputNumber, Message, Modal, Popconfirm, Radio, Select, Space, Spin, Switch, Tag, Typography } from '@arco-design/web-react';
-import { Edit3, Plus, RotateCcw, Sparkles, Star, Trash2 } from 'lucide-react';
+import { Edit3, Plus, RotateCcw, Star, Trash2 } from 'lucide-react';
 import { AiConnectionsPanel, type SettingsLeaveGuard } from '../components/ai-connections/AiConnectionsPanel';
 import { EmbeddingSettingsCard } from '../components/EmbeddingSettingsCard';
 import { MemoryManager } from '../components/ai-memory/MemoryManager';
 import { MemorySettingsCard } from '../components/ai-memory/MemorySettingsCard';
 import { AiRuntimeSettingsPanel } from '../components/AiRuntimeSettingsPanel';
+import { AiToolSettingsPanel } from '../components/AiToolSettingsPanel';
 import { DataManagementPanel } from '../components/DataManagementPanel';
+import { AboutPanel } from '../components/app-update/AboutPanel';
 import { ShortcutRecorder } from '../components/ShortcutRecorder';
+import { PageContextProvider, pageContextRows } from '../components/PageContextProvider';
 import { useUiStore, type OutlineSide, type ThemeMode } from '../stores/uiStore';
 import { listConfigs, createConfig, updateConfig, deleteConfig } from '../lib/review';
 import type { SpacedRepetitionConfig } from '../lib/review';
@@ -69,10 +72,12 @@ const TABS: Array<{ key: SettingsTab; label: string }> = [
   { key: 'general', label: '常规' },
   { key: 'ai', label: 'AI 连接' },
   { key: 'ai-behavior', label: 'AI 对话' },
+  { key: 'tools', label: '工具' },
   { key: 'memory', label: '记忆' },
   { key: 'embedding', label: '嵌入与检索' },
   { key: 'study', label: '学习与复习' },
-  { key: 'data', label: '数据管理' }
+  { key: 'data', label: '数据管理' },
+  { key: 'about', label: '关于' }
 ];
 
 function readTabFromUrl(): SettingsTab {
@@ -91,9 +96,6 @@ export function SettingsPage(): JSX.Element {
   const setOutlineSide = useUiStore((state) => state.setOutlineSide);
   const notebookPanelsSwapped = useUiStore((state) => state.notebookPanelsSwapped);
   const setNotebookPanelsSwapped = useUiStore((state) => state.setNotebookPanelsSwapped);
-  const setAiOpen = useUiStore((state) => state.setAiOpen);
-  const aiFabVisible = useUiStore((state) => state.aiFabVisible);
-  const setAiFabVisible = useUiStore((state) => state.setAiFabVisible);
   const shortcutConfig = useUiStore((state) => state.shortcutConfig);
   const setShortcutConfig = useUiStore((state) => state.setShortcutConfig);
   const [activeTab, setActiveTab] = useState<SettingsTab>(readTabFromUrl);
@@ -267,9 +269,47 @@ export function SettingsPage(): JSX.Element {
     onError: (error) => Message.error(error instanceof Error ? error.message : '删除失败'),
   });
 
-  return <main className="page">
+  const tabLabel = TABS.find(tab => tab.key === activeTab)!.label;
+  const readableSettings = activeTab === 'general' ? [
+    pageContextRows('界面', [
+      ['主题', { light: '浅色', dark: '深色', system: '跟随系统' }[themeMode]],
+      ['专注模式大纲位置', outlineSide === 'left' ? '左侧' : '右侧'],
+      ['交换笔记本页面与大纲位置', notebookPanelsSwapped],
+      ['记住上次停留位置与各页选择', rememberViewState]
+    ]),
+    pageContextRows('快捷键', SHORTCUT_ACTIONS.map(meta => [
+      `${SHORTCUT_SCOPES.find(scope => scope.id === meta.scope)?.label} · ${meta.label}`,
+      shortcutConfig[meta.id].map(describeAccelerator).join(' / ') || '未设置'
+    ]))
+  ].join('\n\n') : activeTab === 'study' ? [
+    pageContextRows('学习偏好', [
+      ['会话结束默认加入记忆曲线', enrollDefault], ['会话结束默认写入日历', planDefault],
+      ['同日正确重复推进曲线', forceAdvance]
+    ]),
+    pageContextRows('会话内记忆曲线', [
+      ['启用循环背诵与错题重现', curveConfig.enabled], ['循环轮数', curveConfig.loops],
+      ['错题重复策略', { group: '组末复习', tail: '本轮末尾', gap: '延迟重现' }[curveConfig.strategy]],
+      ['每组题数', curveConfig.strategy === 'group' ? curveConfig.groupSize : undefined],
+      ['重现间隔', curveConfig.strategy === 'gap' ? curveConfig.gap : undefined],
+      ['不限制重复次数', curveConfig.maxRepeats === 0],
+      ['最大重复次数', curveConfig.maxRepeats === 0 ? undefined : curveConfig.maxRepeats],
+      ['下一轮顺序', { original: '保持原序', wrongFirst: '错题优先', random: '随机' }[curveConfig.nextRoundOrder]],
+      ['过关后跳过后续轮次', curveConfig.skipPassed]
+    ]),
+    '## 复习方案\n' + (reviewConfigsQuery.isPending ? '正在读取复习方案…' : reviewConfigsQuery.isError ? '复习方案读取失败'
+      : (reviewConfigsQuery.data ?? []).map(config => pageContextRows(config.name, [
+        ['默认方案', config.isDefault ? '是' : '否'], ['每天新学', config.dailyNewLimit], ['每天复习', config.dailyReviewLimit],
+        ['答错后策略', WRONG_STRATEGY_OPTIONS.find(option => option.value === config.wrongStrategy)?.label],
+        ['顺序', PRIORITY_OPTIONS.find(option => option.value === config.priorityMode)?.label],
+        ['间隔', Object.entries(config.intervals).map(([round, days]) => `第${round}次→${days}天`).join('，')],
+        ['初始难度系数 EF', config.initialEf], ['最大间隔天数', config.maxIntervalDays]
+      ])).join('\n\n') || '暂无复习方案，请新建一个')
+  ].join('\n\n') : '';
+
+  return <PageContextProvider context={{ kind: 'settings', title: `设置 · ${tabLabel}`, route: `/settings?tab=${activeTab}`,
+    markdown: `# 设置\n当前分区：${tabLabel}\n可选分区：${TABS.map(tab => tab.label).join('、')}\n${readableSettings}` }}><main className="page">
     <div className="page-heading">
-      <div><h1>设置</h1><p>主题、快捷键、AI 连接、记忆、嵌入检索与学习复习偏好。日常对话请用右下角 AI 悬浮球{shortcutConfig.toggleAi[0] ? `或 ${describeAccelerator(shortcutConfig.toggleAi[0])}` : ''}。</p></div>
+      <div><h1>设置</h1><p>主题、快捷键、AI 连接、记忆、嵌入检索与学习复习偏好。日常对话请用右上角 AI 助手{shortcutConfig.toggleAi[0] ? `或 ${describeAccelerator(shortcutConfig.toggleAi[0])}` : ''}。</p></div>
     </div>
     <div className="settings-tab-bar" role="tablist" aria-label="设置分区" onKeyDown={onTabBarKeyDown}>
       {TABS.map((tab) => (
@@ -311,17 +351,12 @@ export function SettingsPage(): JSX.Element {
             <Switch checked={notebookPanelsSwapped} onChange={setNotebookPanelsSwapped} aria-label="交换笔记本页面与大纲位置" />
           </div>
           <div className="settings-row">
-            <div><Typography.Text bold>显示 AI 悬浮球</Typography.Text><br /><Typography.Text type="secondary">隐藏后仍可用快捷键或下方按钮打开。</Typography.Text></div>
-            <Switch checked={aiFabVisible} onChange={setAiFabVisible} />
-          </div>
-          <div className="settings-row">
             <div><Typography.Text bold>记住上次停留位置与各页选择</Typography.Text><br /><Typography.Text type="secondary">重启后回到上次页面，并恢复各页勾选与切换。</Typography.Text></div>
             <Space align="center">
               <Button type="text" size="mini" disabled={!rememberViewState} onClick={onClearViewState}>清除已记住的位置</Button>
               <Switch checked={rememberViewState} onChange={onRememberViewStateChange} />
             </Space>
           </div>
-          <Button type="outline" icon={<Sparkles size={16} />} onClick={() => setAiOpen(true)}>打开 AI 助手</Button>
         </div>
       </section>
       <section className="panel">
@@ -566,6 +601,8 @@ export function SettingsPage(): JSX.Element {
     )}
 
     {activeTab === 'ai-behavior' && <div className="settings-tab-stack" role="tabpanel"><AiRuntimeSettingsPanel registerGuard={registerAiGuard} /></div>}
+    {activeTab === 'tools' && <div className="settings-tab-stack" role="tabpanel"><AiToolSettingsPanel /></div>}
+    {activeTab === 'about' && <AboutPanel />}
 
       {/* 记忆 Tab：一个总开关 + 记忆库的手动管理，维护细节不堆进界面 */}
       {activeTab === 'memory' && (
@@ -693,5 +730,5 @@ export function SettingsPage(): JSX.Element {
         </Form.Item>
       </Form>
     </Modal>
-  </main>;
+  </main></PageContextProvider>;
 }

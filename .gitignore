@@ -10,11 +10,23 @@ pnpm-debug.log*
 
 # Frontend, Electron, Java and packaging output
 frontend/dist/
+frontend/.vite/
+frontend/.vitest/
 electron-dist/
 backend/target/
+# JVM probe bytecode and exported Maven test reports are generated evidence.
+*.class
+/surefire-reports/
+/failsafe-reports/
 dist/
 release/
 out/
+# Portable release assets, unpacked directories and manifests are generated files.
+/Drill-Notebook-*-win-x64-portable.zip
+/Drill-Notebook-*-win-x64-portable.zip.sha256
+/Drill-Notebook-*-win-x64-portable/
+/win-unpacked/
+/drill-program-manifest.json
 electron-builder-cache/
 .mvn/wrapper/dists/
 *.tsbuildinfo
@@ -27,6 +39,9 @@ electron-builder-cache/
 /test-results/
 /blob-report/
 /qa-artifacts/
+# Standalone jsdom/Vitest reports may be exported outside frontend/.
+/vitest-report/
+/vitest-results.json
 coverage/
 .nyc_output/
 *.har
@@ -35,6 +50,7 @@ coverage/
 # Workspace-local Rust toolchain, cargo caches and build targets
 .tooling/
 embedding-worker/target/
+updater/target/
 
 # CodeGraph local index & daemon artifacts (db / shm / wal / log / pid)
 .codegraph/
@@ -73,6 +89,7 @@ credentials/
 # Application data, user profiles and portable runtime state
 # Anchor to repo root so source packages like backend/.../config are not ignored.
 /data/
+/backups/
 /cache/
 /logs/
 /runtime/
@@ -192,24 +209,21 @@ backend/src/test/resources/fixtures/java.pdf
 *.doc
 *.docm
 
-# docs/: ignore by default; re-include only public product docs (not design/plan trees)
+# docs/: include global docs and state/work/test/reference/release/archive trees
 docs/**
 !docs/
 !docs/jlink.md
-!docs/import-formats.md
-!docs/knowledge-point-import.md
-!docs/quiz-markdown-flow.md
-!docs/ai-summary.md
-!docs/ai-retrieval.md
-!docs/architecture.md
-!docs/review-srs.md
-!docs/session-curve.md
-!docs/README.md
+!docs/DESIGN.md
 !docs/features.md
-!docs/data-model.md
-!docs/api-contracts.md
-!docs/testing/
-!docs/testing/**
+!docs/README.md
+!docs/reference/
+!docs/reference/**
+!docs/release/
+!docs/release/**
+!docs/state/
+!docs/state/**
+!docs/test/
+!docs/test/**
 !docs/work/
 !docs/work/**
 !docs/archive/
@@ -223,9 +237,6 @@ docs/**
 /docs/**/*.bmp
 /docs/**/*.avif
 /docs/**/*.svg
-# Release records: the release gate reads this exact path.
-!docs/plans/
-!docs/plans/v0.7.0-release-notes.md
 # Persistent eval fixtures and live-eval sources are part of the release evidence.
 !backend/src/test/resources/eval/
 !backend/src/test/resources/eval/**

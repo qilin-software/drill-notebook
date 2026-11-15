@@ -71,7 +71,7 @@ function AddToNoteModal({ question, visible, onClose }: { question?: Question; v
   </Modal>;
 }
 
-export function QuizPage(): JSX.Element {
+export function QuizPage({ contextActive = true }: { contextActive?: boolean } = {}): JSX.Element {
   const navigate = useNavigate();
   const queryClient = useQueryClient();
   const [searchParams] = useSearchParams();
@@ -172,19 +172,20 @@ export function QuizPage(): JSX.Element {
     }
     const body = questionsToMarkdown([{
       ...question,
-      answer: result?.correctAnswer ?? question.answer,
-      analysis: result?.analysis ?? question.analysis
+      answer: result ? result.correctAnswer ?? question.answer : undefined,
+      analysis: result ? result.analysis ?? question.analysis : undefined
     }]);
     return {
       kind: 'quiz' as const,
       title: `刷题 · 第 ${index + 1} 题`,
       markdown: body,
       route: '/quiz',
-      questionId: question.id
+      questionId: question.id,
+      bankId: question.bankId
     };
   }, [index, question, result]);
 
-  useRegisterPageContext(pageContext);
+  useRegisterPageContext(pageContext, contextActive);
 
   useEffect(() => {
     const onKey = (event: KeyboardEvent): void => {
@@ -435,7 +436,7 @@ export function QuizPage(): JSX.Element {
   return <main className="page">
     {dayQueueMode ? <DayQueueSessionBar /> : null}
     <div className="page-heading">
-      <div><h1>刷题</h1><p>按筛选与编排顺序练习，提交后查看答案和解析。可用右下角 AI 助手讲解当前题。</p></div>
+      <div><h1>刷题</h1><p>按筛选与编排顺序练习，提交后查看答案和解析。可用右上角 AI 助手讲解当前题。</p></div>
       <Space>
         <CompletePlanButton
           planItemId={planItemId}

@@ -1,11 +1,12 @@
 import { useEffect, useLayoutEffect, useRef, useState, type ElementRef } from 'react';
 import { Button, Input, Select, Switch } from '@arco-design/web-react';
 import { ArrowLeft, Copy } from 'lucide-react';
-import { modelName, type ConnectionModel, type ConnectionProvider, type EditorHandle, type ModelPreset, type SaveConnection } from './types';
+import { incomplete, modelName, type ConnectionModel, type ConnectionProvider, type EditorHandle, type ModelPreset, type SaveConnection } from './types';
 import { matchPreset, presetFields, reasoningDraft, supportedEfforts, useModelPresets, type ModelDraft } from './modelPresets';
 import { ReasoningSettings } from './ReasoningSettings';
 import { VerificationDetails } from './ModelVerification';
 import { ModelIdInput } from './ModelIdInput';
+import { pageContextRows, usePageContextSection } from '../PageContextProvider';
 
 interface EditorProps {
   provider?: ConnectionProvider;
@@ -26,6 +27,13 @@ export function ProviderEditor({ provider, onState, save, leave, done, busy, imp
   const heading = useRef<HTMLHeadingElement>(null);
   useEffect(() => { if (heading.current) heading.current.focus(); else nameRef.current?.focus(); }, []);
   const dirty = JSON.stringify(draft) !== JSON.stringify(initial);
+  usePageContextSection('connection-editor', pageContextRows(provider ? '编辑连接' : '添加供应商', [
+    ['供应商名称', draft.name || '未填写'],
+    ['API 格式', draft.apiFormat === 'anthropic' ? 'Anthropic Messages' : 'OpenAI Chat Completions'],
+    ['连接地址', draft.endpoint ? '已填写' : '未填写'], ['认证方式', draft.authMode === 'none' ? '无需密钥' : 'API Key'],
+    ['密钥状态', draft.authMode === 'none' ? undefined : draft.changeKey ? draft.apiKey ? '已输入（未保存）' : '等待输入' : '已配置'],
+    ['保存状态', dirty ? '有未保存的修改' : '未修改']
+  ]), dirty);
   const patch = (value: Partial<typeof draft>) => { setDraft(current => ({ ...current, ...value })); setError(''); };
   const submit = async () => {
     if (!draft.name.trim() || !draft.endpoint.trim()) { setError('请填写供应商名称和 Base URL'); return false; }
@@ -72,7 +80,7 @@ export function ProviderEditor({ provider, onState, save, leave, done, busy, imp
 interface ModelProps extends EditorProps { provider: ConnectionProvider; model?: ConnectionModel; test?: () => void }
 export function ModelEditor({ provider, model, onState, save, leave, done, busy, impact, test }: ModelProps) {
   const [initial] = useState<ModelDraft>(() => ({ modelId: model?.modelId ?? '', name: model?.name ?? '', group: model?.group ?? '', streaming: model?.streaming ?? true,
-    tools: model?.tools ?? false, contextWindow: String(model?.contextWindow ?? ''), maxInputTokens: String(model?.maxInputTokens ?? ''), maxOutputTokens: String(model?.maxOutputTokens ?? ''), ...reasoningDraft(model) }));
+    tools: model?.tools ?? false, contextWindow: String(model?.contextWindow ?? ''), maxOutputTokens: String(model?.maxOutputTokens ?? ''), ...reasoningDraft(model) }));
   const [draft, setDraft] = useState(initial);
   const [selectedPreset, setSelectedPreset] = useState<ModelPreset>();
   const presets = useModelPresets(provider);
@@ -81,10 +89,21 @@ export function ModelEditor({ provider, model, onState, save, leave, done, busy,
   const [error, setError] = useState('');
   const heading = useRef<HTMLHeadingElement>(null);
   const dirty = JSON.stringify(initial) !== JSON.stringify(draft);
+  usePageContextSection('connection-editor', pageContextRows(model ? '编辑模型' : '添加模型', [
+    ['供应商', provider.name], ['模型 ID', draft.modelId || '未填写'], ['模型名称', draft.name || '使用模型 ID'],
+    ['分组名称', draft.group || '未分组'], ['流式输出', draft.streaming], ['允许工具调用', model ? draft.tools : false],
+    ['上下文窗口', /^\d+$/.test(draft.contextWindow) ? draft.contextWindow : '未填写或输入无效'],
+    ['最大输出 Token', /^\d+$/.test(draft.maxOutputTokens) ? draft.maxOutputTokens : '未填写或输入无效'],
+    ['思考控制', draft.reasoningControl],
+    ['可用思考等级', draft.reasoningControl === 'effort' ? draft.reasoningEfforts.join('、') || '未勾选' : undefined],
+    ['默认思考等级', draft.reasoningControl === 'effort' ? draft.defaultReasoningEffort || '沿用服务默认' : undefined],
+    ['思考 Token 预算', draft.reasoningControl === 'budget' ? /^\d+$/.test(draft.thinkingBudgetTokens) ? draft.thinkingBudgetTokens : '未填写或输入无效' : undefined],
+    ['保存状态', dirty ? '有未保存的修改' : '未修改']
+  ]), dirty);
   useEffect(() => { heading.current?.focus(); }, []);
   const patch = (value: Partial<ModelDraft>) => { setDraft(current => ({ ...current, ...value })); setError(''); };
   const selectPreset = (modelId: string, selected: ModelPreset) => {
-    const fields = { ...presetFields(selected), maxInputTokens: '', defaultReasoningEffort: '' };
+    const fields = { ...presetFields(selected), defaultReasoningEffort: '' };
     // 仅明确选择时填入预设；编辑 ID 与读取候选资料都不修改其他设置。
     setSelectedPreset(selected);
     patch({ modelId, ...fields });
@@ -99,14 +118,15 @@ export function ModelEditor({ provider, model, onState, save, leave, done, busy,
   const submit = async () => {
     if (!draft.modelId.trim()) { setError('请填写模型 ID'); return false; }
     if (provider.models.some(value => value.id !== model?.id && value.modelId === draft.modelId.trim())) { setError('此供应商已添加相同模型 ID'); return false; }
-    const limits: Record<string, number | null> = {};
-    for (const field of ['contextWindow', 'maxInputTokens', 'maxOutputTokens'] as const) {
+    const limits: Record<string, number> = {};
+    for (const field of ['contextWindow', 'maxOutputTokens'] as const) {
       const raw = draft[field].trim();
-      if (raw && (!/^\d+$/.test(raw) || Number(raw) < 1 || Number(raw) > 2147483647)) { setError('Token 上限须为 1–2147483647 的整数，留空使用应用策略'); return false; }
-      limits[field] = raw ? Number(raw) : null;
+      if (!raw) { setError('请填写上下文窗口和最大输出 Token'); return false; }
+      if (!/^\d+$/.test(raw) || Number(raw) < 1 || Number(raw) > 2147483647) { setError('Token 上限须为 1–2147483647 的整数'); return false; }
+      limits[field] = Number(raw);
     }
-    if (limits.contextWindow && ((limits.maxInputTokens ?? 0) > limits.contextWindow || (limits.maxOutputTokens ?? 0) > limits.contextWindow)) {
-      setError('输入与输出上限分别不得大于上下文窗口'); return false;
+    if (limits.maxOutputTokens > limits.contextWindow) {
+      setError('最大输出 Token 不得大于上下文窗口'); return false;
     }
     if (draft.reasoningControl === 'effort' && draft.reasoningEfforts.some(level => !supportedEfforts(provider.apiFormat).includes(level))) { setError('当前协议不支持所选思考等级，请取消不支持的等级'); return false; }
     if (draft.defaultReasoningEffort && !draft.reasoningEfforts.includes(draft.defaultReasoningEffort)) { setError('默认等级必须属于已勾选的思考等级'); return false; }
@@ -136,14 +156,14 @@ export function ModelEditor({ provider, model, onState, save, leave, done, busy,
     {model?.verification && !idChanged && <details className="connection-limits"><summary>最近验证结果</summary><VerificationDetails value={model.verification} /><p className="connection-hint">结果来自添加时的检测，不保证后续服务一直可用。</p></details>}
     <h3>输出与工具</h3>
     <div className="connection-setting"><div><strong id="stream-label">流式输出</strong><p id="stream-help">开启后逐步显示回答。</p></div><Switch aria-labelledby="stream-label" aria-describedby="stream-help" checked={draft.streaming} onChange={streaming => patch({ streaming })} disabled={busy} /></div>
-    <div className="connection-setting"><div><strong id="tools-label">允许工具调用</strong><p id="tools-help">{model ? '允许模型使用应用已提供并获授权的工具。' : '添加时根据验证结果自动设置，添加后可调整。'}</p>{impact?.includes('导入') && <p>仅对主模型对话生效，导入解析不调用记忆工具。</p>}</div><Switch aria-labelledby="tools-label" aria-describedby="tools-help" checked={model ? draft.tools : false} onChange={tools => patch({ tools })} disabled={busy || !model} /></div>
-    <details className="connection-limits"><summary>上下文与输出上限（可选）</summary><p className="connection-hint">自定义上限不会突破应用的任务限制。留空沿用应用策略；容量按保守估算检查。</p>
-      {([['contextWindow', '上下文窗口'], ['maxInputTokens', '最大输入 Token'], ['maxOutputTokens', '最大输出 Token']] as const).map(([field, label]) => <div className="connection-field" key={field}><label htmlFor={`model-${field}`}>{label}</label><Input id={`model-${field}`} inputMode="numeric" value={draft[field]} onChange={value => patch({ [field]: value })} placeholder="未指定" disabled={busy} /></div>)}
-    </details>
+    <div className="connection-setting"><div><strong id="tools-label">允许工具调用</strong><p id="tools-help">{model ? '允许模型使用应用已提供并获授权的工具。' : '添加时根据验证结果自动设置，添加后可调整。'}</p>{impact?.includes('导入') && <p>仅对 AI 助手对话生效，导入解析不调用记忆工具。</p>}</div><Switch aria-labelledby="tools-label" aria-describedby="tools-help" checked={model ? draft.tools : false} onChange={tools => patch({ tools })} disabled={busy || !model} /></div>
+    <section className="connection-limits"><h3>上下文与输出上限</h3><p className="connection-hint">两项均须填写，可选择预设自动填入。输入与输出共享上下文窗口；实际请求仍受全局运行限制约束。</p>
+      {([['contextWindow', '上下文窗口'], ['maxOutputTokens', '最大输出 Token']] as const).map(([field, label]) => <div className="connection-field" key={field}><label htmlFor={`model-${field}`}>{label}</label><Input id={`model-${field}`} inputMode="numeric" aria-required required value={draft[field]} onChange={value => patch({ [field]: value })} placeholder="必填" disabled={busy} /></div>)}
+    </section>
     {impact && <p className="connection-hint">保存后影响{impact}，从下一次请求生效。</p>}
     {error && <p role="alert" className="connection-error">{error}</p>}
     {!model && <p className="connection-hint">添加前自动验证文本、视觉与工具，可能产生少量用量；工具通过后自动开启。</p>}
-    <div className="connection-actions end">{model && <Button disabled={dirty || busy} onClick={test}>测试连接</Button>}<Button onClick={leave} disabled={busy}>取消</Button><Button type="primary" loading={busy} onClick={() => void submit()}>{model ? '保存模型设置' : '验证并添加模型'}</Button></div>
+    <div className="connection-actions end">{model && <Button disabled={dirty || busy || incomplete(provider, model)} onClick={test}>测试连接</Button>}<Button onClick={leave} disabled={busy}>取消</Button><Button type="primary" loading={busy} onClick={() => void submit()}>{model ? '保存模型设置' : '验证并添加模型'}</Button></div>
     {dirty && model && <p className="connection-hint">先保存或取消修改，再测试连接。</p>}
   </div>;
 }

@@ -130,6 +130,10 @@ CREATE TABLE IF NOT EXISTS ai_config (
 CREATE TABLE IF NOT EXISTS ai_chat_session (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     title TEXT NOT NULL,
+    session_ref TEXT,
+    title_source TEXT NOT NULL DEFAULT 'legacy',
+    title_status TEXT NOT NULL DEFAULT 'idle',
+    title_revision INTEGER NOT NULL DEFAULT 0,
     archived INTEGER NOT NULL DEFAULT 0,
     model TEXT,
     tags TEXT,
@@ -456,6 +460,16 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_ai_turn_running_session
     ON ai_chat_turn(session_id) WHERE status = 'RUNNING';
 CREATE INDEX IF NOT EXISTS idx_ai_turn_session_id ON ai_chat_turn(session_id, id);
 
+-- 原地重试复用 turn/message 身份；旧请求只保留幂等与工具回执链，不再成为新轮次。
+CREATE TABLE IF NOT EXISTS ai_chat_retry_receipt (
+    request_id TEXT PRIMARY KEY,
+    turn_id INTEGER NOT NULL REFERENCES ai_chat_turn(id) ON DELETE CASCADE,
+    retry_of TEXT,
+    replacement_request_id TEXT NOT NULL,
+    replaced_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_ai_retry_turn ON ai_chat_retry_receipt(turn_id);
+
 CREATE TABLE IF NOT EXISTS ai_chat_attachment (
     id TEXT PRIMARY KEY,
     turn_id INTEGER NOT NULL REFERENCES ai_chat_turn(id) ON DELETE CASCADE,
@@ -621,11 +635,15 @@ CREATE TABLE IF NOT EXISTS ai_usage_attempt (
     output_tokens INTEGER,
     cache_read_tokens INTEGER,
     cache_write_tokens INTEGER,
+    cache_read_included_in_input INTEGER CHECK (cache_read_included_in_input IN (0, 1)),
+    context_breakdown TEXT,
     usage_source TEXT NOT NULL CHECK (usage_source IN ('provider', 'estimate', 'unknown')),
     state TEXT NOT NULL CHECK (state IN ('RESERVED', 'SENT', 'SETTLED', 'UNKNOWN', 'RELEASED')),
     created_at TEXT NOT NULL,
     settled_at TEXT
 );
+
+CREATE INDEX IF NOT EXISTS idx_ai_usage_operation ON ai_usage_attempt(operation_id, purpose);
 
 CREATE TABLE IF NOT EXISTS ai_usage_daily (
     budget_date TEXT NOT NULL,
@@ -654,3 +672,94 @@ CREATE TABLE IF NOT EXISTS ai_chat_storage (
 );
 
 INSERT OR IGNORE INTO ai_chat_storage(id) VALUES (1);
+
+-- Dispatch receipts contain identities only; queued prompts and credentials never go here.
+CREATE TABLE IF NOT EXISTS ai_session_dispatch (
+    sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+    request_id TEXT NOT NULL UNIQUE,
+    session_id INTEGER NOT NULL,
+    source_key TEXT UNIQUE,
+    fingerprint TEXT NOT NULL,
+    state TEXT NOT NULL CHECK (state IN ('QUEUED','RUNNING','COMPLETED','FAILED','ABORTED','INTERRUPTED','CANCELLED','TRUNCATED')),
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    finished_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_dispatch_session ON ai_session_dispatch(session_id, sequence);
+
+-- Human drafts are encrypted; delivered supplements remain associated with their original run.
+CREATE TABLE IF NOT EXISTS ai_chat_pending (
+    request_id TEXT PRIMARY KEY REFERENCES ai_session_dispatch(request_id),
+    session_id INTEGER NOT NULL REFERENCES ai_chat_session(id) ON DELETE CASCADE,
+    state TEXT NOT NULL DEFAULT 'PENDING',
+    parent_request_id TEXT,
+    reply_offset INTEGER NOT NULL DEFAULT 0,
+    revision INTEGER NOT NULL DEFAULT 1,
+    payload_cipher TEXT NOT NULL,
+    payload_meta TEXT NOT NULL,
+    payload_bytes INTEGER NOT NULL,
+    removed_at TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_chat_pending_parent ON ai_chat_pending(parent_request_id);
+CREATE TABLE IF NOT EXISTS ai_chat_queue_state (
+    session_id INTEGER PRIMARY KEY REFERENCES ai_chat_session(id) ON DELETE CASCADE,
+    paused INTEGER NOT NULL DEFAULT 0,
+    editing_id TEXT,
+    resume_after_edit INTEGER NOT NULL DEFAULT 0
+);
+
+-- Idempotent material creation receipts contain references only, never tool arguments or content.
+CREATE TABLE IF NOT EXISTS ai_material_creation (
+    request_id TEXT NOT NULL,
+    operation_id TEXT NOT NULL,
+    session_id INTEGER NOT NULL REFERENCES ai_chat_session(id) ON DELETE CASCADE,
+    fingerprint TEXT NOT NULL,
+    material_type TEXT NOT NULL,
+    material_id INTEGER,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (request_id, operation_id)
+);
+CREATE INDEX IF NOT EXISTS idx_material_creation_session ON ai_material_creation(session_id);
+
+-- Update receipts retain identities and versions only, never patches or material content.
+CREATE TABLE IF NOT EXISTS ai_material_update (
+    request_id TEXT NOT NULL,
+    operation_id TEXT NOT NULL,
+    session_id INTEGER NOT NULL REFERENCES ai_chat_session(id) ON DELETE CASCADE,
+    fingerprint TEXT NOT NULL,
+    material_type TEXT NOT NULL,
+    material_id INTEGER NOT NULL,
+    result_version TEXT,
+    outcome TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (request_id, operation_id)
+);
+CREATE INDEX IF NOT EXISTS idx_material_update_session ON ai_material_update(session_id);
+
+-- Deletion receipts retain identities and outcomes only, never titles or material content.
+CREATE TABLE IF NOT EXISTS ai_material_deletion (
+    request_id TEXT NOT NULL,
+    operation_id TEXT NOT NULL,
+    session_id INTEGER NOT NULL REFERENCES ai_chat_session(id) ON DELETE CASCADE,
+    fingerprint TEXT NOT NULL,
+    material_type TEXT NOT NULL,
+    material_id INTEGER NOT NULL,
+    outcome TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (request_id, operation_id)
+);
+CREATE INDEX IF NOT EXISTS idx_material_deletion_session ON ai_material_deletion(session_id);
+
+-- Global tool switches keep explicit choices only; absent entries use the built-in default.
+CREATE TABLE IF NOT EXISTS ai_tool_settings (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    revision INTEGER NOT NULL,
+    document TEXT NOT NULL
+);
+
+-- Provider choices and encrypted keys share the portable database, independently of tool permissions.
+CREATE TABLE IF NOT EXISTS ai_web_settings (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    revision INTEGER NOT NULL,
+    document TEXT NOT NULL
+);

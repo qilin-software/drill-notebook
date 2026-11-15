@@ -37,7 +37,11 @@ public class AiConnectionsService {
         this.upstream = new AiUpstreamClient(HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(10)).build(), mapper);
     }
 
-    private State state() { return store.initialize(this::migrate); }
+    private State state() {
+        State state = store.initialize(this::migrate);
+        store.initializeSessionChoices(state);
+        return state;
+    }
     public Map<String, Object> view() { synchronized (AiConnectionUsage.LOCK) { return view(state()); } }
     public List<AiModelPresets.Preset> presets(String providerId) {
         synchronized (AiConnectionUsage.LOCK) { return AiModelPresets.forProvider(provider(state(), providerId)); }
@@ -109,7 +113,7 @@ public class AiConnectionsService {
             Provider saved = new Provider(old == null ? uuid() : id, name, format, endpoint, auth, encrypted, metadata, models);
             List<Provider> providers = new ArrayList<>(state.providers());
             if (old == null) providers.add(saved); else providers.set(providers.indexOf(old), saved);
-            return new State(state.revision(), providers, state.chatModelId(), state.importModelId());
+            return new State(state.revision(), providers, state.chatModelId(), state.importModelId(), state.chatReasoningEffort());
         });
     }
 
@@ -168,7 +172,7 @@ public class AiConnectionsService {
         }
         try (usage) {
             var reasoning = AiReasoningSettings.read(candidate.params(), provider.apiFormat());
-            int output = candidate.params().get("maxOutputTokens") instanceof Number n ? Math.min(n.intValue(), 4096) : 4096;
+            int output = Math.min(((Number) candidate.params().get("maxOutputTokens")).intValue(), 4096);
             var target = new AiUpstreamClient.Upstream(provider.endpoint(), decrypt(provider, body), candidate.modelId(), provider.apiFormat(), output, false).withReasoning(reasoning);
             var verification = new AiModelVerifier(upstream, mapper).verify(target, handle);
             synchronized (AiConnectionUsage.LOCK) {
@@ -217,7 +221,8 @@ public class AiConnectionsService {
         }
         params.put("streaming", bool(body, "streaming", !Boolean.FALSE.equals(params.get("streaming"))));
         params.put("tools", bool(body, "tools", params.get("tools") instanceof Boolean flag ? flag : ProviderCapabilities.of(provider.endpoint(), provider.apiFormat(), id).tools()));
-        for (String field : List.of("contextWindow", "maxInputTokens", "maxOutputTokens")) {
+        params.remove("maxInputTokens");
+        for (String field : List.of("contextWindow", "maxOutputTokens")) {
             if (!body.containsKey(field)) continue;
             Object value = body.get(field);
             if (value == null || "".equals(value)) params.remove(field);
@@ -227,11 +232,7 @@ public class AiConnectionsService {
                 params.put(field, ((Number) value).intValue());
             }
         }
-        if (params.get("contextWindow") instanceof Number window) {
-            for (String field : List.of("maxInputTokens", "maxOutputTokens")) {
-                if (params.get(field) instanceof Number max && max.intValue() > window.intValue()) invalid("输入/输出上限分别不得大于上下文窗口");
-            }
-        }
+        AiModelLimits.requireConfigured(params);
         for (String field : AiReasoningSettings.FIELDS) if (body.containsKey(field)) params.put(field, body.get(field));
         AiReasoningSettings reasoning = AiReasoningSettings.read(params, provider.apiFormat());
         reasoning.putInto(params);
@@ -244,13 +245,37 @@ public class AiConnectionsService {
     public Map<String, Object> bind(Map<String, Object> body) {
         return mutate(body, state -> {
             String purpose = text(body, "purpose", 10, true);
-            if (!List.of("chat", "import").contains(purpose)) invalid("用途必须是主模型或导入兜底");
+            if (!"import".equals(purpose)) invalid("设置中仅可选择导入模型，对话模型请在 AI 助手中选择");
             String id = body.get("modelId") == null ? null : text(body, "modelId", 80, true);
-            if (id == null && "chat".equals(purpose)) invalid("请选择主模型");
             if (id != null) ready(owner(state, id), state.model(id));
-            return new State(state.revision(), state.providers(), "chat".equals(purpose) ? id : state.chatModelId(),
-                    "import".equals(purpose) ? id : state.importModelId());
-        }, "chat".equals(body.get("purpose")));
+            return new State(state.revision(), state.providers(), state.chatModelId(), id, state.chatReasoningEffort());
+        });
+    }
+
+    /** 助手输入区改选只写当前会话，并更新新会话的继承默认；已受理任务保留配置快照。 */
+    public Map<String, Object> selectChatModel(Map<String, Object> body) {
+        return mutate(body, state -> {
+            String id = body.containsKey("modelConfigId") ? text(body, "modelConfigId", 80, true) : state.chatModelId();
+            if (id == null) invalid("请在 AI 助手中选择模型");
+            ready(owner(state, id), state.model(id));
+            String effort = body.containsKey("reasoningEffort") ? text(body, "reasoningEffort", 20, false) : state.chatReasoningEffort();
+            if (effort != null && effort.isBlank()) effort = null;
+            if (effort != null && !supportsEffort(state, id, effort)) {
+                if (body.containsKey("reasoningEffort")) invalid("该模型不支持所选思考档位");
+                effort = null;
+            }
+            return new State(state.revision(), state.providers(), id, state.importModelId(), effort);
+        }, true);
+    }
+
+    private static boolean supportsEffort(State state, String id, String effort) {
+        if (id == null || state.model(id) == null) return false;
+        try {
+            var reasoning = AiReasoningSettings.read(state.model(id).params(), state.owner(id).apiFormat());
+            return "effort".equals(reasoning.control()) && reasoning.efforts().contains(effort);
+        } catch (IllegalArgumentException error) {
+            return false;
+        }
     }
 
     public Map<String, Object> delete(String id, boolean isProvider, Map<String, Object> body) {
@@ -260,13 +285,13 @@ public class AiConnectionsService {
             List<Model> removed = isProvider ? owner.models() : List.of(state.model(id));
             for (Model model : removed) {
                 if (model.id().equals(state.chatModelId()) || model.id().equals(state.importModelId())) {
-                    throw new ChatTurnRejectException(409, "CONFIG_IN_USE", "此配置仍被使用，请先应用其他模型或恢复导入跟随", Map.of());
+                    throw new ChatTurnRejectException(409, "CONFIG_IN_USE", "此配置仍被使用，请在 AI 助手中切换对话模型，或更换导入模型", Map.of());
                 }
                 if (AiConnectionUsage.active(model.id())) {
                     throw new ChatTurnRejectException(409, "CONFIG_BUSY", "仍有任务使用此配置，完成后再删除", Map.of());
                 }
             }
-            if (isProvider) return new State(state.revision(), state.providers().stream().filter(p -> !p.id().equals(id)).toList(), state.chatModelId(), state.importModelId());
+            if (isProvider) return new State(state.revision(), state.providers().stream().filter(p -> !p.id().equals(id)).toList(), state.chatModelId(), state.importModelId(), state.chatReasoningEffort());
             return replace(state, owner, new Provider(owner.id(), owner.name(), owner.apiFormat(), owner.endpoint(), owner.authMode(),
                     owner.encryptedKey(), owner.keyMeta(), owner.models().stream().filter(m -> !m.id().equals(id)).toList()));
         });
@@ -352,21 +377,40 @@ public class AiConnectionsService {
         return mutate(body, update, false);
     }
 
-    private Map<String, Object> mutate(Map<String, Object> body, UnaryOperator<State> update, boolean applyChat) {
+    private Map<String, Object> mutate(Map<String, Object> body, UnaryOperator<State> update, boolean selectChat) {
         synchronized (AiConnectionUsage.LOCK) {
             State state = state();
             if (!(body.get("revision") instanceof Number revision) || revision.longValue() != state.revision()) throw AiConnectionsStore.conflict();
             State next = update.apply(state);
+            if (next.chatReasoningEffort() != null && !supportsEffort(next, next.chatModelId(), next.chatReasoningEffort())) {
+                next = new State(next.revision(), next.providers(), next.chatModelId(), next.importModelId(), null);
+            }
             var target = store.resolve(next, "chat");
             String fingerprint = memoryFingerprint(target, MemoryPolicyService.PURPOSE_USE);
-            // 显式应用可修复旧版本留下的过期授权；修改当前连接的地址/协议也要同步。
-            if (fingerprint != null && (applyChat || !fingerprint.equals(
+            // 显式选择可修复旧版本留下的过期授权；修改当前连接的地址/协议也要同步。
+            if (fingerprint != null && (selectChat || !fingerprint.equals(
                     memoryFingerprint(store.resolve(state, "chat"), MemoryPolicyService.PURPOSE_USE)))) {
-                return view(store.saveWithMemoryConsent(next, state.revision(), fingerprint,
-                        memoryFingerprint(target, MemoryPolicyService.PURPOSE_MAINTENANCE)));
+                return saveSelection(next, state, body, selectChat, fingerprint,
+                        memoryFingerprint(target, MemoryPolicyService.PURPOSE_MAINTENANCE));
             }
+            if (selectChat) return saveSelection(next, state, body, true, fingerprint,
+                    memoryFingerprint(target, MemoryPolicyService.PURPOSE_MAINTENANCE));
             return view(store.save(next, state.revision()));
         }
+    }
+
+    private Map<String, Object> saveSelection(State next, State previous, Map<String, Object> body,
+                                               boolean selectChat, String useFingerprint, String maintenanceFingerprint) {
+        Long sessionId = null;
+        if (selectChat && body.get("sessionId") != null) {
+            if (!(body.get("sessionId") instanceof Number id) || id.longValue() <= 0 || id.doubleValue() != id.longValue()) {
+                invalid("会话标识无效");
+            }
+            sessionId = ((Number) body.get("sessionId")).longValue();
+        }
+        var result = view(store.saveWithMemoryConsent(next, previous.revision(), useFingerprint, maintenanceFingerprint, sessionId));
+        if (sessionId != null) result.put("sessionChoice", store.sessionChoice(sessionId));
+        return result;
     }
 
     private static String memoryFingerprint(AiConfigRepository.ConfigRow config, String purpose) {
@@ -395,6 +439,7 @@ public class AiConnectionsService {
         Map<String, Object> result = new LinkedHashMap<>();
         result.put("revision", state.revision());
         result.put("chatModelId", state.chatModelId());
+        result.put("chatReasoningEffort", state.chatReasoningEffort());
         result.put("importModelId", state.importModelId());
         result.put("providers", state.providers().stream().map(p -> {
             Map<String, Object> view = new LinkedHashMap<>();
@@ -406,7 +451,8 @@ public class AiConnectionsService {
             view.put("models", p.models().stream().map(m -> {
                 Map<String, Object> item = new LinkedHashMap<>();
                 item.put("id", m.id()); item.put("modelId", m.modelId()); item.put("name", m.name()); item.put("group", m.group());
-                for (String key : List.of("streaming", "tools", "contextWindow", "maxInputTokens", "maxOutputTokens")) item.put(key, m.params().get(key));
+                for (String key : List.of("streaming", "tools", "contextWindow", "maxOutputTokens")) item.put(key, m.params().get(key));
+                item.put("nativeWeb", com.drillnotebook.app.service.web.NativeWebCapabilities.of(p.endpoint(), p.apiFormat(), m.modelId()));
                 item.put("reasoningControl", m.params().getOrDefault("reasoningControl", "effort"));
                 item.put("reasoningEfforts", m.params().getOrDefault("reasoningEfforts", List.of()));
                 item.put("defaultReasoningEffort", m.params().get("defaultReasoningEffort"));
@@ -422,7 +468,7 @@ public class AiConnectionsService {
         return result;
     }
     private static State replace(State state, Provider old, Provider value) {
-        return new State(state.revision(), state.providers().stream().map(p -> p.id().equals(old.id()) ? value : p).toList(), state.chatModelId(), state.importModelId());
+        return new State(state.revision(), state.providers().stream().map(p -> p.id().equals(old.id()) ? value : p).toList(), state.chatModelId(), state.importModelId(), state.chatReasoningEffort());
     }
     private static Provider provider(State state, String id) {
         Provider provider = state.provider(id);
@@ -438,6 +484,7 @@ public class AiConnectionsService {
         if (blank(provider.endpoint()) || ("api_key".equals(provider.authMode()) && blank(provider.encryptedKey())) || (model != null && blank(model.modelId()))) {
             invalid("此配置待补全，请检查连接地址、密钥和模型 ID");
         }
+        if (model != null) AiModelLimits.requireConfigured(model.params());
     }
     private static String text(Map<String, Object> body, String key, int limit, boolean required) {
         String value = body.get(key) == null ? "" : String.valueOf(body.get(key)).trim();

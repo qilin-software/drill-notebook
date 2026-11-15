@@ -28,8 +28,6 @@ import org.springframework.stereotype.Component;
  */
 @Component
 public class ContextBudgeter {
-    /** 窗口未知时的保守默认（§9.2：不能宣称数学上保证不超窗，只能给保守值并提示配置）。 */
-    public static final int DEFAULT_CONTEXT_WINDOW_TOKENS = 32000;
     /** 输出预留沿用现有默认 max_tokens。 */
     public static final int OUTPUT_RESERVE_TOKENS = 4096;
     public static final int MIN_SAFETY_MARGIN_TOKENS = 512;
@@ -44,15 +42,15 @@ public class ContextBudgeter {
         this.mapper = mapper;
     }
 
-    /** 计划身份与厂商窗口：窗口是否由用户显式配置决定要不要报 WINDOW_UNSET。 */
+    /** 计划身份、已配置的厂商窗口与本轮输出预留。 */
     public record Target(String planId, long sessionId, long contextGeneration, long historyRevision,
                          Long summaryRevision, Long vaultEpoch, Long vaultRevision, long policyRevision,
-                         int contextWindow, boolean windowKnown, int maxInputTokens, int outputReserve) {
+                         int contextWindow, boolean windowKnown, int outputReserve) {
         public Target(String planId, long sessionId, long contextGeneration, long historyRevision,
                       Long summaryRevision, Long vaultEpoch, Long vaultRevision, long policyRevision,
                       int contextWindow, boolean windowKnown) {
             this(planId, sessionId, contextGeneration, historyRevision, summaryRevision, vaultEpoch, vaultRevision,
-                    policyRevision, contextWindow, windowKnown, Integer.MAX_VALUE, OUTPUT_RESERVE_TOKENS);
+                    policyRevision, contextWindow, windowKnown, OUTPUT_RESERVE_TOKENS);
         }
     }
 
@@ -95,14 +93,15 @@ public class ContextBudgeter {
         kept.currentImages.addAll(draft.currentImages());
 
         List<String> notices = new ArrayList<>(draft.notices());
-        if (!target.windowKnown()) notices.add("WINDOW_UNSET");
+        if (!target.windowKnown() || target.contextWindow() <= 0) throw new ChatTurnRejectException(400,
+                "MODEL_LIMITS_REQUIRED", "请先在模型设置中填写上下文窗口和最大输出 Token", Map.of());
         if (!kept.currentImages.isEmpty() || kept.turns.stream().anyMatch(turn -> !turn.images().isEmpty())) {
             notices.add("IMAGE_COST_UNKNOWN");
         }
-        int window = target.contextWindow() > 0 ? target.contextWindow() : DEFAULT_CONTEXT_WINDOW_TOKENS;
+        int window = target.contextWindow();
         int margin = Math.max(MIN_SAFETY_MARGIN_TOKENS, window / 10);
         int allowedInput = Math.min(ChatContextAssembler.USER_TEXT_BUDGET,
-                Math.min(target.maxInputTokens(), window - target.outputReserve() - margin));
+                window - target.outputReserve() - margin);
         int userTokens = estimator.estimateText(draft.userText());
         if (userTokens > allowedInput) {
             // 当前问题永不静默截断：请用户缩短或改成引用片段（§9.2、T05）
@@ -126,7 +125,7 @@ public class ContextBudgeter {
             // 图像成本已按每张 4,096 单独从窗口里扣除
             estimated = estimator.estimateSerialized(countable(messages));
             limit = Math.min(ChatContextPlan.INPUT_BUDGET_TOKENS,
-                    Math.min(target.maxInputTokens(), window - target.outputReserve() - margin) - kept.imageTokens());
+                    window - target.outputReserve() - margin - kept.imageTokens());
             if (estimated <= limit) break;
             if (attempt == MAX_FIT_ATTEMPTS) throw tooLarge(describeOverflow(kept), estimated, limit, kept);
             if (!trim(kept, estimated - limit, audit)) {
@@ -184,7 +183,7 @@ public class ContextBudgeter {
             saved += turn.images().size() * TokenEstimator.IMAGE_UNKNOWN_ESTIMATED_TOKENS;
             audit.omit(ContextAudit.Omission.ATTACHMENT_POLICY, "IMAGE", turn.images().size());
             rebuilt.add(new Turn(turn.turnId(), turn.legacy(), turn.userMessageId(), turn.assistantMessageId(),
-                    turn.userText(), turn.assistantText(), List.of(), turn.estimatedTokens()));
+                    turn.userText(), turn.assistantText(), List.of(), turn.estimatedTokens(),turn.supplements()));
         }
         kept.turns.clear();
         kept.turns.addAll(rebuilt);
@@ -262,7 +261,7 @@ public class ContextBudgeter {
         for (ConversationProjection.Item item : projection.coveredCandidates()) {
             Turn turn = new Turn(item.turnId(), false, item.userMessageId(), item.assistantMessageId(),
                     item.userText(), item.assistantText(), List.of(),
-                    item.estimatedTokens() + 2 * TokenEstimator.MESSAGE_OVERHEAD_TOKENS);
+                    item.estimatedTokens() + 2 * TokenEstimator.MESSAGE_OVERHEAD_TOKENS,item.supplements());
             int position = 0;
             while (position < kept.turns.size()
                     && (kept.turns.get(position).turnId() == null
@@ -305,7 +304,8 @@ public class ContextBudgeter {
             userBlocks.add(textContent(turn.userText()));
             for (Image image : turn.images()) userBlocks.add(imageContent(image));
             messages.add(message("user", userBlocks));
-            messages.add(message("assistant", List.of(textContent(turn.assistantText()))));
+            for(var part:ChatSupplement.messages(turn.assistantText(),turn.supplements()))
+                messages.add(message((String)part.get("role"),List.of(textContent((String)part.get("content")))));
         }
         List<Object> current = new ArrayList<>();
         current.add(textContent(draft.userText()));

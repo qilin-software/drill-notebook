@@ -9,6 +9,112 @@ const started: ToolActivity = { sequence: 1, toolName: 'search_memories', state:
 const ended: ToolActivity = { ...started, state: 'FINISHED', outcome: 'OK', count: 2, elapsedMs: 620 };
 
 describe('工具活动折叠和真实结果', () => {
+  it('所有类别的工具被关闭后显示未执行，不冒充成功或未知结果', () => {
+    const rows = readToolActivities(['read_notebook', 'create_material', 'update_material', 'search_memories', 'send_message', 'delete_memory']
+      .map((toolName, i) => ({ ...ended, sequence: i + 1, toolName, outcome: 'DISABLED', count: 0 })));
+    render(<ToolActivityGroup activities={rows} active />);
+    for (const row of rows) expect(toolResultText(row)).toBe('工具已在设置中关闭，未执行');
+    expect(screen.getAllByRole('button', { name: /工具已在设置中关闭，未执行/ })).toHaveLength(6);
+    expect(screen.queryByText('执行结果未确认')).not.toBeInTheDocument();
+  });
+
+  it('删除结果不再提供死链接，移出错题本仍能打开原题', () => {
+    const open = vi.fn();
+    const link = 'drill-notebook://material/note/12';
+    const rows = readToolActivities([
+      { ...ended, toolName: 'read_notebook', sourceLink: link },
+      { ...ended, sequence: 2, toolName: 'delete_material', outcome: 'DELETED', sourceLink: link, arguments: '不应展示' }
+    ]);
+    const view = render(<ToolActivityGroup activities={rows} onOpenMaterial={open} active />);
+    fireEvent.click(screen.getByRole('button', { name: /删除学习资料 已删除/ }));
+    fireEvent.click(screen.getByRole('button', { name: /读取笔记 本次读取/ }));
+    expect(screen.queryByRole('button', { name: '查看资料 ↗' })).not.toBeInTheDocument();
+    expect(screen.queryByText('不应展示')).not.toBeInTheDocument();
+    const removed = readToolActivities([{ ...ended, sequence: 2, toolName: 'remove_wrong_question', outcome: 'REMOVED', sourceLink: 'drill-notebook://material/question/12' }]);
+    view.rerender(<ToolActivityGroup activities={removed} onOpenMaterial={open} active />);
+    fireEvent.click(screen.getByRole('button', { name: '查看原题 ↗' }));
+    expect(open).toHaveBeenCalledWith('drill-notebook://material/question/12');
+    expect(toolResultText({ ...removed[0], outcome: 'DISABLED' })).toContain('未执行');
+    expect(toolResultText({ ...removed[0], outcome: 'NO_CHANGE' })).toBe('已不在错题本中');
+    view.rerender(<ToolActivityGroup activities={[{ ...removed[0], state: 'UNKNOWN' }]} active />);
+    expect(screen.getByText('部分删除结果未确认，请到对应列表核对。')).toBeVisible();
+  });
+
+  it('修改资料展示独立结果、版本冲突和未保存草稿，安全来源不包含修改正文', () => {
+    const open = vi.fn();
+    const saved = readToolActivities([{ ...ended, toolName: 'update_material', outcome: 'UPDATED',
+      sourceLink: 'drill-notebook://material/question/12', changes: { answer: '不展示答案' } }]);
+    const view = render(<ToolActivityGroup activities={saved} onOpenMaterial={open} />);
+    fireEvent.click(screen.getByRole('button', { name: /已更新学习资料/ }));
+    fireEvent.click(screen.getByRole('button', { name: /修改学习资料 已更新/ }));
+    expect(screen.getByText('当前本地学习资料')).toBeVisible();
+    expect(screen.queryByText('不展示答案')).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: '查看资料 ↗' }));
+    expect(open).toHaveBeenCalledWith('drill-notebook://material/question/12');
+    const blocked = readToolActivities([{ ...ended, toolName: 'update_material', outcome: 'DRAFT_UNSAVED', count: 0, incomplete: true }]);
+    view.rerender(<ToolActivityGroup activities={blocked} onOpenMaterial={open} />);
+    expect(screen.getByRole('button', { name: /修改学习资料 请先保存当前笔记草稿/ })).toBeVisible();
+    expect(screen.queryByRole('button', { name: '查看资料 ↗' })).not.toBeInTheDocument();
+    expect(toolResultText({ ...blocked[0], outcome: 'CONFLICT' })).toContain('重新读取');
+    expect(toolResultText({ ...blocked[0], outcome: 'DUPLICATE' })).toBe('已处理，未重复修改');
+    view.rerender(<ToolActivityGroup activities={[{ ...blocked[0], state: 'UNKNOWN', outcome: 'UNKNOWN' }]} />);
+    expect(screen.getByText(/部分资料是否已保存尚未确认/)).toBeVisible();
+  });
+
+  it('资料保存结果保留安全来源，只有点击才导航，未知写入不能宣称失败', () => {
+    const link = 'drill-notebook://material/note/12';
+    const open = vi.fn();
+    const saved = readToolActivities([{ ...ended, toolName: 'create_material', outcome: 'CREATED', sourceLink: link, arguments: '不展示的正文' }]);
+    const view = render(<ToolActivityGroup activities={saved} onOpenMaterial={open} />);
+    fireEvent.click(screen.getByRole('button', { name: /已保存学习资料/ }));
+    fireEvent.click(screen.getByRole('button', { name: /新增学习资料 已保存/ }));
+    expect(screen.getByText('当前本地学习资料')).toBeVisible();
+    expect(screen.queryByText('不展示的正文')).not.toBeInTheDocument();
+    expect(open).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole('button', { name: '查看资料 ↗' }));
+    expect(open).toHaveBeenCalledWith(link);
+    expect(readToolActivities([{ ...saved[0], sourceLink: 'https://example.com/private' }])[0].sourceLink).toBeUndefined();
+    view.rerender(<ToolActivityGroup activities={[...saved, { ...started, sequence: 2, toolName: 'create_material', state: 'UNKNOWN' }]} onOpenMaterial={open} />);
+    expect(screen.getByText(/部分资料是否已保存尚未确认/)).toBeVisible();
+    expect(screen.getByRole('button', { name: '查看资料 ↗' })).toBeVisible();
+  });
+
+  it('派发成功只表示受理，等待中的消息不冒充已读回复，点击才打开目标', () => {
+    const link = `drill-notebook://session/${'a'.repeat(32)}`;
+    const openSession = vi.fn();
+    const rows = readToolActivities([
+      { ...ended, toolName: 'create_session', outcome: 'CREATED', count: 1, sessionLink: link },
+      { ...ended, sequence: 2, toolName: 'read_session', outcome: 'QUEUED', count: 0, incomplete: true }
+    ]);
+    render(<ToolActivityGroup activities={rows} onOpenSession={openSession} />);
+    const group = screen.getByRole('button', { name: /已查询会话状态 · 已新建会话/ });
+    expect(group).not.toHaveAccessibleName(/已读取会话/);
+    expect(openSession).not.toHaveBeenCalled();
+    fireEvent.click(group);
+    expect(screen.getByRole('button', { name: /读取会话 目标消息仍在排队，尚无回复/ })).toBeVisible();
+    fireEvent.click(screen.getByRole('button', { name: /新建会话 会话已创建，首条消息已提交/ }));
+    fireEvent.click(screen.getByRole('button', { name: '打开会话 ↗' }));
+    expect(openSession).toHaveBeenCalledWith(link);
+    expect(readToolActivities([{ ...ended, sessionLink: 'https://example.com/unsafe', requestId: 'not-a-request' }])[0].sessionLink).toBeUndefined();
+  });
+
+  it('会话工具展示真实进度和分页，不沿用记忆结果文案', () => {
+    const view = render(<ToolActivityGroup activities={[{ ...started, toolName: 'list_sessions' }]} active phase="tools" />);
+    expect(screen.getByRole('button', { name: /正在查找历史会话/ })).toBeVisible();
+    const listed = { ...ended, toolName: 'list_sessions' as const, incomplete: true };
+    const reading = { ...started, sequence: 2, toolName: 'read_session' as const };
+    view.rerender(<ToolActivityGroup activities={[listed, reading]} active phase="tools" />);
+    expect(screen.getByRole('button', { name: /正在读取会话/ })).toBeVisible();
+    expect(screen.getAllByText('本次找到 2 个会话（分批结果）')[0]).toBeVisible();
+    fireEvent.click(screen.getByRole('button', { name: /查找历史会话 本次找到/ }));
+    expect(screen.getAllByText('当前本地数据中的会话')[0]).toBeVisible();
+    expect(toolResultText({ ...ended, toolName: 'read_session', incomplete: true })).toBe('本次读取 2 段消息（部分记录）');
+    expect(toolResultText({ ...ended, toolName: 'read_session', outcome: 'AMBIGUOUS' })).toBe('找到多个会话，待明确目标');
+    expect(toolResultText({ ...ended, toolName: 'read_session', outcome: 'NOT_FOUND' })).toBe('会话不存在或已被删除');
+    expect(toolResultText({ ...ended, toolName: 'read_session', outcome: 'STALE' })).toBe('会话历史已变化，需要重新读取');
+    expect(toolResultText({ ...ended, toolName: 'read_session', outcome: 'UNAVAILABLE', availability: 'LOCKED' })).toBe('会话需要解锁后读取');
+    expect(readToolActivities([listed, reading])[1].toolName).toBe('read_session');
+  });
   it('百次工具记录完整保留，读取 20 条不被显示成 15 条', () => {
     const rows = Array.from({ length: 100 }, (_, i) => ({ ...ended, sequence: i + 1, count: 20 }));
     expect(readToolActivities(rows)).toHaveLength(100);

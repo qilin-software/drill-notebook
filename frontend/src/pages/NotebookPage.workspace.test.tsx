@@ -15,12 +15,13 @@
  * do NOT claim a "guaranteed prior-page flush" — that's accepted debt.
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { render, screen, waitFor, fireEvent } from '@testing-library/react';
+import { render, screen, waitFor, fireEvent, act } from '@testing-library/react';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
-import { MemoryRouter, useLocation } from 'react-router-dom';
+import { MemoryRouter, useLocation, useNavigate } from 'react-router-dom';
 import { Message } from '@arco-design/web-react';
 import type { NotePage, Notebook } from '../lib/types';
 import { useUiStore } from '../stores/uiStore';
+import { refreshToolMutation } from '../lib/toolMutationEffects';
 
 const { apiGet, apiPost, apiPut, apiDel, apiFlush } = vi.hoisted(() => ({
   apiGet: vi.fn(),
@@ -51,6 +52,7 @@ beforeEach(() => {
   (window as unknown as { api: Record<string, unknown> }).api = baseWindowApi() as Record<string, unknown>;
   useUiStore.setState({ notebookPanelsSwapped: false });
   apiPut.mockResolvedValue({});
+  apiFlush.mockResolvedValue(undefined);
 });
 
 afterEach(() => {
@@ -71,11 +73,13 @@ afterEach(() => {
 vi.mock('../components/editor/NotebookEditor', () => ({
   NotebookEditor: ({
     onChange,
+    content,
     pageId,
     focusMode,
     onFocusModeChange
   }: {
     onChange?: (c: Record<string, unknown>) => void;
+    content?: Record<string, unknown>;
     pageId?: number;
     focusMode?: boolean;
     onFocusModeChange?: (f: boolean) => void;
@@ -84,6 +88,7 @@ vi.mock('../components/editor/NotebookEditor', () => ({
       className="editor-canvas"
       data-testid="notebook-editor"
       data-page-id={pageId}
+      data-content={JSON.stringify(content)}
       data-focus-mode={focusMode ? 'true' : 'false'}
     >
       <button type="button" onClick={() => onChange?.({ type: 'doc', content: [{ type: 'paragraph', content: [{ type: 'text', text: 'A' }] }] })}>
@@ -148,11 +153,13 @@ function primeNotebookApi(opts: { slowPages?: boolean; slowPage37?: boolean; cre
 
 function LocationProbe(): JSX.Element {
   const location = useLocation();
-  return <div data-testid="loc">{location.pathname}{location.search}</div>;
+  const navigate = useNavigate();
+  return <><div data-testid="loc">{location.pathname}{location.search}</div>
+    <button onClick={() => navigate('/notebooks?pageId=37')}>打开另一来源</button>
+    <button onClick={() => navigate('/notebooks?notebookId=2')}>打开空笔记本来源</button></>;
 }
 
-function renderNotebookPage(initialEntries: string[] = ['/notebooks']): ReturnType<typeof render> {
-  const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+function renderNotebookPage(initialEntries: string[] = ['/notebooks'], queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } })): ReturnType<typeof render> {
   return render(
     <QueryClientProvider client={queryClient}>
       <MemoryRouter initialEntries={initialEntries}>
@@ -168,6 +175,96 @@ function renderNotebookPage(initialEntries: string[] = ['/notebooks']): ReturnTy
 // =====================================================================
 
 describe('NotebookPage behavior — baseline regression (Task 1)', () => {
+  it.each(['note', 'notebook'] as const)('工具删除 %s 后退出被删页并丢弃未保存草稿', async type => {
+    primeNotebookApi();
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    renderNotebookPage(['/notebooks?pageId=11'], client);
+    await waitFor(() => expect(screen.getByTestId('notebook-editor')).toHaveAttribute('data-page-id', '11'));
+    fireEvent.click(screen.getByText('type-A'));
+    const originalGet = apiGet.getMockImplementation()!;
+    apiGet.mockImplementation((path: string) => {
+      if (path === '/api/notebooks' && type === 'notebook') return Promise.resolve([]);
+      if (path === '/api/notebooks/1/pages') return Promise.resolve(type === 'note' ? [page37, page104] : []);
+      if (path === '/api/note-pages/11') return Promise.reject(new Error('deleted'));
+      return originalGet(path);
+    });
+    act(() => refreshToolMutation(client, { sequence: 1, toolName: 'delete_material', state: 'FINISHED', outcome: 'DELETED',
+      count: 1, startedAt: null, elapsedMs: 1, availability: null, incomplete: false,
+      sourceLink: `drill-notebook://material/${type}/${type === 'note' ? 11 : 1}` }));
+    await waitFor(() => {
+      if (type === 'note') expect(screen.getByTestId('notebook-editor')).toHaveAttribute('data-page-id', '37');
+      else expect(screen.queryByTestId('notebook-editor')).not.toBeInTheDocument();
+    });
+    fireEvent(window, new Event('pagehide'));
+    await act(async () => { await new Promise(resolve => setTimeout(resolve, 450)); });
+    expect(apiPut.mock.calls.filter(([path]) => path === '/api/note-pages/11')).toHaveLength(0);
+    expect(apiFlush.mock.calls.filter(([path]) => path === '/api/note-pages/11')).toHaveLength(0);
+    expect(useUiStore.getState().pageContext.markdown).not.toContain('原-11');
+  });
+
+  it('工具更新刷新已保存正文；草稿待保存、保存中和失败时都不被刷新覆盖', async () => {
+    primeNotebookApi();
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    renderNotebookPage(['/notebooks?pageId=11'], client);
+    await waitFor(() => expect(screen.getByTestId('notebook-editor').getAttribute('data-content')).toContain('原-11'));
+    const remote = (text: string) => ({ ...page11, content: { type: 'doc', content: [{ type: 'paragraph', content: [{ type: 'text', text }] }] } });
+    await act(async () => { client.setQueryData(['note-page', 11], remote('AI 已更新')); });
+    await waitFor(() => expect(screen.getByTestId('notebook-editor').getAttribute('data-content')).toContain('AI 已更新'));
+    expect(useUiStore.getState().pageContext.isDraft).toBe(false);
+
+    let rejectSave!: (reason: Error) => void;
+    apiPut.mockImplementationOnce(() => new Promise((_resolve, reject) => { rejectSave = reject; }));
+    fireEvent.click(screen.getByText('type-A'));
+    expect(useUiStore.getState().pageContext.isDraft).toBe(true);
+    await act(async () => { client.setQueryData(['note-page', 11], remote('防抖期间远端内容')); });
+    expect(screen.getByTestId('notebook-editor').getAttribute('data-content')).toContain('"A"');
+    await waitFor(() => expect(apiPut).toHaveBeenCalled());
+    await act(async () => { client.setQueryData(['note-page', 11], remote('保存期间远端内容')); });
+    expect(screen.getByTestId('notebook-editor').getAttribute('data-content')).toContain('"A"');
+    await act(async () => { rejectSave(new Error('offline')); });
+    await act(async () => { client.setQueryData(['note-page', 11], remote('保存失败后远端内容')); });
+    expect(screen.getByTestId('notebook-editor').getAttribute('data-content')).toContain('"A"');
+    expect(useUiStore.getState().pageContext.isDraft).toBe(true);
+
+    fireEvent.click(screen.getByText('type-B'));
+    await waitFor(() => expect(useUiStore.getState().pageContext.isDraft).toBe(false));
+    expect(useUiStore.getState().pageContext.markdown).toContain('B');
+    await act(async () => { client.setQueryData(['note-page', 11], remote('下一次工具更新')); });
+    await waitFor(() => expect(screen.getByTestId('notebook-editor').getAttribute('data-content')).toContain('下一次工具更新'));
+  });
+
+  it('切到后台的 keepalive 保存确认前仍标记草稿，成功后允许工具更新', async () => {
+    primeNotebookApi();
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    let finish!: () => void;
+    apiFlush.mockImplementationOnce(() => new Promise<void>((resolve) => { finish = resolve; }));
+    renderNotebookPage(['/notebooks?pageId=11'], client);
+    await waitFor(() => expect(screen.getByTestId('notebook-editor')).toHaveAttribute('data-page-id', '11'));
+    fireEvent.click(screen.getByText('type-A'));
+    fireEvent(window, new Event('pagehide'));
+    expect(apiFlush).toHaveBeenCalledWith('/api/note-pages/11', expect.anything());
+    expect(useUiStore.getState().pageContext.isDraft).toBe(true);
+    await act(async () => { client.setQueryData(['note-page', 11], { ...page11, content: page37.content }); });
+    expect(screen.getByTestId('notebook-editor').getAttribute('data-content')).toContain('"A"');
+    await act(async () => { finish(); });
+    await waitFor(() => expect(useUiStore.getState().pageContext.isDraft).toBe(false));
+    expect(apiPut).not.toHaveBeenCalled();
+  });
+
+  it('连续点击页面来源可切换目标，打开空笔记本不会保留旧本正文', async () => {
+    primeNotebookApi();
+    const originalGet = apiGet.getMockImplementation()!;
+    apiGet.mockImplementation((path: string) => path === '/api/notebooks'
+      ? Promise.resolve([...baseNotebooks, { id: 2, title: '空笔记本' }]) : originalGet(path));
+    renderNotebookPage(['/notebooks?pageId=11']);
+    await waitFor(() => expect(screen.getByTestId('notebook-editor')).toHaveAttribute('data-page-id', '11'));
+    fireEvent.click(screen.getByText('打开另一来源'));
+    await waitFor(() => expect(screen.getByTestId('notebook-editor')).toHaveAttribute('data-page-id', '37'));
+    fireEvent.click(screen.getByText('打开空笔记本来源'));
+    await waitFor(() => expect(screen.queryByTestId('notebook-editor')).not.toBeInTheDocument());
+    expect(useUiStore.getState().pageContext.markdown).not.toContain('原-37');
+    expect(useUiStore.getState().pageContext.notebookId).toBe(2);
+  });
   describe('Heading + notebook + page selector (NBK-01, NBK-04)', () => {
     beforeEach(() => primeNotebookApi());
 

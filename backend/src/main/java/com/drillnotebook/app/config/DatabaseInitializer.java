@@ -24,7 +24,7 @@ import org.springframework.stereotype.Component;
 @Component
 public class DatabaseInitializer {
     private static final Logger log = LoggerFactory.getLogger(DatabaseInitializer.class);
-    private static final int SCHEMA_VERSION = 11;
+    private static final int SCHEMA_VERSION = 21;
 
     /** 当前应用支持的数据库结构版本，供备份恢复在启动换库前拒绝未来版本。 */
     public static int currentSchemaVersion() {
@@ -107,6 +107,8 @@ public class DatabaseInitializer {
             ensureColumn(connection, "note_page", "content_hash", "TEXT");
             // 错题本：手动「移出错题本」标记；答错时由 recordAnswer 重置为 0，使其重新计入错题本
             ensureColumn(connection, "question", "wrong_excluded", "INTEGER NOT NULL DEFAULT 0");
+            // 人工加入错题的真实作答基线；NULL 保持升级前的成员规则。
+            ensureColumn(connection, "question", "wrong_manual_after", "INTEGER");
             // v9 轮次映射：legacy 消息保持 turn_id IS NULL，不自动补造轮次
             ensureColumn(connection, "ai_chat_message", "turn_id", "INTEGER REFERENCES ai_chat_turn(id) ON DELETE SET NULL");
             ensureColumn(connection, "ai_chat_message", "turn_role", "TEXT");
@@ -126,7 +128,44 @@ public class DatabaseInitializer {
             ensureColumn(connection, "ai_chat_session", "memory_skipped_count", "INTEGER NOT NULL DEFAULT 0");
             ensureColumn(connection, "ai_chat_session", "summary_skipped_count", "INTEGER NOT NULL DEFAULT 0");
             ensureColumn(connection, "ai_chat_session", "last_scan_notice", "TEXT");
+            // 会话独立保存模型与档位；旧空选择在连接初始化时一次性继承，不持续跟随全局默认。
+            ensureColumn(connection, "ai_chat_session", "model_config_id", "TEXT");
+            ensureColumn(connection, "ai_chat_session", "reasoning_effort", "TEXT");
+            ensureColumn(connection, "ai_chat_session", "model_choice_revision", "INTEGER NOT NULL DEFAULT 0");
+            // 会话置顶：记录置顶时刻，先置顶的排在前面；NULL 表示未置顶。
+            ensureColumn(connection, "ai_chat_session", "pinned_at", "TEXT");
+            ensureColumn(connection, "ai_chat_turn", "model_label", "TEXT");
+            ensureColumn(connection, "ai_chat_turn", "reasoning_effort", "TEXT");
+            // 最近一次模型请求实际送入的 token 数与当时的模型窗口；供应商未回报时保持 NULL，不写估算。
+            ensureColumn(connection, "ai_chat_turn", "context_tokens", "INTEGER");
+            ensureColumn(connection, "ai_chat_turn", "context_window", "INTEGER");
+            // 最近一次请求里缓存命中的部分与输出长度：界面按「输入（命中 / 未命中）+ 输出」展示。
+            ensureColumn(connection, "ai_chat_turn", "cache_read_tokens", "INTEGER");
+            ensureColumn(connection, "ai_chat_turn", "output_tokens", "INTEGER");
+            // 逐次用量保留供应商的缓存桶口径，会话与轮次累计使用同一份归一化输入。
+            ensureColumn(connection, "ai_usage_attempt", "cache_read_included_in_input",
+                    "INTEGER CHECK (cache_read_included_in_input IN (0, 1))");
+            ensureColumn(connection, "ai_usage_attempt", "context_breakdown", "TEXT");
+            if (current != null && current < 21) UsageInputMigration.backfill(connection);
+            // 提交时绑定的业务页面：只留标题与本地定位，正文仍只在本轮内存与加密队列里。
+            ensureColumn(connection, "ai_chat_turn", "page_title", "TEXT");
+            ensureColumn(connection, "ai_chat_turn", "page_link", "TEXT");
             migrateAiChatSessions(connection);
+            ensureColumn(connection, "ai_chat_session", "session_ref", "TEXT");
+            ensureColumn(connection, "ai_chat_session", "title_source", "TEXT NOT NULL DEFAULT 'legacy'");
+            ensureColumn(connection, "ai_chat_session", "title_status", "TEXT NOT NULL DEFAULT 'idle'");
+            ensureColumn(connection, "ai_chat_session", "title_revision", "INTEGER NOT NULL DEFAULT 0");
+            exec(connection, "UPDATE ai_chat_session SET session_ref = lower(hex(randomblob(16))) WHERE session_ref IS NULL");
+            exec(connection, "CREATE UNIQUE INDEX IF NOT EXISTS idx_ai_session_ref ON ai_chat_session(session_ref)");
+            if (current == null || current < 12) {
+                exec(connection, """
+                        UPDATE ai_chat_session SET title_source = 'temporary', title_status = 'pending'
+                        WHERE title IN ('新会话', '默认会话')
+                          AND NOT EXISTS (SELECT 1 FROM ai_chat_message m WHERE m.session_id = ai_chat_session.id)
+                        """);
+            }
+            // 进程中断的标题任务不重发，也不永久显示生成中；用户可从菜单重试。
+            exec(connection, "UPDATE ai_chat_session SET title_status = 'failed', title_revision = title_revision + 1 WHERE title_status = 'generating'");
             migrateAiConfigPurposes(connection);
             exec(connection, "CREATE INDEX IF NOT EXISTS idx_ai_chat_session_updated ON ai_chat_session(updated_at DESC, id DESC)");
             exec(connection, "CREATE INDEX IF NOT EXISTS idx_ai_chat_message_session ON ai_chat_message(session_id, id)");
@@ -234,6 +273,11 @@ public class DatabaseInitializer {
     }
 
     private static void migrateAiChatSessions(Connection connection) throws SQLException {
+        // 只有旧消息确实缺少归属时才迁移；空数据库和删除后的空列表不补建会话。
+        try (Statement statement = connection.createStatement();
+             ResultSet orphan = statement.executeQuery("SELECT 1 FROM ai_chat_message WHERE session_id IS NULL LIMIT 1")) {
+            if (!orphan.next()) return;
+        }
         long defaultSessionId;
         try (Statement statement = connection.createStatement();
              ResultSet existing = statement.executeQuery("SELECT id FROM ai_chat_session ORDER BY id LIMIT 1")) {

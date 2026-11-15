@@ -1,5 +1,5 @@
 /**
- * 设置页「常规」分区（SET-*）：主题三选一、AI 悬浮球开关、快捷键按作用域分组展示、
+ * 设置页「常规」分区（SET-*）：主题三选一、AI 助手入口、快捷键按作用域分组展示、
  * 多绑定录入 / 移除 / 清空、冲突拒绝（全局 vs 全局、全局 vs 页面、同页面不同阶段放行）、
  * 单项与全部恢复默认、单键规则按作用域区分。其余分区的重组件全部替身。
  */
@@ -10,7 +10,6 @@ import { MemoryRouter } from 'react-router-dom';
 import { Message } from '@arco-design/web-react';
 import { useUiStore } from '../stores/uiStore';
 import { LS_SHORTCUTS, defaultShortcutConfig, readShortcutConfig } from '../lib/shortcuts';
-import { LS_SHOW_AI_FAB } from '../lib/sessionPrefs';
 
 vi.mock('../lib/review', () => ({
   listConfigs: vi.fn(() => Promise.resolve([])),
@@ -56,7 +55,7 @@ function press(key: string, init?: KeyboardEventInit): void {
 
 beforeEach(() => {
   // store 为模块级单例，逐条用例复位到出厂状态
-  useUiStore.setState({ aiOpen: false, aiFabVisible: true, shortcutConfig: defaultShortcutConfig(), outlineSide: 'left', notebookPanelsSwapped: false });
+  useUiStore.setState({ aiOpen: false, shortcutConfig: defaultShortcutConfig(), outlineSide: 'left', notebookPanelsSwapped: false });
   useUiStore.getState().setThemeMode('light');
   window.location.hash = '';
   vi.restoreAllMocks();
@@ -72,7 +71,8 @@ describe('SettingsPage 常规分区', () => {
     expect(screen.getByText('浅色')).toBeInTheDocument();
     expect(screen.getByText('深色')).toBeInTheDocument();
     expect(screen.getByText('跟随系统')).toBeInTheDocument();
-    expect(document.querySelectorAll('[data-scope]')).toHaveLength(7);
+    expect(document.querySelectorAll('[data-scope]')).toHaveLength(8);
+    expect(screen.getByText('AI 助手窗口 · 仅在助手窗口内生效。')).toBeInTheDocument();
     expect(screen.getByText('全局 · 任意页面生效。')).toBeInTheDocument();
     expect(screen.getByText('知识卡片全屏 · 知识点全屏阅读时生效。')).toBeInTheDocument();
     expect(screen.getByText('笔记本 · 笔记页列表项选中时生效。')).toBeInTheDocument();
@@ -98,13 +98,9 @@ describe('SettingsPage 常规分区', () => {
     expect(useUiStore.getState().theme).toBe('dark');
   });
 
-  it('SET-3: hiding the AI fab persists the preference', () => {
+  it('SET-3: 常规设置不再提供「打开 AI 助手」入口（顶栏入口已够用）', () => {
     renderPage();
-    const toggle = within(shortcutRow('显示 AI 悬浮球')).getByRole('switch');
-    expect(toggle).toHaveAttribute('aria-checked', 'true');
-    fireEvent.click(toggle);
-    expect(useUiStore.getState().aiFabVisible).toBe(false);
-    expect(localStorage.getItem(LS_SHOW_AI_FAB)).toBe('false');
+    expect(screen.queryByRole('button', { name: '打开 AI 助手' })).toBeNull();
   });
 
   it('focus outline side and preview panel swap persist independently', () => {

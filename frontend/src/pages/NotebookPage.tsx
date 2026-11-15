@@ -21,6 +21,7 @@ import { useIdSwitchReset, usePersistSlice } from '../hooks/useViewState';
 import { readPageSlice } from '../lib/viewState';
 import { matchesAny } from '../lib/shortcuts';
 import { NoteAutosave } from '../lib/noteAutosave';
+import { onMaterialDeleted } from '../lib/materialEvents';
 
 /** 页面标题的两个改名入口：左侧列表行 vs 编辑区标题。任一时刻只有一个在编辑。 */
 type PageRenameSurface = 'list' | 'header';
@@ -30,6 +31,7 @@ export function NotebookPage(): JSX.Element {
   const [searchParams] = useSearchParams();
   const planItemId = Number(searchParams.get('planItemId')) || undefined;
   const pageIdFromQuery = Number(searchParams.get('pageId')) || undefined;
+  const notebookIdFromQuery = Number(searchParams.get('notebookId')) || undefined;
   const dayQueueMode = searchParams.get('dayQueue') === '1';
   const pageIdsFromQuery = useMemo(
     () => searchParams.get('pageIds')?.split(',').map(Number).filter(Boolean) ?? [],
@@ -39,8 +41,13 @@ export function NotebookPage(): JSX.Element {
   const setNotebookFocusMode = useUiStore((state) => state.setNotebookFocusMode);
   const notebookPanelsSwapped = useUiStore((state) => state.notebookPanelsSwapped);
   const cachedNotebooks = readPageSlice('notebooks');
-  const [notebookId, setNotebookId] = useState<number | undefined>(cachedNotebooks.notebookId);
-  const [pageId, setPageId] = useState<number | undefined>(pageIdFromQuery ?? cachedNotebooks.pageId);
+  const [notebookId, setNotebookId] = useState<number | undefined>(notebookIdFromQuery ?? cachedNotebooks.notebookId);
+  const [pageId, setPageId] = useState<number | undefined>(pageIdFromQuery ?? (notebookIdFromQuery ? undefined : cachedNotebooks.pageId));
+  useEffect(() => {
+    if (!notebookIdFromQuery || pageIdFromQuery) return;
+    setNotebookId(notebookIdFromQuery);
+    setPageId(undefined);
+  }, [notebookIdFromQuery, pageIdFromQuery]);
   const [newPageVisible, setNewPageVisible] = useState(false);
   const [newPageTitle, setNewPageTitle] = useState('');
   const [newNotebookVisible, setNewNotebookVisible] = useState(false);
@@ -49,10 +56,14 @@ export function NotebookPage(): JSX.Element {
   // 切页窗口期会把旧页内容 PUT 到新页，切后台 flush 时尤其明显）。
   const [draft, setDraft] = useState<{ pageId: number; content: Record<string, unknown> } | null>(null);
   const draftsRef = useRef<Map<number, Record<string, unknown>>>(new Map());
+  const pageNotebooksRef = useRef(new Map<number, number>());
+  const deletedPagesRef = useRef(new Set<number>());
+  const [saveRevision, setSaveRevision] = useState(0);
   const autosaveRef = useRef<NoteAutosave | null>(null);
   if (!autosaveRef.current) {
     autosaveRef.current = new NoteAutosave((payload) => put(`/api/note-pages/${payload.pageId}`, { content: payload.content })
-      .catch((error: unknown) => Message.error(friendlyMessage(error, '笔记保存失败，请稍后重试'))));
+      .catch((error: unknown) => { Message.error(friendlyMessage(error, '笔记保存失败，请稍后重试')); throw error; }),
+      400, () => setSaveRevision((revision) => revision + 1));
   }
   const [selectedPageIds, setSelectedPageIds] = useState<number[]>(() => cachedNotebooks.selectedPageIds ?? []);
   const [planVisible, setPlanVisible] = useState(false);
@@ -66,7 +77,7 @@ export function NotebookPage(): JSX.Element {
   const listRenameInputRef = useRef<RefInputType>(null);
   const headerRenameInputRef = useRef<RefInputType>(null);
   const notebookRenameInputRef = useRef<RefInputType>(null);
-  const deepLinkApplied = useRef(false);
+  const deepLinkApplied = useRef<number>();
   const notebooksQuery = useQuery({ queryKey: ['notebooks'], queryFn: () => get<Notebook[]>('/api/notebooks') });
   const pagesQuery = useQuery({ queryKey: ['note-pages', notebookId], queryFn: () => get<NotePage[]>(`/api/notebooks/${notebookId}/pages`), enabled: notebookId !== undefined });
   const pageQuery = useQuery({ queryKey: ['note-page', pageId], queryFn: () => get<NotePage>(`/api/note-pages/${pageId}`), enabled: pageId !== undefined });
@@ -76,6 +87,26 @@ export function NotebookPage(): JSX.Element {
     queryFn: () => get<NotePage>(`/api/note-pages/${pageIdFromQuery}`),
     enabled: pageIdFromQuery !== undefined
   });
+  useEffect(() => onMaterialDeleted(event => {
+    const removed = new Set<number>();
+    if (event.type === 'note') removed.add(event.id);
+    else {
+      for (const [id, book] of pageNotebooksRef.current) if (book === event.id) removed.add(id);
+      for (const page of pagesQuery.data ?? []) if (page.notebookId === event.id) removed.add(page.id);
+    }
+    for (const id of removed) {
+      deletedPagesRef.current.add(id);
+      autosaveRef.current?.discard(id);
+      draftsRef.current.delete(id);
+      pageNotebooksRef.current.delete(id);
+    }
+    setDraft(value => value && removed.has(value.pageId) ? null : value);
+    setSelectedPageIds(ids => ids.filter(id => !removed.has(id)));
+    if (pageId !== undefined && removed.has(pageId)) { setPageId(undefined); cancelPageRename(); }
+    if (event.type === 'notebook' && notebookId === event.id) {
+      setPageId(undefined); setNotebookId(undefined); cancelNotebookRename();
+    }
+  }), [notebookId, pageId, pagesQuery.data]);
 
   const refresh = (): void => {
     void queryClient.invalidateQueries({ queryKey: ['notebooks'] });
@@ -273,8 +304,9 @@ export function NotebookPage(): JSX.Element {
 
   // Deep link: select notebook + page from ?pageId=
   useEffect(() => {
-    if (deepLinkApplied.current || !pageIdFromQuery || !deepLinkPageQuery.data) return;
-    deepLinkApplied.current = true;
+    if (!pageIdFromQuery) { deepLinkApplied.current = undefined; return; }
+    if (deepLinkApplied.current === pageIdFromQuery || !deepLinkPageQuery.data) return;
+    deepLinkApplied.current = pageIdFromQuery;
     setNotebookId(deepLinkPageQuery.data.notebookId);
     setPageId(deepLinkPageQuery.data.id);
   }, [deepLinkPageQuery.data, pageIdFromQuery]);
@@ -283,7 +315,7 @@ export function NotebookPage(): JSX.Element {
     if (notebookId === undefined && notebooksQuery.data?.length && !pageIdFromQuery) {
       setNotebookId(notebooksQuery.data[0].id);
     }
-    if (notebookId === undefined && notebooksQuery.data?.length && pageIdFromQuery && deepLinkApplied.current === false && deepLinkPageQuery.isError) {
+    if (notebookId === undefined && notebooksQuery.data?.length && pageIdFromQuery && deepLinkApplied.current !== pageIdFromQuery && deepLinkPageQuery.isError) {
       // Fallback if deep-link page fetch failed
       setNotebookId(notebooksQuery.data[0].id);
     }
@@ -316,17 +348,18 @@ export function NotebookPage(): JSX.Element {
   // 服务端快照到达：记基线并采纳为草稿；本页还有未落库编辑时保留草稿（服务端快照旧于它）。
   useEffect(() => {
     const data = pageQuery.data;
-    if (!data) return;
+    if (!data || deletedPagesRef.current.has(data.id)) return;
+    pageNotebooksRef.current.set(data.id, data.notebookId);
     const autosave = autosaveRef.current;
     if (!autosave) return;
-    autosave.noteServer(data.id, data.content);
     if (autosave.hasPendingFor(data.id)) return;
+    autosave.noteServer(data.id, data.content);
     draftsRef.current.set(data.id, data.content);
     setDraft({ pageId: data.id, content: data.content });
   }, [pageQuery.data]);
   // 编辑器回传：草稿入 Map + 触发重渲染（AI 上下文/导出用），并交给协调器防抖落库。
   const handleEditorChange = (content: Record<string, unknown>): void => {
-    if (pageId === undefined) return;
+    if (pageId === undefined || deletedPagesRef.current.has(pageId)) return;
     draftsRef.current.set(pageId, content);
     setDraft({ pageId, content });
     autosaveRef.current?.change(pageId, content);
@@ -334,9 +367,7 @@ export function NotebookPage(): JSX.Element {
   // 无感自动保存：切走页面不取消计时；退出/切后台前 keepalive 兜底冲刷。
   useEffect(() => {
     const flush = (): void => {
-      for (const payload of autosaveRef.current?.take() ?? []) {
-        flushRequest(`/api/note-pages/${payload.pageId}`, { content: payload.content });
-      }
+      autosaveRef.current?.flush((payload) => flushRequest(`/api/note-pages/${payload.pageId}`, { content: payload.content }));
     };
     const onVisibility = (): void => { if (document.visibilityState === 'hidden') flush(); };
     window.addEventListener('pagehide', flush);
@@ -354,7 +385,7 @@ export function NotebookPage(): JSX.Element {
     return () => setNotebookFocusMode(false);
   }, [focusMode, setNotebookFocusMode]);
 
-  const currentPage = pageQuery.data;
+  const currentPage = pageQuery.data?.notebookId === notebookId ? pageQuery.data : undefined;
   const selectedNotebook = notebooksQuery.data?.find((notebook) => notebook.id === notebookId);
   const validSelectedPageIds = useMemo(() => {
     const available = new Set((pagesQuery.data ?? []).map((page) => page.id));
@@ -397,9 +428,10 @@ export function NotebookPage(): JSX.Element {
       markdown: notePageToMarkdown({ ...currentPage, content }),
       route: '/notebooks',
       notebookId: currentPage.notebookId,
-      notePageId: currentPage.id
+      notePageId: currentPage.id,
+      isDraft: autosaveRef.current?.hasPendingFor(currentPage.id) ?? false
     };
-  }, [currentPage, notebookId, pageId, draft]);
+  }, [currentPage, notebookId, pageId, draft, saveRevision]);
 
   useRegisterPageContext(pageContext);
 

@@ -83,7 +83,23 @@ public class QuestionRepository {
         String chapter = body.containsKey("chapter") ? text(body.get("chapter")) : current.chapter;
         String groupId = body.containsKey("groupId") ? text(body.get("groupId")) : current.groupId;
         Integer orderInGroup = body.containsKey("orderInGroup") ? integer(body.get("orderInGroup")) : current.orderInGroup;
-        jdbc.update("UPDATE question SET type = ?, stem = ?, options = ?, answer = ?, analysis = ?, difficulty = ?, tags = ?, chapter = ?, group_id = ?, order_in_group = ? WHERE id = ?", type, stem, options, answer, analysis, difficulty, tags, chapter, groupId, orderInGroup, id);
+        // Validate the merged question, but persist only supplied fields. In particular, an
+        // analysis-only edit must not normalize old answers or fill a previously unset difficulty.
+        Map<String,Object> changed = new LinkedHashMap<>();
+        if (body.get("type") != null) changed.put("type", type);
+        if (body.get("stem") != null) changed.put("stem", stem);
+        if (body.get("options") != null) changed.put("options", options);
+        if (body.get("answer") != null) changed.put("answer", answer);
+        if (body.get("analysis") != null) changed.put("analysis", analysis);
+        if (body.get("difficulty") != null) changed.put("difficulty", difficulty);
+        if (body.get("tags") != null) changed.put("tags", tags);
+        if (body.containsKey("chapter")) changed.put("chapter", chapter);
+        if (body.containsKey("groupId")) changed.put("group_id", groupId);
+        if (body.containsKey("orderInGroup")) changed.put("order_in_group", orderInGroup);
+        if (changed.isEmpty()) return;
+        List<Object> parameters = new ArrayList<>(changed.values()); parameters.add(id);
+        jdbc.update("UPDATE question SET " + changed.keySet().stream().map(column -> column + " = ?").collect(Collectors.joining(","))
+                + " WHERE id = ?", parameters.toArray());
         rebuildFts();
     }
 
@@ -137,27 +153,30 @@ public class QuestionRepository {
 
     /**
      * 错题本成员规则（单一真相源）：
-     * 1) 累计答错过（wrongCount > 0）；
+     * 1) 累计答错过或被人工加入；
      * 2) 未被手动移出（wrong_excluded = 0）；
-     * 3) 最近一次答错之后尚未连续答对满 {@link #WRONG_MASTER_STREAK} 次。
+     * 3) 最近答错或人工加入（取较新基线）之后尚未连续答对满 {@link #WRONG_MASTER_STREAK} 次。
      * 排序：错误次数多者优先，其次最近答错时间。
      */
-    public List<QuestionRecord> wrongQuestions() {
-        return jdbc.query("""
-                SELECT q.* FROM question q
-                JOIN (
+    static final String WRONG_MEMBERSHIP_SQL = """
+                LEFT JOIN (
                     SELECT question_id,
+                           COUNT(*) AS attempt_count,
                            SUM(CASE WHEN is_correct = 0 THEN 1 ELSE 0 END) AS wrong_count,
                            MAX(CASE WHEN is_correct = 0 THEN id END) AS last_wrong_id,
                            MAX(CASE WHEN is_correct = 0 THEN answered_at END) AS last_wrong_at
                     FROM answer_record GROUP BY question_id
                 ) agg ON agg.question_id = q.id
-                WHERE agg.wrong_count > 0
+                WHERE (COALESCE(agg.wrong_count, 0) > 0 OR q.wrong_manual_after IS NOT NULL)
                   AND q.wrong_excluded = 0
                    AND (SELECT COUNT(*) FROM answer_record c
-                          WHERE c.question_id = q.id AND c.is_correct = 1 AND c.id > agg.last_wrong_id) < """ + WRONG_MASTER_STREAK + """
-                 ORDER BY agg.wrong_count DESC, agg.last_wrong_at DESC
-                """, rowMapper);
+                          WHERE c.question_id = q.id AND c.is_correct = 1
+                            AND c.id > MAX(COALESCE(agg.last_wrong_id, 0), COALESCE(q.wrong_manual_after, 0))) < """ + WRONG_MASTER_STREAK + """
+                """;
+
+    public List<QuestionRecord> wrongQuestions() {
+        return jdbc.query("SELECT q.* FROM question q " + WRONG_MEMBERSHIP_SQL
+                + " ORDER BY agg.wrong_count DESC, agg.last_wrong_at DESC", rowMapper);
     }
 
     /** 错题本视图：在成员规则基础上附带错误次数 / 作答次数 / 错误率，供前端展示与排序。 */
@@ -182,6 +201,21 @@ public class QuestionRepository {
     /** 手动移出/恢复错题本。答错会由 recordAnswer 自动重置为未移出。 */
     public void setWrongExcluded(long questionId, boolean excluded) {
         jdbc.update("UPDATE question SET wrong_excluded = ? WHERE id = ?", excluded ? 1 : 0, questionId);
+    }
+
+    public boolean inWrongBook(long questionId) {
+        return !jdbc.query("SELECT q.id FROM question q " + WRONG_MEMBERSHIP_SQL + " AND q.id = ?",
+                (row, index) -> row.getLong(1), questionId).isEmpty();
+    }
+
+    /** 不伪造答题记录；已在错题本时不重置进度。由调用方的写事务包住判定和标记。 */
+    public boolean addToWrongBook(long questionId) {
+        findById(questionId);
+        if (inWrongBook(questionId)) return false;
+        jdbc.update("UPDATE question SET wrong_excluded = 0, wrong_manual_after = "
+                + "(SELECT COALESCE(MAX(id), 0) FROM answer_record WHERE question_id = ?) WHERE id = ?",
+                questionId, questionId);
+        return true;
     }
 
     /**

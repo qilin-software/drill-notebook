@@ -8,6 +8,7 @@ import { ApiError } from '../lib/api';
 import { isUuidV7 } from '../lib/uuidV7';
 import type { StreamCallbacks } from '../lib/aiStream';
 import type { ToolActivity } from '../lib/toolActivity';
+import type { AiRecovery } from '../lib/aiRecovery';
 
 const { apiGet, apiPost, streamChatMock } = vi.hoisted(() => ({
   apiGet: vi.fn(), apiPost: vi.fn(), streamChatMock: vi.fn()
@@ -103,7 +104,7 @@ describe('AiAssistant 流式会话状态', () => {
       if (url === '/api/ai/config') return Promise.resolve({ chat: { hasKey: true, provider: 'custom', endpoint: 'mock://x', model: 'm' } });
       if (url === '/api/notebooks') return Promise.resolve([{ id: 1, title: 'NB' }]);
       if (url === '/api/ai/sessions') return Promise.resolve([{ id: 10, title: 'S' }]);
-      if (url === '/api/ai/sessions/10/history?limit=50') return Promise.resolve(historyPage(serverMessages));
+      if (url.startsWith('/api/ai/sessions/10/history?')) return Promise.resolve(historyPage(serverMessages));
       if (url.startsWith('/api/notebooks/')) return Promise.resolve([]);
       return Promise.resolve({});
     });
@@ -119,21 +120,169 @@ describe('AiAssistant 流式会话状态', () => {
   const activity: ToolActivity = { sequence: 1, toolName: 'create_memory', state: 'FINISHED', outcome: 'CREATED',
     count: 1, startedAt: '2026-11-08T01:00:00.000Z', elapsedMs: 30, availability: null, incomplete: false };
 
-  it('历史达限说明与继续入口保留，继续开启新轮次且不覆盖草稿', async () => {
-    serverMessages = [{ id: 1, role: 'user', content: '检查所有记忆' },
+  it('恢复状态在原回答显示一次，成功后清除且始终保留下一条草稿', async () => {
+    renderAssistant(); await send('请求在原轮次恢复');
+    await waitFor(() => expect(streamCallbacks).toBeTruthy());
+    const input = screen.getByPlaceholderText('正在回复，可先输入下一条问题');
+    fireEvent.change(input, { target: { value: '恢复过程中写下的草稿' } });
+    const value: AiRecovery = { kind: 'request', state: 'waiting', attempt: 0, limit: 4,
+      error: 'HTTP 503 · server_error\nfixture provider unavailable', nextRetryAt: Date.now() + 10000 };
+    act(() => streamCallbacks!.onMetadata?.({ requestId: turnRequestId(), sessionId: 10, recovery: value }));
+    expect(screen.getByText('请求重试 0/4')).toBeVisible();
+    expect(screen.getAllByText(/fixture provider unavailable/)).toHaveLength(1);
+    expect(screen.queryByText('展开报错')).toBeNull();
+    expect(screen.getByRole('button', { name: '停止' })).toBeEnabled();
+    act(() => streamCallbacks!.onMetadata?.({ requestId: turnRequestId(), recovery: { ...value, state: 'connecting', attempt: 1, nextRetryAt: null } }));
+    expect(screen.getByText('请求重试 1/4')).toBeVisible();
+    act(() => {
+      streamCallbacks!.onMetadata?.({ requestId: turnRequestId(), recovery: null });
+      streamCallbacks!.onText('成功恢复的回答');
+      streamCallbacks!.onDone({ requestId: turnRequestId(), reply: '成功恢复的回答', reasoning: '', status: 'COMPLETED', recovery: null, stateDurable: true });
+    });
+    expect(screen.getByText('成功恢复的回答')).toBeVisible();
+    expect(document.querySelector('.ai-recovery')).toBeNull();
+    expect(input).toHaveValue('恢复过程中写下的草稿');
+    expect(streamChatMock).toHaveBeenCalledOnce();
+  });
+
+  it('没有正文的上游失败也保留报错，历史刷新后显示一次', async () => {
+    renderAssistant(); await send('上游鉴权失败');
+    await waitFor(() => expect(streamCallbacks).toBeTruthy());
+    const value: AiRecovery = { kind: 'request', state: 'failed', attempt: 0, limit: 4,
+      error: 'HTTP 401 · invalid_api_key\nfixture provider exact error' };
+    act(() => streamCallbacks!.onMetadata?.({ requestId: turnRequestId(), sessionId: 10, recovery: value }));
+    serverMessages = [
+      { id: 1, role: 'user', content: '上游鉴权失败', requestId: turnRequestId(), turnStatus: 'FAILED' },
+      { id: 2, role: 'assistant', content: '', requestId: turnRequestId(), turnStatus: 'FAILED', recovery: value }
+    ];
+    act(() => streamCallbacks!.onError({ requestId: turnRequestId(), sessionId: 10,
+      message: value.error, partial: false, persistenceStatus: 'saved', stateDurable: true, recovery: value }));
+    await waitFor(() => expect(document.querySelector('.chat-stream-cursor')).toBeNull());
+    expect(screen.getAllByText(/fixture provider exact error/)).toHaveLength(1);
+    expect(screen.queryByText('这一轮失败，显示的内容可能不完整')).toBeNull();
+    expect(screen.queryByText('展开报错')).toBeNull();
+    await act(async () => { useUiStore.setState({ aiOpen: false }); });
+    await act(async () => { useUiStore.setState({ aiOpen: true }); });
+    await waitFor(() => expect(screen.getAllByText(/fixture provider exact error/)).toHaveLength(1));
+    expect(document.querySelectorAll('.chat-message.assistant')).toHaveLength(1);
+    expect(streamChatMock).toHaveBeenCalledOnce();
+    expect(apiPost.mock.calls.some(([url]) => url === '/api/ai/chat')).toBe(false);
+  });
+
+  it('生成期间跨页定位并返回最新，草稿和原轮次流式回答都保留', async () => {
+    serverMessages = [
+      { id: 1001, role: 'user', content: '最新的历史提问', requestId: 'old-latest' },
+      { id: 1002, role: 'assistant', content: '最新的历史答复', requestId: 'old-latest' }
+    ];
+    const other = apiGet.getMockImplementation()!;
+    apiGet.mockImplementation((url: string) => {
+      if (url === '/api/ai/sessions/10/history?limit=50') return Promise.resolve({ ...historyPage(serverMessages),
+        firstRound: 501, totalRounds: serverMessages.length > 2 ? 502 : 501, hasMore: true });
+      if (url === '/api/ai/sessions/10/navigation/1') return Promise.resolve({ roundNumber: 1, totalRounds: 502,
+        messageId: 1, question: '最早的历史提问', answer: '最早的历史答复', status: 'COMPLETED' });
+      if (url === '/api/ai/sessions/10/history?limit=50&afterMessageId=0') return Promise.resolve({
+        ...historyPage([{ id: 1, role: 'user', content: '最早的历史提问' }, { id: 2, role: 'assistant', content: '最早的历史答复' }]),
+        firstRound: 1, totalRounds: 502, hasOlder: false, hasMore: true });
+      return other(url);
+    });
+    renderAssistant(); await screen.findByText('最新的历史答复');
+    await send('正在生成的这一问'); await waitFor(() => expect(streamCallbacks).toBeTruthy());
+    const input = screen.getByPlaceholderText('正在回复，可先输入下一条问题');
+    fireEvent.change(input, { target: { value: '跳转时保留的草稿' } });
+    act(() => streamCallbacks!.onText('回答的前半段'));
+    const range = screen.getByRole('slider', { name: '会话内对话跳转' });
+    fireEvent.focus(range); fireEvent.keyDown(range, { key: 'Home' });
+    await screen.findByText('最早的历史提问');
+    expect(screen.getByText('最新的历史答复')).toBeVisible();
+    fireEvent.click(screen.getByRole('button', { name: /第 1 .*对话预览/ }));
+    await waitFor(() => expect(document.querySelector('[data-conversation-message="1"]')).toHaveClass('is-jump-target'));
+    expect(screen.queryByText('最新的历史答复')).toBeNull();
+    expect(input).toHaveValue('跳转时保留的草稿');
+    expect(screen.queryByText('跳到这轮')).toBeNull();
+    serverMessages = [...serverMessages,
+      { id: 1003, role: 'user', content: '正在生成的这一问', requestId: turnRequestId() },
+      { id: 1004, role: 'assistant', content: '回答的前半段和后半段', requestId: turnRequestId(), turnStatus: 'COMPLETED' }];
+    act(() => {
+      streamCallbacks!.onText('和后半段');
+      streamCallbacks!.onDone({ requestId: turnRequestId(), reply: '回答的前半段和后半段', reasoning: '', status: 'COMPLETED', stateDurable: true });
+    });
+    expect(screen.getByText('最早的历史答复')).toBeVisible();
+    expect(screen.queryByText('回答的前半段和后半段')).toBeNull();
+    fireEvent.click(screen.getByRole('button', { name: /回到最新/ }));
+    await screen.findByText('回答的前半段和后半段');
+    expect(screen.queryByText('最早的历史答复')).toBeNull();
+    expect(input).toHaveValue('跳转时保留的草稿');
+    expect(streamChatMock).toHaveBeenCalledOnce();
+    expect(apiPost.mock.calls.some(([url]) => url === '/api/ai/chat')).toBe(false);
+  });
+
+  it('回复中 Enter 排队、Ctrl+Enter 插话且不取消当前轮，组合输入不提交', async () => {
+    renderAssistant(); await send('第一问');
+    const input = await screen.findByPlaceholderText('正在回复，可先输入下一条问题');
+    fireEvent.change(input, { target: { value: '下一条' } });
+    fireEvent.keyDown(input, { key: 'Enter', keyCode: 229, isComposing: true });
+    expect(apiPost).not.toHaveBeenCalled();
+    fireEvent.keyDown(input, { key: 'Enter' });
+    await waitFor(() => expect(apiPost).toHaveBeenCalledWith('/api/ai/sessions/10/queue', expect.objectContaining({ mode: 'queue', input: { role: 'user', userText: '下一条' } })));
+    await waitFor(() => expect(input).toHaveValue(''));
+    fireEvent.change(input, { target: { value: '补充条件' } });
+    fireEvent.keyDown(input, { key: 'Enter', ctrlKey: true });
+    await waitFor(() => expect(apiPost).toHaveBeenCalledWith('/api/ai/sessions/10/queue', expect.objectContaining({ mode: 'steer', targetRequestId: turnRequestId() })));
+    expect(streamChatMock).toHaveBeenCalledTimes(1);
+    expect(apiPost.mock.calls.some((call) => String(call[0]).endsWith('/cancel'))).toBe(false);
+  });
+
+  it('入队响应延迟时只清已提交草稿，随后输入的文字保留', async () => {
+    let acknowledge!: (value: unknown) => void;
+    apiPost.mockImplementation((path: string) => path.endsWith('/queue') ? new Promise((resolve) => { acknowledge = resolve; }) : Promise.resolve({}));
+    renderAssistant(); await send('第一问');
+    const input = await screen.findByPlaceholderText('正在回复，可先输入下一条问题');
+    fireEvent.change(input, { target: { value: '排队消息' } }); fireEvent.keyDown(input, { key: 'Enter' });
+    await waitFor(() => expect(acknowledge).toBeTruthy());
+    fireEvent.change(input, { target: { value: '正在写的新草稿' } });
+    await act(async () => { acknowledge({ status: 'QUEUED' }); });
+    expect(input).toHaveValue('正在写的新草稿');
+    expect(streamChatMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('已自定义 Ctrl+Enter 为发送时仍排队，不被插话快捷键覆盖', async () => {
+    const shortcuts = useUiStore.getState().shortcutConfig;
+    try {
+      act(() => useUiStore.setState({ shortcutConfig: { ...shortcuts, aiSend: ['Ctrl+Enter'] } }));
+      renderAssistant(); await send('第一问');
+      const input = await screen.findByPlaceholderText('正在回复，可先输入下一条问题');
+      fireEvent.change(input, { target: { value: '排队' } }); fireEvent.keyDown(input, { key: 'Enter', ctrlKey: true });
+      await waitFor(() => expect(apiPost).toHaveBeenCalledWith('/api/ai/sessions/10/queue', expect.objectContaining({ mode: 'queue' })));
+    } finally { act(() => useUiStore.setState({ shortcutConfig: shortcuts })); }
+  });
+
+  it('历史达限后在原轮次重试，沿用原输入并保留下一条草稿', async () => {
+    serverMessages = [{ id: 1, role: 'user', content: '检查所有记忆', requestId: 'budget-turn' },
       { id: 2, role: 'assistant', content: '已完成部分查询', requestId: 'budget-turn', turnStatus: 'COMPLETED', finishReason: 'budget_stages', toolActivities: [activity] }];
+    const base = apiGet.getMockImplementation()!;
+    apiGet.mockImplementation((url: string) => url === '/api/ai/turns/budget-turn/input'
+      ? Promise.resolve({ requestId: 'budget-turn', sessionId: 10, input: { role: 'user', userText: '检查所有记忆' } }) : base(url));
     renderAssistant();
-    const next = await screen.findByRole('button', { name: '继续' });
+    const next = await screen.findByRole('button', { name: '重试' });
     expect(screen.getByText(/已达工具阶段上限/)).toBeVisible();
     fireEvent.change(screen.getByPlaceholderText(/提问/), { target: { value: '未发送草稿' } });
-    expect(next).toBeDisabled();
-    fireEvent.change(screen.getByPlaceholderText(/提问/), { target: { value: '' } });
+    expect(next).toBeEnabled();
     fireEvent.click(next);
     await waitFor(() => expect(streamChatMock).toHaveBeenCalledTimes(1));
     const body = streamChatMock.mock.calls[0][1];
     expect(body.sessionId).toBe(10);
     expect(body.requestId).not.toBe('budget-turn');
-    expect(body.input.userText).toContain('已经确认成功的操作不要重复执行');
+    expect(body.retryOf).toBe('budget-turn');
+    expect(body.input.userText).toBe('检查所有记忆');
+    expect(document.querySelectorAll('.chat-message.user')).toHaveLength(1);
+    expect(document.querySelectorAll('.chat-message.assistant')).toHaveLength(1);
+    expect(screen.getByPlaceholderText('正在回复，可先输入下一条问题')).toHaveValue('未发送草稿');
+    serverMessages = [{ id: 1, role: 'user', content: '检查所有记忆', requestId: body.requestId },
+      { id: 2, role: 'assistant', content: '原位置重试完成', requestId: body.requestId, turnStatus: 'COMPLETED' }];
+    act(() => streamCallbacks!.onDone({ requestId: body.requestId, reply: '原位置重试完成', reasoning: '', status: 'COMPLETED', stateDurable: true }));
+    await screen.findByText('原位置重试完成');
+    expect(screen.getByPlaceholderText(/提问/)).toHaveValue('未发送草稿');
+    expect(document.querySelectorAll('.chat-message.user')).toHaveLength(1);
   });
 
   it('失败历史只在助手气泡提示，用户提问保持原文', async () => {
@@ -155,9 +304,11 @@ describe('AiAssistant 流式会话状态', () => {
     act(() => streamCallbacks!.onToolActivity!({ requestId: turnRequestId(), toolActivities: [activity,
       { ...activity, sequence: 2, toolName: 'update_memory', state: 'RUNNING', outcome: 'UNKNOWN', elapsedMs: null }], phase: 'tools' }));
     fireEvent.click(screen.getByRole('button', { name: '中断生成' }));
+    expect(screen.getByRole('button', { name: '中断生成' })).toBeVisible();
+    act(() => streamCallbacks!.onDone({ requestId: turnRequestId(), status: 'ABORTED', reply: '', reasoning: '', toolActivities: [activity], stateDurable: true }));
     expect(screen.getByText('记住我的复习偏好')).toBeVisible();
     expect(screen.getByRole('button', { name: /新增记忆 已新增 1 条/ })).toBeVisible();
-    expect(screen.getByText(/回答已中断，已确认的工具结果已保留/)).toBeVisible();
+    expect(screen.getByText(/这一轮已中断/)).toBeVisible();
     expect(document.querySelector('.ai-tool-icon.is-running')).toBeNull();
     expect(streamChatMock).toHaveBeenCalledTimes(1);
     expect(apiPost.mock.calls.some((call) => call[0] === '/api/ai/chat')).toBe(false);
@@ -285,7 +436,7 @@ describe('AiAssistant 流式会话状态', () => {
     expect(nodes[4].querySelector('.chat-stream-cursor')).not.toBeNull();
   });
 
-  it('停止带着本轮 requestId 调取消接口，让后端立刻释放会话', async () => {
+  it('停止携带本轮 requestId，等待后端终态且保留已受理提问', async () => {
     serverMessages = [{ id: 1, role: 'user', content: '第一问', createdAt: '2026-10-12T12:00:00.000Z' }];
     renderAssistant();
     await screen.findByText('第一问');
@@ -305,9 +456,10 @@ describe('AiAssistant 流式会话状态', () => {
 
     await waitFor(() => expect(apiPost).toHaveBeenCalledWith(`/api/ai/turns/${requestId}/cancel`, {}));
     await waitFor(() => expect(storageReads()).toBeGreaterThan(storageBefore));
-    // 停止后界面恢复可发送：占位与未送达的用户消息一起回滚
+    act(() => streamCallbacks!.onDone({ requestId, status: 'ABORTED', reply: '', reasoning: '', stateDurable: true }));
+    // 后端确认后恢复可发送；已经受理的提问不能从界面抹掉。
     await waitFor(() => expect(screen.getByRole('button', { name: '发送' })).toBeInTheDocument());
-    expect(messageNodes().some((node) => node.textContent?.includes('第二问'))).toBe(false);
+    expect(messageNodes().some((node) => node.textContent?.includes('第二问'))).toBe(true);
   });
 
   it('已有部分正文后收到 error：绝不自动回退重发，保留已生成内容', async () => {

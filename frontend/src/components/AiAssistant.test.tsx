@@ -5,6 +5,7 @@ import { MemoryRouter, useLocation } from 'react-router-dom';
 import { AiAssistant } from './AiAssistant';
 import { useUiStore, type AiPageContext } from '../stores/uiStore';
 import { isUuidV7 } from '../lib/uuidV7';
+import { LS_RETRIEVE_NOTES } from '../lib/sessionPrefs';
 import type { StreamCallbacks, StreamDonePayload } from '../lib/aiStream';
 
 const { apiGet, apiPost } = vi.hoisted(() => ({ apiGet: vi.fn(), apiPost: vi.fn() }));
@@ -29,8 +30,7 @@ function LocationProbe(): JSX.Element {
   return <div data-testid="loc">{location.pathname}{location.search}</div>;
 }
 
-const renderAssistant = () => {
-  const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+const renderAssistant = (queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } })) => {
   return render(
     <QueryClientProvider client={queryClient}>
       <MemoryRouter>
@@ -52,6 +52,7 @@ interface V2Body {
   messages?: unknown;
   input: { role: string; userText: string };
   pageContext?: { kind: string; pageId?: number; markdown?: string };
+  pageSnapshot?: { kind: string; pageId?: number; markdown?: string; notebookId?: number; capturedAt?: string };
   retrievalOptions?: { enabled: boolean; scope: string; notebookId?: number };
 }
 
@@ -68,11 +69,7 @@ const typeAndSend = async (text: string): Promise<void> => {
   await waitFor(() => expect(apiPost.mock.calls.some((item) => item[0] === '/api/ai/chat')).toBe(true));
 };
 
-const toggleRetrieveNotes = (): void => {
-  fireEvent.click(screen.getByLabelText('检索笔记'));
-};
-
-describe('AiAssistant v2 请求组装（Task 14 检索口径）', () => {
+describe('AiAssistant v2 请求组装（按需读取页面）', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     localStorage.clear();
@@ -94,7 +91,7 @@ describe('AiAssistant v2 请求组装（Task 14 检索口径）', () => {
     setContext({ kind: 'none', title: '无页面上下文', markdown: '' });
   });
 
-  it('关闭检索：不带 retrievalOptions，页面正文改走 pageContext，不再有 system 消息', async () => {
+  it('页面正文只放本地快照，不走自动注入字段', async () => {
     setContext({ kind: 'quiz', title: '刷题', markdown: 'QUIZ MD' });
     renderAssistant();
     await typeAndSend('你好');
@@ -104,32 +101,31 @@ describe('AiAssistant v2 请求组装（Task 14 检索口径）', () => {
     // v2 前端禁止再拼"你是学习助手"system，也不回传历史（contracts §4.1）
     expect(body.messages).toBeUndefined();
     expect(body.input).toEqual({ role: 'user', userText: '你好' });
-    expect(body.pageContext).toEqual({ kind: 'quiz', markdown: 'QUIZ MD' });
+    expect(body.pageContext).toBeUndefined();
+    expect(body.pageSnapshot).toMatchObject({ kind: 'quiz', markdown: 'QUIZ MD' });
+    expect(Number.isFinite(Date.parse(body.pageSnapshot!.capturedAt!))).toBe(true);
   });
 
-  it('note 页开启检索：默认 current + notebookId，且不再重复带上整页 markdown', async () => {
+  it('旧检索偏好不再注入资料，笔记快照保留正文和目标', async () => {
     setContext({ kind: 'note', title: '页面', markdown: 'NOTE MD', notebookId: 7, notePageId: 5 });
+    localStorage.setItem(LS_RETRIEVE_NOTES, 'true');
     renderAssistant();
-    await waitFor(() => expect(screen.getByRole('button', { name: '发送' })).toBeEnabled());
-    toggleRetrieveNotes();
     await typeAndSend('你好');
     const body = chatBody();
-    expect(body.retrievalOptions).toEqual({ enabled: true, scope: 'current', notebookId: 7 });
-    expect(body.pageContext).toEqual({ kind: 'note', pageId: 5 });
-    expect(body.pageContext?.markdown).toBeUndefined();
+    expect(body.retrievalOptions).toBeUndefined();
+    expect(body.pageContext).toBeUndefined();
+    expect(body.pageSnapshot).toMatchObject({ kind: 'note', pageId: 5, notebookId: 7, markdown: 'NOTE MD' });
   });
 
-  it('无 notebookId 的页面开启检索：默认 all，绝不发送缺 notebookId 的 current', async () => {
+  it('空页面不会自动检索全库或恢复旧注入字段', async () => {
     setContext({ kind: 'quiz', title: '刷题', markdown: '' });
+    localStorage.setItem(LS_RETRIEVE_NOTES, 'true');
     renderAssistant();
-    await waitFor(() => expect(screen.getByRole('button', { name: '发送' })).toBeEnabled());
-    toggleRetrieveNotes();
     await typeAndSend('你好');
     const body = chatBody();
-    expect(body.retrievalOptions).toEqual({ enabled: true, scope: 'all' });
-    expect((body.retrievalOptions as { notebookId?: number }).notebookId).toBeUndefined();
-    // 没有页面正文时只留页面身份，不塞空 markdown
-    expect(body.pageContext).toEqual({ kind: 'quiz' });
+    expect(body.retrievalOptions).toBeUndefined();
+    expect(body.pageContext).toBeUndefined();
+    expect(body.pageSnapshot).toMatchObject({ kind: 'quiz', markdown: '' });
   });
 
   it('每个逻辑请求带一个 UUIDv7 身份，服务端据此做幂等', async () => {
@@ -228,6 +224,65 @@ describe('AiAssistant v2 请求组装（Task 14 检索口径）', () => {
     expect(await screen.findByText('文本附件合计不能超过 20 万字')).toBeTruthy();
   });
 
+  it.each([
+    ['note', '/notebooks?pageId=12'],
+    ['notebook', '/notebooks?notebookId=12'],
+    ['bank', '/banks?bankId=12'],
+    ['knowledge', '/knowledge?pointId=12&bankId=7'],
+    ['question', '/banks?bankId=7&questionId=12'],
+    ['wrong', '/banks?bankId=7&questionId=12']
+  ])('工具返回的 %s 来源可打开普通资料页面', async (type, route) => {
+    const originalGet = apiGet.getMockImplementation()!;
+    apiGet.mockImplementation((url: string) => url === '/api/questions/12' || url === '/api/knowledge-points/12'
+      ? Promise.resolve({ id: 12, bankId: 7 }) : originalGet(url));
+    apiPost.mockImplementation((url: string) => Promise.resolve(url === '/api/ai/chat'
+      ? { reply: `[资料来源](drill-notebook://material/${type}/12)`, sessionId: 10 } : {}));
+    renderAssistant();
+    await typeAndSend('打开资料');
+    fireEvent.click(await screen.findByRole('link', { name: '资料来源' }));
+    await waitFor(() => expect(screen.getByTestId('loc').textContent).toBe(route));
+    expect(useUiStore.getState().aiOpen).toBe(false);
+  });
+
+  it('资料保存活动刷新目录并提供导航，同时保留现有编辑草稿', async () => {
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    client.setQueryData(['note-pages', 7], []);
+    client.setQueryData(['note-page', 12], { content: '尚未保存的草稿' });
+    apiPost.mockImplementation((url: string) => Promise.resolve(url === '/api/ai/chat' ? {
+      reply: '已保存', sessionId: 10, toolActivities: [{ sequence: 1, toolName: 'create_material', state: 'FINISHED', outcome: 'CREATED',
+        count: 1, sourceLink: 'drill-notebook://material/note/12', incomplete: false }]
+    } : {}));
+    renderAssistant(client);
+    await typeAndSend('保存为一页新笔记');
+    fireEvent.click(await screen.findByRole('button', { name: /已保存学习资料/ }));
+    fireEvent.click(screen.getByRole('button', { name: /新增学习资料 已保存/ }));
+    await waitFor(() => expect(client.getQueryState(['note-pages', 7])?.isInvalidated).toBe(true));
+    expect(client.getQueryState(['note-page', 12])?.isInvalidated).toBe(false);
+    expect(client.getQueryData(['note-page', 12])).toEqual({ content: '尚未保存的草稿' });
+    fireEvent.click(screen.getByRole('button', { name: '查看资料 ↗' }));
+    await waitFor(() => expect(screen.getByTestId('loc').textContent).toBe('/notebooks?pageId=12'));
+  });
+
+  it('资料修改活动只使目标笔记正文失效，保留其他笔记缓存并支持来源跳转', async () => {
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    client.setQueryData(['note-pages', 7], []);
+    client.setQueryData(['note-page', 12], { content: '目标旧正文' });
+    client.setQueryData(['note-page', 13], { content: '另一笔记正文' });
+    apiPost.mockImplementation((url: string) => Promise.resolve(url === '/api/ai/chat' ? {
+      reply: '已修改', sessionId: 10, toolActivities: [{ sequence: 1, toolName: 'update_material', state: 'FINISHED', outcome: 'UPDATED',
+        count: 1, sourceLink: 'drill-notebook://material/note/12', incomplete: false }]
+    } : {}));
+    renderAssistant(client);
+    await typeAndSend('追加到这页笔记');
+    fireEvent.click(await screen.findByRole('button', { name: /已更新学习资料/ }));
+    fireEvent.click(screen.getByRole('button', { name: /修改学习资料 已更新/ }));
+    await waitFor(() => expect(client.getQueryState(['note-page', 12])?.isInvalidated).toBe(true));
+    expect(client.getQueryState(['note-pages', 7])?.isInvalidated).toBe(true);
+    expect(client.getQueryState(['note-page', 13])?.isInvalidated).toBe(false);
+    fireEvent.click(screen.getByRole('button', { name: '查看资料 ↗' }));
+    await waitFor(() => expect(screen.getByTestId('loc').textContent).toBe('/notebooks?pageId=12'));
+  });
+
   it('citation 点击深链到 /notebooks?pageId=', async () => {
     apiPost.mockImplementation((url: string) => {
       if (url === '/api/ai/chat') {
@@ -244,9 +299,8 @@ describe('AiAssistant v2 请求组装（Task 14 检索口径）', () => {
       return Promise.resolve({});
     });
     setContext({ kind: 'note', title: '页面', markdown: 'NOTE MD', notebookId: 7, notePageId: 5 });
+    localStorage.setItem(LS_RETRIEVE_NOTES, 'true');
     renderAssistant();
-    await waitFor(() => expect(screen.getByRole('button', { name: '发送' })).toBeEnabled());
-    toggleRetrieveNotes();
     await typeAndSend('你好');
 
     const chip = await screen.findByText('第五页');
@@ -271,9 +325,8 @@ describe('AiAssistant v2 请求组装（Task 14 检索口径）', () => {
       return Promise.resolve({});
     });
     setContext({ kind: 'note', title: '页面', markdown: 'NOTE MD', notebookId: 7, notePageId: 5 });
+    localStorage.setItem(LS_RETRIEVE_NOTES, 'true');
     renderAssistant();
-    await waitFor(() => expect(screen.getByRole('button', { name: '发送' })).toBeEnabled());
-    toggleRetrieveNotes();
     await typeAndSend('你好');
 
     expect(await screen.findByText('ANSWER')).toBeInTheDocument();

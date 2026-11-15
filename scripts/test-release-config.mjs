@@ -20,23 +20,31 @@ const defaultVersion = workflow.on.workflow_dispatch.inputs.version.default.repl
 const mavenCommand = 'mvn --batch-mode --show-version --no-transfer-progress -f backend/pom.xml';
 
 test('发布默认值、预发行渠道与 PowerShell 7 入口保持一致', () => {
-  assert.equal(workflow.on.workflow_dispatch.inputs.version.default, 'v0.7.0');
+  assert.equal(workflow.on.workflow_dispatch.inputs.version.default, 'v0.8.2');
   assert.equal(workflow.on.workflow_dispatch.inputs.publish_release.default, false);
   assert.equal(steps.find(step => step.uses?.startsWith('softprops/action-gh-release@')).with.prerelease, true);
+  assert.equal(steps.find(step => step.uses?.startsWith('softprops/action-gh-release@')).with.make_latest, 'false');
+  const packageScript = readFileSync(join(root, 'scripts/package-portable.ps1'), 'utf8');
+  assert.equal(packageScript.match(/\[string\]\$Version = '([^']+)'/)?.[1], defaultVersion);
   assert.equal(job.defaults.run.shell, 'pwsh');
   assert.match(packageJson.scripts['package:portable'], /^pwsh .* -File scripts\/package-portable\.ps1$/);
 });
 
-test('锁文件安装及前后端测试必须成功后才可打包发布', () => {
+test('干净检出先编译发布模块，配置检查通过后构建发布，不重复本地业务全量测试', () => {
   const install = steps.findIndex(step => step.run === 'npm ci');
-  const build = steps.findIndex(step => step.run === 'npm run build');
-  assert.ok(install >= 0 && build > install);
-  for (const command of ['node --test scripts/test-release-config.mjs', 'npm run test:frontend', `${mavenCommand} test`]) {
+  const electronBuild = steps.findIndex(step => step.run === 'npm run build:electron');
+  const build = steps.findIndex(step => step.run === 'npm run build:frontend');
+  assert.ok(install >= 0 && electronBuild > install && build > electronBuild);
+  for (const command of ['node --test scripts/test-release-config.mjs']) {
     const index = steps.findIndex(step => step.run === command);
-    assert.ok(index > install && index < build, `${command} 必须在安装后、构建前`);
+    assert.ok(index > electronBuild && index < build, `${command} 必须在 Electron 编译后、前端构建前`);
+    assert.equal(steps[electronBuild]['continue-on-error'], undefined);
+    assert.equal(steps[electronBuild].if, undefined);
     assert.equal(steps[index]['continue-on-error'], undefined);
     assert.equal(steps[index].if, undefined);
   }
+  const commands = steps.map(step => step.run ?? '').join('\n');
+  assert.doesNotMatch(commands, /npm (?:run )?test(?::(?:frontend|backend|electron|rag))?\b|npm (?:--workspace|--prefix) frontend (?:run )?test\b|\bvitest\s+run\b|\bmvn[^\n]*\b(?:test|verify)\s*(?:\n|$)/);
   assert.equal(job['continue-on-error'], undefined);
   const pack = steps.findIndex(step => step.run?.includes('npx electron-builder'));
   const release = steps.findIndex(step => step.uses?.startsWith('softprops/action-gh-release@'));
@@ -44,19 +52,30 @@ test('锁文件安装及前后端测试必须成功后才可打包发布', () =>
   assert.match(steps[pack].run, /--publish never --config\.extraMetadata\.version=/);
   assert.equal(steps[release].if, "github.event_name == 'push' || inputs.publish_release == true");
   assert.equal(steps[release].with.name, 'Drill Notebook ${{ steps.ver.outputs.tag }}');
+  assert.equal(steps[release].with.target_commitish, '${{ github.sha }}');
+  assert.equal(steps[release].with.body_path, '${{ steps.notes.outputs.path }}');
   assert.equal(steps[release].with.fail_on_unmatched_files, true);
   const artifact = steps.find(step => step.uses?.startsWith('actions/upload-artifact@'));
   assert.equal(artifact.if, undefined);
   assert.equal(artifact.with['if-no-files-found'], 'error');
-  assert.ok(existsSync(join(root, 'docs/plans/v0.7.0-release-notes.md')));
+  const archive = 'dist/Drill-Notebook-${{ steps.ver.outputs.version }}-win-x64-portable.zip';
+  const assets = [archive, `${archive}.sha256`];
+  assert.deepEqual(steps[release].with.files.trim().split(/\r?\n/), assets);
+  assert.deepEqual(artifact.with.path.trim().split(/\r?\n/), assets);
+  const notes = steps.findIndex(step => step.id === 'notes');
+  assert.ok(notes > steps.findIndex(step => step.id === 'ver') && notes < install);
+  assert.equal(steps[notes].if, undefined);
+  assert.equal(steps[notes]['continue-on-error'], undefined);
+  assert.ok(existsSync(join(root, `docs/release/v${defaultVersion}-release-notes.md`)));
 });
 
-test('云端后端使用预装 Maven，保留测试门禁、Java 17 和 JAR 产物路径', () => {
-  const backendTest = steps.findIndex(step => step.name === '后端全量测试');
+test('云端后端使用预装 Maven 跳过测试执行，保留 Java 17 编译和 JAR 产物路径', () => {
+  const configCheck = steps.findIndex(step => step.run === 'node --test scripts/test-release-config.mjs');
   const backendBuild = steps.findIndex(step => step.name.startsWith('构建后端 jar'));
   const pack = steps.findIndex(step => step.run?.includes('npx electron-builder'));
-  assert.ok(backendTest >= 0 && backendBuild > backendTest && pack > backendBuild);
-  assert.equal(steps[backendTest].run, `${mavenCommand} test`);
+  assert.ok(configCheck >= 0 && backendBuild > configCheck && pack > backendBuild);
+  assert.equal(steps.findIndex(step => step.name === '后端全量测试'), -1);
+  assert.equal(steps.findIndex(step => step.name === '前端全量测试'), -1);
   assert.equal(steps[backendBuild].run, `${mavenCommand} -DskipTests package`);
   assert.equal(steps[backendBuild]['continue-on-error'], undefined);
   assert.equal(steps[backendBuild].if, undefined);
@@ -68,14 +87,14 @@ test('云端后端使用预装 Maven，保留测试门禁、Java 17 和 JAR 产�
   });
 });
 
-const cacheRoot = join(root, 'cache');
+const fixtureRoot = join(root, 'temp');
 function fixture(t, builderExit = 0) {
-  mkdirSync(cacheRoot, { recursive: true });
-  const dir = mkdtempSync(join(cacheRoot, 'release-config-test-'));
+  mkdirSync(fixtureRoot, { recursive: true });
+  const dir = mkdtempSync(join(fixtureRoot, 'release-config-test-'));
   t.after(() => {
     // 仅删除本测试刚创建的工作区内临时目录。
-    const pathInCache = relative(cacheRoot, dir);
-    assert.ok(pathInCache && !pathInCache.startsWith(`..${sep}`) && !pathInCache.includes(sep));
+    const fixturePath = relative(fixtureRoot, dir);
+    assert.ok(fixturePath && !fixturePath.startsWith(`..${sep}`) && !fixturePath.includes(sep));
     rmSync(dir, { recursive: true, force: true });
   });
   for (const file of ['jre/bin/java.exe', 'frontend/dist/index.html', 'electron-dist/main.js', 'backend/target/drill-notebook-backend-0.1.0.jar']) {
@@ -85,6 +104,9 @@ function fixture(t, builderExit = 0) {
   }
   mkdirSync(join(dir, 'scripts'));
   copyFileSync(join(root, 'scripts/package-portable.ps1'), join(dir, 'scripts/package-portable.ps1'));
+  copyFileSync(join(root, 'scripts/generate-update-metadata.mjs'), join(dir, 'scripts/generate-update-metadata.mjs'));
+  for (const name of ['program-manifest', 'update-feed', 'update-fs']) copyFileSync(join(root, `electron-dist/${name}.js`), join(dir, `electron-dist/${name}.js`));
+  writeFileSync(join(dir, 'scripts/build-updater.ps1'), "New-Item -ItemType Directory -Path updater/target/release -Force | Out-Null\n[IO.File]::WriteAllText((Join-Path (Get-Location) 'updater/target/release/drill-updater.exe'), 'fixture')\n");
   mkdirSync(join(dir, 'node_modules/.bin'), { recursive: true });
   writeFileSync(join(dir, 'node_modules/.bin/electron-builder.cmd'), [
     '@echo off',
@@ -92,6 +114,11 @@ function fixture(t, builderExit = 0) {
     `if ${builderExit} NEQ 0 exit /b ${builderExit}`,
     'if not exist "dist\\win-unpacked" mkdir "dist\\win-unpacked"',
     '>"dist\\win-unpacked\\Drill Notebook.exe" echo fixture',
+    'mkdir "dist\\win-unpacked\\resources\\backend" "dist\\win-unpacked\\resources\\jre\\bin" "dist\\win-unpacked\\resources\\updater"',
+    '>"dist\\win-unpacked\\resources\\app.asar" echo fixture',
+    '>"dist\\win-unpacked\\resources\\backend\\app.jar" echo fixture',
+    '>"dist\\win-unpacked\\resources\\jre\\bin\\java.exe" echo fixture',
+    '>"dist\\win-unpacked\\resources\\updater\\drill-updater.exe" echo fixture',
     'exit /b 0',
     '',
   ].join('\r\n'));
@@ -107,14 +134,58 @@ function runPackage(dir, args = []) {
   return result;
 }
 
+function runArtifactCheck(dir) {
+  const script = join(dir, 'scripts/check-artifacts.ps1');
+  writeFileSync(script, steps.find(step => step.name === '校验产物').run
+    .replaceAll('${{ steps.ver.outputs.version }}', defaultVersion));
+  const result = spawnSync('pwsh', ['-NoProfile', '-File', script], {
+    cwd: dir, encoding: 'utf8', timeout: 30000, windowsHide: true,
+  });
+  assert.ifError(result.error);
+  return result;
+}
+
 const windowsOnly = { skip: process.platform !== 'win32' };
+test('发布说明按完整版本选择，预发行复用同版正文，缺失或空白立即失败', windowsOnly, t => {
+  mkdirSync(fixtureRoot, { recursive: true });
+  const dir = mkdtempSync(join(fixtureRoot, 'release-notes-test-'));
+  t.after(() => {
+    const fixturePath = relative(fixtureRoot, dir);
+    assert.ok(fixturePath && !fixturePath.startsWith(`..${sep}`) && !fixturePath.includes(sep));
+    rmSync(dir, { recursive: true, force: true });
+  });
+  mkdirSync(join(dir, 'docs/release'), { recursive: true });
+  for (const tag of ['v0.7.1', 'v0.7.2', 'v0.7.3', 'v0.7.30', 'v0.8.0', 'v0.8.1', 'v0.8.2']) {
+    writeFileSync(join(dir, `docs/release/${tag}-release-notes.md`), `# ${tag} 发布说明\n`);
+  }
+  writeFileSync(join(dir, 'docs/release/v0.7.4-release-notes.md'), ' \n');
+  const script = join(dir, 'select-notes.ps1');
+  const output = join(dir, 'notes-output.txt');
+  writeFileSync(script, steps.find(step => step.id === 'notes').run);
+  for (const tag of ['v0.7.1', 'v0.7.2', 'v0.7.3', 'v0.7.3-rc.1', 'v0.7.30', 'v0.8.0', 'v0.8.0-rc.1', 'v0.8.1', 'v0.8.1-rc.1', 'v0.8.2', 'v0.8.2-rc.1', 'v0.7.4', 'v0.7.5']) {
+    const result = spawnSync('pwsh', ['-NoProfile', '-File', script], {
+      cwd: dir, encoding: 'utf8', timeout: 30000, windowsHide: true,
+      env: { ...process.env, RELEASE_TAG: tag, GITHUB_OUTPUT: output },
+    });
+    assert.ifError(result.error);
+    if (tag === 'v0.7.4' || tag === 'v0.7.5') {
+      assert.notEqual(result.status, 0, `不应发布缺少正文的版本：${tag}`);
+      assert.equal(existsSync(output), false);
+    } else {
+      assert.equal(result.status, 0, result.stdout + result.stderr);
+      assert.equal(readFileSync(output, 'utf8').trim(), `path=docs/release/${tag.split('-')[0]}-release-notes.md`);
+      rmSync(output);
+    }
+  }
+});
+
 test('云端版本校验拒绝路径、命令及多行输入，正常输出发布版本', windowsOnly, t => {
   const dir = fixture(t);
   const script = join(dir, 'scripts/validate-version.ps1');
   const output = join(dir, 'version-output.txt');
   writeFileSync(script, steps.find(step => step.id === 'ver').run);
-  for (const version of ['v0.6.3', 'v0.7.0-rc.1', '../outside', 'v0.6.3;echo bad', 'v0.6.3\ntag=other', 'v0.6.3\n', '0.6.3']) {
-    const valid = version === 'v0.6.3' || version === 'v0.7.0-rc.1';
+  for (const version of ['v0.8.2', 'v0.8.2-rc.1', '../outside', 'v0.8.2;echo bad', 'v0.8.2\ntag=other', 'v0.8.2\n', '0.8.2']) {
+    const valid = version === 'v0.8.2' || version === 'v0.8.2-rc.1';
     const result = spawnSync('pwsh', ['-NoProfile', '-File', script], {
       cwd: dir, encoding: 'utf8', timeout: 30000, windowsHide: true,
       env: { ...process.env, RAW: version, GITHUB_OUTPUT: output },
@@ -133,22 +204,30 @@ test('云端版本校验拒绝路径、命令及多行输入，正常输出发�
   }
 });
 
-test('本地默认版本与 CI 一致，注入应用版本并生成同版本 ZIP', windowsOnly, t => {
+test('本地默认版本与 CI 一致，同版本 ZIP 和校验文件通过云端产物检查', windowsOnly, t => {
   const dir = fixture(t);
   const result = runPackage(dir);
   assert.equal(result.status, 0, result.stdout + result.stderr);
   const args = readFileSync(join(dir, 'builder-args.txt'), 'utf8');
   assert.ok(args.includes(`--config.extraMetadata.version=${defaultVersion}`));
   assert.ok(args.includes('--publish never'));
-  assert.ok(existsSync(join(dir, `dist/Drill-Notebook-${defaultVersion}-win-x64-portable.zip`)));
+  const archive = join(dir, `dist/Drill-Notebook-${defaultVersion}-win-x64-portable.zip`);
+  assert.ok(existsSync(archive));
+  assert.ok(existsSync(`${archive}.sha256`));
+  const accepted = runArtifactCheck(dir);
+  assert.equal(accepted.status, 0, accepted.stdout + accepted.stderr);
+  rmSync(`${archive}.sha256`);
+  const missingChecksum = runArtifactCheck(dir);
+  assert.notEqual(missingChecksum.status, 0);
+  assert.match(missingChecksum.stderr, /\.zip\.sha256/);
 });
 
 test('自定义版本去除 v 前缀，应用版本与 ZIP 名称一致', windowsOnly, t => {
   const dir = fixture(t);
-  const result = runPackage(dir, ['-Version', 'v0.7.0-rc.1']);
+  const result = runPackage(dir, ['-Version', 'v0.8.2-rc.1']);
   assert.equal(result.status, 0, result.stdout + result.stderr);
-  assert.ok(readFileSync(join(dir, 'builder-args.txt'), 'utf8').includes('--config.extraMetadata.version=0.7.0-rc.1'));
-  assert.ok(existsSync(join(dir, 'dist/Drill-Notebook-0.7.0-rc.1-win-x64-portable.zip')));
+  assert.ok(readFileSync(join(dir, 'builder-args.txt'), 'utf8').includes('--config.extraMetadata.version=0.8.2-rc.1'));
+  assert.ok(existsSync(join(dir, 'dist/Drill-Notebook-0.8.2-rc.1-win-x64-portable.zip')));
 });
 
 test('非法版本在构建和写入产物前被拒绝', windowsOnly, t => {

@@ -9,7 +9,7 @@ const { read, request } = vi.hoisted(() => ({ read: vi.fn(), request: vi.fn() })
 vi.mock('../../lib/api', () => ({ get: (...args: unknown[]) => read(...args), apiRequest: (...args: unknown[]) => request(...args) }));
 const fixture = (): Connections => ({ revision: 1, chatModelId: 'a', importModelId: null, providers: [
   { id: 'p', name: '学习网关', endpoint: 'https://example.invalid/v1', apiFormat: 'chat_completions', authMode: 'none', hasKey: false, needsPassword: false,
-    models: [{ id: 'a', modelId: 'chat-a', name: '通用对话', group: '常用', streaming: true, tools: false }, { id: 'b', modelId: 'chat-b', name: '深度分析', group: '', streaming: false, tools: true }] },
+    models: [{ id: 'a', modelId: 'chat-a', name: '通用对话', group: '常用', streaming: true, tools: false, contextWindow: 128000, maxOutputTokens: 32000 }, { id: 'b', modelId: 'chat-b', name: '深度分析', group: '', streaming: false, tools: true, contextWindow: 128000, maxOutputTokens: 32000 }] },
   { id: 'q', name: '备用网关', endpoint: 'https://backup.invalid/v1', apiFormat: 'chat_completions', authMode: 'none', hasKey: false, needsPassword: false, models: [] }
 ] });
 function mount(registerGuard?: (guard: SettingsLeaveGuard | null) => void,
@@ -36,7 +36,10 @@ describe('AI connection workflow', () => {
     const option = await screen.findByRole('checkbox', { name: /new-model/ });
     expect(request.mock.calls.filter(call => call[0].endsWith('/discover'))).toHaveLength(1);
     expect(request.mock.calls.some(call => call[0].endsWith('/verify-add'))).toBe(false);
-    fireEvent.click(option); fireEvent.click(screen.getByRole('button', { name: '验证并添加（1）' }));
+    fireEvent.click(option);
+    fireEvent.change(screen.getByLabelText('new-model 上下文窗口'), { target: { value: '128000' } });
+    fireEvent.change(screen.getByLabelText('new-model 最大输出 Token'), { target: { value: '32000' } });
+    fireEvent.click(screen.getByRole('button', { name: '验证并添加（1）' }));
     await screen.findByText('已添加');
     const verification = request.mock.calls.find(call => call[0].endsWith('/verify-add'))!;
     expect(JSON.parse(verification[1].body)).toMatchObject({ revision: 2, model: { modelId: 'new-model' } });
@@ -53,6 +56,8 @@ describe('AI connection workflow', () => {
     });
     mount(); fireEvent.click(await screen.findByRole('button', { name: '添加模型' }));
     fireEvent.change(screen.getByLabelText('模型 ID'), { target: { value: 'fresh' } });
+    fireEvent.change(screen.getByLabelText('上下文窗口'), { target: { value: '128000' } });
+    fireEvent.change(screen.getByLabelText('最大输出 Token'), { target: { value: '32000' } });
     fireEvent.click(screen.getByRole('button', { name: /备用网关/ }));
     fireEvent.click(await screen.findByRole('button', { name: '保存并继续' }));
     await screen.findByText('已添加');
@@ -71,6 +76,10 @@ describe('AI connection workflow', () => {
     fireEvent.click(await screen.findByRole('button', { name: '获取模型' }));
     fireEvent.click(await screen.findByRole('checkbox', { name: /first/ }));
     fireEvent.click(screen.getByRole('checkbox', { name: /second/ }));
+    for (const id of ['first', 'second']) {
+      fireEvent.change(screen.getByLabelText(`${id} 上下文窗口`), { target: { value: '128000' } });
+      fireEvent.change(screen.getByLabelText(`${id} 最大输出 Token`), { target: { value: '32000' } });
+    }
     fireEvent.click(screen.getByRole('button', { name: '验证并添加（2）' }));
     await waitFor(() => expect(finishes).toHaveLength(2));
     for (const call of request.mock.calls.filter(call => call[0].endsWith('/verify-add'))) expect(JSON.parse(call[1].body).connectionVersion).toBe('connection-v1');
@@ -97,22 +106,31 @@ describe('AI connection workflow', () => {
     await waitFor(() => expect(request).toHaveBeenCalledTimes(1));
     expect(request.mock.calls[0][0]).toBe('/api/ai/connections/models/b');
     expect(JSON.parse(request.mock.calls[0][1].body)).toMatchObject({ revision: 1, tools: true, streaming: true, name: '修改名称' });
-    expect(screen.getByText('学习网关 / 通用对话')).toBeInTheDocument();
+    expect(screen.getByText('跟随 AI 助手')).toBeInTheDocument();
   });
-  it('apply waits for server success and a failed switch keeps current binding', async () => {
+  it('settings only select import models; failed saves keep the binding and success can restore following the assistant', async () => {
     request.mockRejectedValue(new Error('保存失败'));
     const client = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } });
     client.setQueryData(['ai-memory-settings'], { enabled: true, revision: 1 });
     mount(undefined, client);
-    fireEvent.click(await screen.findByRole('button', { name: '应用' }));
+    const choose = await screen.findByRole('button', { name: '用于导入：深度分析' });
+    expect(screen.queryByRole('button', { name: '应用' })).toBeNull();
+    expect(screen.queryByText('主模型')).toBeNull();
+    fireEvent.click(choose);
     await screen.findByText('保存失败');
-    expect(screen.getByText('学习网关 / 通用对话')).toBeInTheDocument();
+    expect(screen.getByText('跟随 AI 助手')).toBeInTheDocument();
     expect(client.getQueryState(['ai-memory-settings'])?.isInvalidated).toBe(false);
-    expect(JSON.parse(request.mock.calls[0][1].body)).toMatchObject({ purpose: 'chat', modelId: 'b' });
-    request.mockResolvedValue({ ...fixture(), revision: 2, chatModelId: 'b' });
-    fireEvent.click(screen.getByRole('button', { name: '应用' }));
+    expect(JSON.parse(request.mock.calls[0][1].body)).toMatchObject({ purpose: 'import', modelId: 'b' });
+    request.mockResolvedValue({ ...fixture(), revision: 2, importModelId: 'b' });
+    fireEvent.click(choose);
     await screen.findByText('学习网关 / 深度分析');
     expect(client.getQueryState(['ai-memory-settings'])?.isInvalidated).toBe(true);
+    expect(client.getQueryData<Connections>(['ai-connections'])?.chatModelId).toBe('a');
+    expect(choose).toBeDisabled();
+    request.mockResolvedValue({ ...fixture(), revision: 3 });
+    fireEvent.click(screen.getByRole('button', { name: '恢复跟随' }));
+    await screen.findByText('跟随 AI 助手');
+    expect(JSON.parse(request.mock.calls.at(-1)![1].body)).toMatchObject({ purpose: 'import', modelId: null, revision: 2 });
   });
   it('dirty supplier switch supports keep editing, failed save and discard', async () => {
     request.mockRejectedValue(new Error('配置已变更'));
@@ -131,11 +149,11 @@ describe('AI connection workflow', () => {
   });
   it('invalid token values stay in editor and never reach backend', async () => {
     mount(); fireEvent.click(await screen.findByRole('button', { name: '设置：深度分析' }));
-    fireEvent.click(screen.getByText('上下文与输出上限（可选）'));
+    expect(screen.queryByLabelText('最大输入 Token')).not.toBeInTheDocument();
     fireEvent.change(screen.getByLabelText('上下文窗口'), { target: { value: '100' } });
     fireEvent.change(screen.getByLabelText('最大输出 Token'), { target: { value: '101' } });
     fireEvent.click(screen.getByRole('button', { name: '保存模型设置' }));
-    await screen.findByText('输入与输出上限分别不得大于上下文窗口');
+    await screen.findByText('最大输出 Token 不得大于上下文窗口');
     expect(request).not.toHaveBeenCalled();
   });
   it('Escape preserves dirty model settings until discard is selected', async () => {
