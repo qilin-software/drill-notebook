@@ -192,13 +192,14 @@ class WebToolChatPathTest {
         webSettings.save(json.valueToTree(Map.of("revision", 0, "preferNative", true)));
         var main = mock(AiUpstreamClient.class); ReflectionTestUtils.setField(ai, "upstreamClient", main);
         var builder = new AiUpstreamClient(null, json);
-        when(main.buildChatCompletionRequest(any(), anyList(), anyBoolean(), anyList())).thenAnswer(call ->
-                builder.buildChatCompletionRequest(call.getArgument(0), call.getArgument(1), call.getArgument(2), call.getArgument(3)));
-        when(main.buildAnthropicRequest(any(), anyList(), anyBoolean(), anyList())).thenAnswer(call ->
-                builder.buildAnthropicRequest(call.getArgument(0), call.getArgument(1), call.getArgument(2), call.getArgument(3)));
-        when(main.callWithTools(any(), anyList(), anyList(), anyBoolean(), any(), anyInt(), any())).thenAnswer(call -> {
+        when(main.prepare(any(), anyList(), anyList(), anyBoolean(), anyInt(), anyString())).thenAnswer(call ->
+                builder.prepare(call.getArgument(0), call.getArgument(1), call.getArgument(2), call.getArgument(3), call.getArgument(4), call.getArgument(5)));
+        when(main.callPrepared(any(), any(), any(), anyInt(), any(), any())).thenAnswer(call -> {
             mainTargets.add(call.getArgument(0));
-            requests.add(json.valueToTree(Map.of("messages", call.getArgument(1), "tools", call.getArgument(2))));
+            com.drillnotebook.app.model.PreparedRequest prepared = call.getArgument(1);
+            java.util.function.Consumer<com.drillnotebook.app.model.PreparedRequest> sent = call.getArgument(5);
+            if (sent != null) sent.accept(prepared);
+            requests.add(json.valueToTree(prepared.body()));
             var usage = new AiUpstreamClient.Usage("provider", 10, 5, null, null);
             return requests.size() == 1
                     ? new AiUpstreamClient.Result("", "", "tool_calls", true, false, false, usage,

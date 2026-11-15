@@ -6,9 +6,12 @@ import com.drillnotebook.app.config.DatabaseInitializer;
 import com.drillnotebook.app.memory.Schema9Fixture;
 import com.drillnotebook.app.memory.TestWorkspace;
 import com.drillnotebook.app.model.AiRetrySettings;
+import com.drillnotebook.app.model.AiContextSettings;
 import com.drillnotebook.app.service.ChatTurnRejectException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.datasource.SingleConnectionDataSource;
 import static org.junit.jupiter.api.Assertions.*;
@@ -66,10 +69,74 @@ class AiRuntimeSettingsRepositoryTest {
             jdbc.execute("CREATE TABLE ai_runtime_settings(id INTEGER PRIMARY KEY, revision INTEGER, document TEXT)");
             var values = new ObjectMapper().valueToTree(new AiRuntimeSettings(80, 200, 60, 20, 256000, 32000, 16000, 0));
             ((com.fasterxml.jackson.databind.node.ObjectNode) values).remove("retry");
+            ((com.fasterxml.jackson.databind.node.ObjectNode) values).remove("context");
             jdbc.update("INSERT INTO ai_runtime_settings VALUES(1,7,?)", values.toString());
             var saved = new AiRuntimeSettingsRepository(jdbc).read();
             assertEquals(7, saved.revision()); assertEquals(80, saved.values().maxToolStages());
             assertEquals(com.drillnotebook.app.model.AiRetrySettings.DEFAULTS, saved.values().retry());
+            assertEquals(AiContextSettings.DEFAULTS, saved.values().context());
+        }
+    }
+
+    @Test void contextSettingsSavedThroughTheApiSurviveReopeningAndLegacySaves() throws Exception {
+        var root = TestWorkspace.scratchDirectory("portable-context-settings-");
+        try {
+            var source = Schema9Fixture.dataSource(root);
+            new DatabaseInitializer(source, Schema9Fixture.resolver(root)).initialize();
+            var repository = new AiRuntimeSettingsRepository(new JdbcTemplate(source));
+            var controller = new AiRuntimeSettingsController(repository);
+            var mapper = new ObjectMapper();
+            var values = (com.fasterxml.jackson.databind.node.ObjectNode) mapper.valueToTree(AiRuntimeSettings.DEFAULTS);
+            values.set("context", mapper.valueToTree(new AiContextSettings(false, 85)));
+            values.set("retry", mapper.valueToTree(new AiRetrySettings(7, 8, false, 9)));
+            controller.put(mapper.createObjectNode().put("revision", 0).set("values", values));
+
+            var reopened = new AiRuntimeSettingsRepository(new JdbcTemplate(Schema9Fixture.dataSource(root)));
+            assertEquals(new AiContextSettings(false, 85), reopened.read().values().context());
+            assertEquals(new AiRetrySettings(7, 8, false, 9), reopened.read().values().retry());
+
+            values.remove("context");
+            values.remove("retry");
+            values.put("maxToolStages", 80);
+            new AiRuntimeSettingsController(reopened).put(mapper.createObjectNode().put("revision", 1).set("values", values));
+            assertEquals(80, repository.read().values().maxToolStages());
+            assertEquals(new AiContextSettings(false, 85), repository.read().values().context());
+            assertEquals(new AiRetrySettings(7, 8, false, 9), repository.read().values().retry());
+
+            controller.put(mapper.createObjectNode().put("revision", 2).set("values", mapper.valueToTree(AiRuntimeSettings.DEFAULTS)));
+            assertEquals(AiContextSettings.DEFAULTS, reopened.read().values().context());
+            assertEquals(3, reopened.read().revision());
+        } finally { TestWorkspace.deleteRecursively(root); }
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {
+            "{\"autoCompact\":true,\"thresholdPercent\":64}",
+            "{\"autoCompact\":true,\"thresholdPercent\":96}",
+            "{\"autoCompact\":true,\"thresholdPercent\":2147483648}",
+            "{\"autoCompact\":true,\"thresholdPercent\":80.5}",
+            "{\"autoCompact\":false,\"thresholdPercent\":\"80\"}",
+            "{\"autoCompact\":\"true\",\"thresholdPercent\":80}",
+            "{\"autoCompact\":true}",
+            "{\"thresholdPercent\":80}",
+            "{\"autoCompact\":true,\"thresholdPercent\":80,\"unexpected\":true}",
+            "null"
+    })
+    void invalidContextSettingsDoNotReplaceTheSavedConfiguration(String invalid) throws Exception {
+        try (var source = new SingleConnectionDataSource("jdbc:sqlite::memory:", true)) {
+            var jdbc = new JdbcTemplate(source);
+            jdbc.execute("CREATE TABLE ai_runtime_settings(id INTEGER PRIMARY KEY, revision INTEGER, document TEXT)");
+            var repository = new AiRuntimeSettingsRepository(jdbc);
+            var custom = new AiRuntimeSettings(80, 200, 60, 20, 256000, 32000, 16000, 0,
+                    new AiRetrySettings(7, 8, false, 9), new AiContextSettings(false, 85));
+            repository.save(0, custom);
+            var mapper = new ObjectMapper();
+            var values = (com.fasterxml.jackson.databind.node.ObjectNode) mapper.valueToTree(custom);
+            values.set("context", mapper.readTree(invalid));
+            var body = mapper.createObjectNode().put("revision", 1).set("values", values);
+            assertThrows(IllegalArgumentException.class, () -> new AiRuntimeSettingsController(repository).put(body));
+            assertEquals(1, repository.read().revision());
+            assertEquals(custom, repository.read().values());
         }
     }
     @Test void globalSettingsPersistAcrossInstancesAndResetWithoutTouchingModels() throws Exception {

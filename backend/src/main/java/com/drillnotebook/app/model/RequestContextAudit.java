@@ -21,7 +21,7 @@ public record RequestContextAudit(int schemaVersion, String estimatorVersion, St
     public RequestContextAudit {
         categories = List.copyOf(categories);
         if (schemaVersion != VERSION || estimatorVersion == null || model == null
-                || !"CHAT".equals(kind) && !"NATIVE_WEB".equals(kind)
+                || !"CHAT".equals(kind) && !"NATIVE_WEB".equals(kind) && !"CONTEXT_COMPACT".equals(kind)
                 || estimatedInputTokens < 0 || contextWindow < 0 || categories.size() > Kind.values().length)
             throw new IllegalArgumentException("请求上下文摘要格式不支持");
         var kinds = EnumSet.noneOf(Kind.class);

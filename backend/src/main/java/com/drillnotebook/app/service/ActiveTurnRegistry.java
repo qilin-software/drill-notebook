@@ -33,6 +33,7 @@ public class ActiveTurnRegistry {
         private volatile Runnable abortHook;
         private volatile List<ToolActivity> toolActivities = List.of();
         private volatile AiRecovery recovery;
+        private volatile boolean contextCompacting;
         /** 当前轮尚未落库的回复长度；只保存数值，不保留流式正文。 */
         private volatile ContextTokens contextTokens = new ContextTokens(0, null);
         private volatile ModelContextSnapshot modelContext;
@@ -60,6 +61,8 @@ public class ActiveTurnRegistry {
 
         public AiRecovery recovery() { return recovery; }
         public void recovery(AiRecovery value) { recovery = value; }
+        public boolean contextCompacting() { return contextCompacting; }
+        public void contextCompacting(boolean value) { contextCompacting = value; }
 
         public ContextTokens contextTokens() { return contextTokens; }
         public ModelContextSnapshot modelContext() { return modelContext; }

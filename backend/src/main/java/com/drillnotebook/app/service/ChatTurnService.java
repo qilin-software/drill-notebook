@@ -342,9 +342,15 @@ public class ChatTurnService {
      * @return attempt ID，登记不可用时为 null
      */
     public String startUsage(Lease lease, String targetFingerprint, String contextPlanId) {
+        return startUsage(lease, targetFingerprint, contextPlanId, UsageRepository.PURPOSE_CHAT);
+    }
+
+    public String startUsage(Lease lease, String targetFingerprint, String contextPlanId, String purpose) {
+        if (!UsageRepository.PURPOSE_CHAT.equals(purpose) && !UsageRepository.PURPOSE_CONTEXT_COMPACT.equals(purpose))
+            throw new IllegalArgumentException("会话请求用途无效");
         ZoneId zone = ZoneId.systemDefault();
         Attempt attempt = new Attempt(UuidV7.generate(System.currentTimeMillis()), lease.requestId(),
-                UsageRepository.PURPOSE_CHAT, targetFingerprint, LocalDate.now(zone).toString(), zone.getId(),
+                purpose, targetFingerprint, LocalDate.now(zone).toString(), zone.getId(),
                 0, MemoryTimes.now(), contextPlanId);
         try {
             if (!usage.reserve(attempt)) return null;
@@ -443,6 +449,9 @@ public class ChatTurnService {
         body.put("startedAt", turn.startedAt());
         body.put("finishedAt", turn.finishedAt());
         body.put("active", registry.isActive(requestId));
+        boolean compacting = registry.find(requestId).map(ActiveTurnRegistry.Handle::contextCompacting).orElse(false);
+        body.put("contextCompaction", Map.of("running", compacting));
+        if (compacting) body.put("phase", "compacting");
         body.put("retryOf", turn.retryOf());
         body.put("contentDeleted", turn.contentDeletedAt() != null);
         ChatMessageCipher.Read reply = readPart(turn.assistantMessageId(), false, masterPassword);
@@ -458,7 +467,7 @@ public class ChatTurnService {
         return body;
     }
 
-    /** 仅允许白名单活动对象进入检查点，原始工具结果永远不写会话存储。 */
+    /** UI activity metadata remains separate from the encrypted, bounded model-visible tool steps. */
     public void recordToolActivities(Lease lease, List<ToolActivity> activities) {
         List<ToolActivity> boundedActivities = List.copyOf(activities.subList(0,
                 Math.min(activities.size(), ToolActivity.MAX_ENTRIES)));

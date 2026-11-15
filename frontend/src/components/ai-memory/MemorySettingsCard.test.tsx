@@ -147,7 +147,6 @@ describe('MemorySettingsCard', () => {
       revision: 6,
       enabled: true,
       autoExtract: true,
-      compressSession: true,
       autoApplyLowRisk: true
     }));
     expect(apiPost).toHaveBeenCalledWith('/api/ai/memory/vault', {
@@ -180,7 +179,6 @@ describe('MemorySettingsCard', () => {
       revision: 4,
       enabled: true,
       autoExtract: true,
-      compressSession: true,
       autoApplyLowRisk: true
     }));
     expect(screen.queryByLabelText('解锁用主密码')).toBeNull();
@@ -199,7 +197,6 @@ describe('MemorySettingsCard', () => {
     current = makeSettings({
       enabled: true,
       autoExtract: true,
-      compressSession: true,
       consents: {
         MEMORY_USE: consent('MEMORY_USE', false, 'fp-new-model'),
         MEMORY_MAINTENANCE: consent('MEMORY_MAINTENANCE', true)
@@ -233,7 +230,7 @@ describe('MemorySettingsCard', () => {
     expect(apiPost).not.toHaveBeenCalled();
   });
 
-  it('自动整理开关同时写提取与摘要两个键', async () => {
+  it('自动整理只控制长期记忆提取，保留旧摘要设置', async () => {
     current = makeSettings({ enabled: true, autoExtract: true, compressSession: true });
     renderCard();
 
@@ -241,9 +238,9 @@ describe('MemorySettingsCard', () => {
 
     await waitFor(() => expect(apiPut).toHaveBeenCalledWith('/api/ai/memory/settings', {
       revision: 4,
-      autoExtract: false,
-      compressSession: false
+      autoExtract: false
     }));
+    expect(current.compressSession).toBe(true);
   });
 
   it('旧的防御性区域不再出现', async () => {

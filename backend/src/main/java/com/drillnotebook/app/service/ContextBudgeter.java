@@ -17,22 +17,12 @@ import java.util.List;
 import java.util.Map;
 import org.springframework.stereotype.Component;
 
-/**
- * 统一预算与冻结（执行方案 §9.2/§9.4、contracts §4.5）：
- * projection → assemble → <b>fit</b> → 序列化 → 计数校验 → freeze。
- *
- * <p>裁剪顺序固定（§9.2）：先历史图像，再低排名笔记片段、页面冗余、附件低优先段落、低相关记忆、
- * 最早近期轮次、旧摘要；当前用户问题与固定系统规则永不删，当前图片永不静默丢。
- * 本地重fit最多 3 次，仍装不下就 {@code CONTEXT_TOO_LARGE} 并指出该缩短哪类输入，
- * 绝不带着旧估算硬发请求。</p>
- */
+/** Candidate view assembly; final protocol preflight in ContextCoordinator owns window validation. */
 @Component
 public class ContextBudgeter {
     /** 输出预留沿用现有默认 max_tokens。 */
     public static final int OUTPUT_RESERVE_TOKENS = 4096;
     public static final int MIN_SAFETY_MARGIN_TOKENS = 512;
-    /** 本地 fit 上限（§4.5）：超过就拒绝，不做无限重组。 */
-    public static final int MAX_FIT_ATTEMPTS = 3;
 
     private final TokenEstimator estimator;
     private final ObjectMapper mapper;
@@ -42,10 +32,26 @@ public class ContextBudgeter {
         this.mapper = mapper;
     }
 
+    int estimate(List<Map<String, Object>> messages) { return estimator.estimateInput(messages.stream().map(com.drillnotebook.app.model.ContextSource::untag).toList()); }
+
     /** 计划身份、已配置的厂商窗口与本轮输出预留。 */
     public record Target(String planId, long sessionId, long contextGeneration, long historyRevision,
                          Long summaryRevision, Long vaultEpoch, Long vaultRevision, long policyRevision,
-                         int contextWindow, boolean windowKnown, int outputReserve) {
+                          int contextWindow, boolean windowKnown, int outputReserve,
+                           String providerFingerprint, String protocol, String model, boolean memoriesAllowed, String memoryBoundary) {
+        public Target(String planId, long sessionId, long contextGeneration, long historyRevision,
+                      Long summaryRevision, Long vaultEpoch, Long vaultRevision, long policyRevision,
+                      int contextWindow, boolean windowKnown, int outputReserve,
+                      String providerFingerprint, String protocol, String model) {
+            this(planId, sessionId, contextGeneration, historyRevision, summaryRevision, vaultEpoch, vaultRevision,
+                    policyRevision, contextWindow, windowKnown, outputReserve, providerFingerprint, protocol, model, true, null);
+        }
+        public Target(String planId, long sessionId, long contextGeneration, long historyRevision,
+                      Long summaryRevision, Long vaultEpoch, Long vaultRevision, long policyRevision,
+                      int contextWindow, boolean windowKnown, int outputReserve) {
+            this(planId, sessionId, contextGeneration, historyRevision, summaryRevision, vaultEpoch, vaultRevision,
+                    policyRevision, contextWindow, windowKnown, outputReserve, "", "", "");
+        }
         public Target(String planId, long sessionId, long contextGeneration, long historyRevision,
                       Long summaryRevision, Long vaultEpoch, Long vaultRevision, long policyRevision,
                       int contextWindow, boolean windowKnown) {
@@ -54,7 +60,7 @@ public class ContextBudgeter {
         }
     }
 
-    /** 一次 fit 的可变工作集：只在这里减，序列化与审计都从它读。 */
+    /** Candidate work set; serialization and provenance read the same items. */
     private static final class Kept {
         private Item summary;
         private Item resumeState;
@@ -73,7 +79,7 @@ public class ContextBudgeter {
             return images;
         }
 
-        /** 图片按"未知成本每张预留 4,096"计（§4.3），不进 8,000 文本预算，但要占窗口。 */
+        /** 图片按"未知成本每张预留 4,096"计（§4.3），参与统一窗口预算。 */
         int imageTokens() {
             return allImages().size() * TokenEstimator.IMAGE_UNKNOWN_ESTIMATED_TOKENS;
         }
@@ -98,48 +104,12 @@ public class ContextBudgeter {
         if (!kept.currentImages.isEmpty() || kept.turns.stream().anyMatch(turn -> !turn.images().isEmpty())) {
             notices.add("IMAGE_COST_UNKNOWN");
         }
-        int window = target.contextWindow();
-        int margin = Math.max(MIN_SAFETY_MARGIN_TOKENS, window / 10);
-        int allowedInput = Math.min(ChatContextAssembler.USER_TEXT_BUDGET,
-                window - target.outputReserve() - margin);
-        int userTokens = estimator.estimateText(draft.userText());
-        if (userTokens > allowedInput) {
-            // 当前问题永不静默截断：请用户缩短或改成引用片段（§9.2、T05）
-            throw tooLarge(List.of("USER_TEXT"), userTokens, allowedInput, kept);
-        }
-
-        // 摘要没进这份计划（组装阶段就丢了）时 coverage 不再成立：先把被它替掉的原文有界回补（§9.4）
-        boolean coveredRestored = false;
-        if (kept.summary == null && !projection.coveredCandidates().isEmpty()) {
-            restoreCovered(kept, projection, audit);
-            coveredRestored = true;
-        }
-        if (capRecentTurns(kept, audit)) notices.add("CONTEXT_TRIMMED");
-
-        int estimated = 0;
-        int limit = 0;
-        List<Map<String, Object>> messages = List.of();
-        for (int attempt = 0; attempt <= MAX_FIT_ATTEMPTS; attempt++) {
-            messages = serialize(draft, kept);
-            // 估算排除图像 base64：结构开销保留，编码字节不计（§4.3"不能把 base64 长度当收费 Token"），
-            // 图像成本已按每张 4,096 单独从窗口里扣除
-            estimated = estimator.estimateSerialized(countable(messages));
-            limit = Math.min(ChatContextPlan.INPUT_BUDGET_TOKENS,
-                    window - target.outputReserve() - margin - kept.imageTokens());
-            if (estimated <= limit) break;
-            if (attempt == MAX_FIT_ATTEMPTS) throw tooLarge(describeOverflow(kept), estimated, limit, kept);
-            if (!trim(kept, estimated - limit, audit)) {
-                // 已经没有可裁的东西：剩下的只有"当前图片 + 当前问题 + 固定规则"，直接拒绝
-                throw tooLarge(describeOverflow(kept), estimated, limit, kept);
-            }
-            // trim 可能把摘要丢掉了：coverage 随之失效，回补被它替代的原文并重新收敛近期区（§9.4）
-            if (kept.summary == null && !coveredRestored && !projection.coveredCandidates().isEmpty()) {
-                restoreCovered(kept, projection, audit);
-                capRecentTurns(kept, audit);
-                coveredRestored = true;
-            }
-            if (!notices.contains("CONTEXT_TRIMMED")) notices.add("CONTEXT_TRIMMED");
-        }
+        int limit = ContextWindowBudget.of(target.contextWindow(), target.outputReserve(), com.drillnotebook.app.model.AiContextSettings.DEFAULTS).hardInput();
+        if (kept.summary == null && !projection.coveredCandidates().isEmpty()) restoreCovered(kept, projection, audit);
+        // Candidate only: the protocol adapter adds tools, signed state and actual output allocation.
+        // Final PreparedRequest preflight owns the window budget and compaction; no history or current attachments are silently removed here.
+        List<Map<String, Object>> messages = serialize(draft, kept, target);
+        int estimated = estimator.estimateInput(messages.stream().map(com.drillnotebook.app.model.ContextSource::untag).toList());
 
         List<Map<String, Object>> citations = new ArrayList<>();
         for (int index = 0; index < kept.hits.size(); index++) {
@@ -154,114 +124,13 @@ public class ContextBudgeter {
                         projection.resumeState()));
     }
 
-    /** 按 §9.2 的顺序裁一轮；返回是否真的裁掉了东西。 */
-    private boolean trim(Kept kept, int excess, ContextAudit.Builder audit) {
-        int saved = dropHistoryImages(kept, audit);
-        if (saved >= excess) return saved > 0;
-        saved += dropRag(kept, excess - saved, audit);
-        if (saved >= excess) return saved > 0;
-        saved += dropPage(kept, excess - saved, audit);
-        if (saved >= excess) return saved > 0;
-        saved += dropAttachments(kept, excess - saved, audit);
-        if (saved >= excess) return saved > 0;
-        saved += dropMemories(kept, excess - saved, audit);
-        if (saved >= excess) return saved > 0;
-        saved += dropOldestTurns(kept, excess - saved, audit);
-        if (saved >= excess) return saved > 0;
-        return saved + dropSummary(kept, audit) > 0;
-    }
-
-    /** 历史图像先走（§4.3"总预算不足先去历史图像"）；当前图片一张都不动。 */
-    private int dropHistoryImages(Kept kept, ContextAudit.Builder audit) {
-        int saved = 0;
-        List<Turn> rebuilt = new ArrayList<>();
-        for (Turn turn : kept.turns) {
-            if (turn.images().isEmpty()) {
-                rebuilt.add(turn);
-                continue;
-            }
-            saved += turn.images().size() * TokenEstimator.IMAGE_UNKNOWN_ESTIMATED_TOKENS;
-            audit.omit(ContextAudit.Omission.ATTACHMENT_POLICY, "IMAGE", turn.images().size());
-            rebuilt.add(new Turn(turn.turnId(), turn.legacy(), turn.userMessageId(), turn.assistantMessageId(),
-                    turn.userText(), turn.assistantText(), List.of(), turn.estimatedTokens(),turn.supplements()));
-        }
-        kept.turns.clear();
-        kept.turns.addAll(rebuilt);
-        return saved;
-    }
-
-    private int dropRag(Kept kept, int excess, ContextAudit.Builder audit) {
-        // 从尾部（低排名）开始，片段与 citation 成对删除，编号不会与实际注入错位
-        int saved = 0;
-        while (!kept.rag.isEmpty() && saved < excess) {
-            int index = kept.rag.size() - 1;
-            saved += kept.rag.get(index).estimatedTokens();
-            kept.rag.remove(index);
-            kept.hits.remove(index);
-        }
-        if (saved > 0) audit.omit(ContextAudit.Omission.BUDGET, "NOTEBOOK_RAG", 1);
-        return saved;
-    }
-
-    private int dropPage(Kept kept, int excess, ContextAudit.Builder audit) {
-        int saved = 0;
-        while (!kept.page.isEmpty() && saved < excess) {
-            saved += kept.page.get(kept.page.size() - 1).estimatedTokens();
-            kept.page.remove(kept.page.size() - 1);
-        }
-        if (saved > 0) audit.omit(ContextAudit.Omission.BUDGET, "PAGE", 1);
-        return saved;
-    }
-
-    private int dropAttachments(Kept kept, int excess, ContextAudit.Builder audit) {
-        int saved = 0;
-        while (!kept.attachments.isEmpty() && saved < excess) {
-            saved += kept.attachments.get(kept.attachments.size() - 1).estimatedTokens();
-            kept.attachments.remove(kept.attachments.size() - 1);
-        }
-        if (saved > 0) audit.omit(ContextAudit.Omission.BUDGET, "TEXT_ATTACHMENT", 1);
-        return saved;
-    }
-
-    private int dropMemories(Kept kept, int excess, ContextAudit.Builder audit) {
-        int saved = 0;
-        while (kept.memories.size() > 0 && saved < excess) {
-            saved += kept.memories.get(kept.memories.size() - 1).estimatedTokens();
-            kept.memories.remove(kept.memories.size() - 1);
-        }
-        if (saved > 0) audit.omit(ContextAudit.Omission.BUDGET, "MEMORY", 1);
-        return saved;
-    }
-
-    /**
-     * §9.2 的近期区上限：从最旧开始整轮舍弃，直到落回 2,400 以内或只剩最新一轮。
-     * 最新一轮不可再分（"不能切到半句改变否定语义"），单独就超上限时保留它，交给总预算处理；
-     * "尽可能保留最近至少 2 轮"是优先目标而不是硬保证——预算不够就继续按完整轮次舍弃历史。
-     */
-    private boolean capRecentTurns(Kept kept, ContextAudit.Builder audit) {
-        int total = 0;
-        for (Turn turn : kept.turns) total += turn.estimatedTokens();
-        int dropped = 0;
-        while (kept.turns.size() > 1 && total > ChatContextAssembler.RECENT_TURNS_BUDGET) {
-            total -= kept.turns.get(0).estimatedTokens();
-            kept.turns.remove(0);
-            dropped++;
-        }
-        if (dropped > 0) audit.omit(ContextAudit.Omission.BUDGET, "TURN", dropped);
-        return dropped > 0;
-    }
-
-    /**
-     * 摘要被舍弃后的一次有界回补（§9.4"只排除被有效 coverage 替代的原轮次"）：把扫描窗口内
-     * 已解密的被覆盖轮次按时间序并回候选，并撤销账本里的覆盖省略——原文回来了就不再算被替代。
-     * 回补范围受扫描窗口约束（一份最多 32 轮），不做全库重读。
-     */
+    /** Restore original sources when a legacy summary was not eligible. */
     private void restoreCovered(Kept kept, ConversationProjection.Projection projection,
                                 ContextAudit.Builder audit) {
         for (ConversationProjection.Item item : projection.coveredCandidates()) {
             Turn turn = new Turn(item.turnId(), false, item.userMessageId(), item.assistantMessageId(),
                     item.userText(), item.assistantText(), List.of(),
-                    item.estimatedTokens() + 2 * TokenEstimator.MESSAGE_OVERHEAD_TOKENS,item.supplements());
+                    item.estimatedTokens() + 2 * TokenEstimator.MESSAGE_OVERHEAD_TOKENS,item.supplements(), item.steps(), item.sourceRevision(), item.requestId());
             int position = 0;
             while (position < kept.turns.size()
                     && (kept.turns.get(position).turnId() == null
@@ -273,45 +142,57 @@ public class ContextBudgeter {
         audit.clearOmission(ContextAudit.Omission.COVERED_BY_SUMMARY, "TURN");
     }
 
-    /** 从最早的开始整轮丢；"最近两轮保底"在总预算这里同样只是优先目标，不是硬性下限。 */
-    private int dropOldestTurns(Kept kept, int excess, ContextAudit.Builder audit) {
-        int saved = 0;
-        while (!kept.turns.isEmpty() && saved < excess) {
-            saved += kept.turns.get(0).estimatedTokens();
-            kept.turns.remove(0);
-        }
-        if (saved > 0) audit.omit(ContextAudit.Omission.BUDGET, "TURN", 1);
-        return saved;
-    }
-
-    private int dropSummary(Kept kept, ContextAudit.Builder audit) {
-        if (kept.summary == null) return 0;
-        int saved = kept.summary.estimatedTokens();
-        kept.summary = null;
-        audit.omit(ContextAudit.Omission.BUDGET, "SUMMARY", 1);
-        return saved;
-    }
-
     /** 最终消息序列：固定系统前缀 → 一个 CONTEXT_DATA_V1 数据块 → 近期对话 → 当前输入永远最后。 */
-    private List<Map<String, Object>> serialize(Draft draft, Kept kept) {
+    private List<Map<String, Object>> serialize(Draft draft, Kept kept, Target target) {
         List<Map<String, Object>> messages = new ArrayList<>();
         messages.add(message("system", List.of(textContent(draft.systemText()))));
         Map<String, Object> envelope = ChatContextAssembler.dataEnvelope(kept.summary, kept.resumeState,
                 kept.memories, kept.rag, kept.page, kept.attachments);
         messages.add(message("user", List.of(textContent(write(envelope)))));
         for (Turn turn : kept.turns) {
+            var source = turn.requestId() == null || turn.requestId().isBlank() ? null : turn.legacy() ? new com.drillnotebook.app.model.ContextSource("LEGACY", turn.userMessageId() + ":" + turn.assistantMessageId(), 0,
+                    turn.userMessageId() + ":" + turn.assistantMessageId(), 1, turn.requestId()) : new com.drillnotebook.app.model.ContextSource("TURN", String.valueOf(turn.turnId()),
+                    turn.turnId(), turn.requestId(), turn.sourceRevision(), ChatContextEntryService.fingerprint(turn.requestId() + ":" + turn.sourceRevision()));
+            List<Map<String, Object>> turnMessages = new ArrayList<>();
             List<Object> userBlocks = new ArrayList<>();
             userBlocks.add(textContent(turn.userText()));
             for (Image image : turn.images()) userBlocks.add(imageContent(image));
-            messages.add(message("user", userBlocks));
-            for(var part:ChatSupplement.messages(turn.assistantText(),turn.supplements()))
-                messages.add(message((String)part.get("role"),List.of(textContent((String)part.get("content")))));
+            turnMessages.add(message("user", userBlocks));
+            int[] replyPosition = {0, 0};
+            for (var step : turn.steps()) {
+                appendReplyThrough(turnMessages, turn.assistantText(), turn.supplements(), replyPosition, step.replyOffset());
+                if (step.replyCharacters() > 0) {
+                    int end = Math.addExact(step.replyOffset(), step.replyCharacters());
+                    String visible = step.messages().stream().filter(m -> "assistant".equals(m.get("role")) && !m.containsKey("tool_calls"))
+                            .map(m -> String.valueOf(m.get("content"))).collect(java.util.stream.Collectors.joining());
+                    if (end > turn.assistantText().length() || replyPosition[0] != step.replyOffset()
+                            || !visible.equals(turn.assistantText().substring(step.replyOffset(), end)))
+                        throw new ChatCryptoException("回复步骤与当前正文版本不一致");
+                    replyPosition[0] = end;
+                }
+                turnMessages.addAll(step.forTarget(target.providerFingerprint(), target.protocol(), target.model(), target.memoriesAllowed(), target.memoryBoundary())
+                        .stream().map(com.drillnotebook.app.model.ContextSource::untag).toList());
+            }
+            appendReplyThrough(turnMessages, turn.assistantText(), turn.supplements(), replyPosition, turn.assistantText().length());
+            for (var message : turnMessages) messages.add(source == null ? message : source.tag(message));
         }
         List<Object> current = new ArrayList<>();
         current.add(textContent(draft.userText()));
         for (Image image : kept.currentImages) current.add(imageContent(image));
         messages.add(message("user", current));
         return messages;
+    }
+
+    private static void appendReplyThrough(List<Map<String, Object>> messages, String answer, List<ChatSupplement> supplements, int[] state, int requestedEnd) {
+        int end = Math.min(answer.length(), Math.max(state[0], requestedEnd));
+        while (state[1] < supplements.size() && supplements.get(state[1]).replyOffset() <= end) {
+            var supplement = supplements.get(state[1]++);
+            int at = Math.min(end, Math.max(state[0], supplement.replyOffset()));
+            if (at > state[0]) messages.add(message("assistant", List.of(textContent(answer.substring(state[0], at)))));
+            messages.add(message("user", List.of(textContent(supplement.contextText())))); state[0] = at;
+        }
+        if (end > state[0]) messages.add(message("assistant", List.of(textContent(answer.substring(state[0], end)))));
+        state[0] = end;
     }
 
     private static Map<String, Object> message(String role, Object content) {
@@ -336,51 +217,6 @@ public class ContextBudgeter {
         block.put("type", "image_url");
         block.put("image_url", url);
         return block;
-    }
-
-    /**
-     * 估算视图：数据 URL 的 base64 载荷不计入文本 Token（§4.3"不能把 base64 长度当收费 Token"），
-     * 只保留结构与前缀开销；每张图的成本按 {@link TokenEstimator#IMAGE_UNKNOWN_ESTIMATED_TOKENS}
-     * 另行从窗口里扣除。纯文本消息原样参与估算。
-     */
-    private static List<Map<String, Object>> countable(List<Map<String, Object>> messages) {
-        List<Map<String, Object>> view = new ArrayList<>(messages.size());
-        for (Map<String, Object> message : messages) {
-            if (!(message.get("content") instanceof List<?> blocks)) {
-                view.add(message);
-                continue;
-            }
-            List<Object> copied = new ArrayList<>(blocks.size());
-            boolean changed = false;
-            for (Object block : blocks) {
-                Object lean = stripDataUrl(block);
-                if (lean != block) changed = true;
-                copied.add(lean);
-            }
-            if (!changed) {
-                view.add(message);
-                continue;
-            }
-            Map<String, Object> row = new LinkedHashMap<>();
-            row.put("role", message.get("role"));
-            row.put("content", copied);
-            view.add(row);
-        }
-        return view;
-    }
-
-    private static Object stripDataUrl(Object block) {
-        if (!(block instanceof Map<?, ?> map) || !"image_url".equals(map.get("type"))) return block;
-        if (!(map.get("image_url") instanceof Map<?, ?> url)) return block;
-        if (!(url.get("url") instanceof String dataUrl) || !dataUrl.startsWith("data:")) return block;
-        int comma = dataUrl.indexOf(',');
-        String prefix = comma < 0 ? dataUrl : dataUrl.substring(0, comma + 1);
-        Map<String, Object> leanUrl = new LinkedHashMap<>();
-        leanUrl.put("url", prefix);
-        Map<String, Object> lean = new LinkedHashMap<>();
-        lean.put("type", map.get("type"));
-        lean.put("image_url", leanUrl);
-        return lean;
     }
 
     private String write(Map<String, Object> envelope) {
@@ -481,25 +317,4 @@ public class ContextBudgeter {
         }
     }
 
-    private static List<String> describeOverflow(Kept kept) {
-        List<String> categories = new ArrayList<>();
-        if (!kept.currentImages.isEmpty()) categories.add("IMAGE");
-        if (!kept.turns.isEmpty()) categories.add("RECENT_TURNS");
-        if (!kept.rag.isEmpty()) categories.add("NOTEBOOK_RAG");
-        if (!kept.page.isEmpty()) categories.add("PAGE");
-        if (!kept.attachments.isEmpty()) categories.add("TEXT_ATTACHMENT");
-        if (!kept.memories.isEmpty()) categories.add("MEMORY");
-        categories.add("USER_TEXT");
-        return categories;
-    }
-
-    private ChatTurnRejectException tooLarge(List<String> categories, int estimated, int limit, Kept kept) {
-        Map<String, Object> details = new LinkedHashMap<>();
-        details.put("estimatedInputTokens", estimated);
-        details.put("inputBudget", limit);
-        details.put("categoriesToShorten", categories);
-        details.put("imagesProvided", kept.currentImages.size());
-        return new ChatTurnRejectException(413, "CONTEXT_TOO_LARGE",
-                "本轮上下文装不下，请缩短：" + String.join("、", categories), details);
-    }
 }

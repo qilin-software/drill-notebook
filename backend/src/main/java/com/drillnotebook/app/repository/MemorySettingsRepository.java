@@ -89,6 +89,7 @@ public class MemorySettingsRepository {
                             + " policy_json = ?, updated_at = ? WHERE id = ? AND revision = ?",
                     enabled ? 1 : 0, autoExtract ? 1 : 0, compressSession ? 1 : 0, autoApplyLowRisk ? 1 : 0,
                     policyJson, updatedAt, SETTINGS_ID, expectedRevision);
+            if (updated == 1) ChatContextCheckpointRepository.invalidateAllIn(connection);
             return updated == 1
                     ? new WriteResult(WriteOutcome.APPLIED, require(connection))
                     : new WriteResult(WriteOutcome.CONFLICT, require(connection));
@@ -112,6 +113,7 @@ public class MemorySettingsRepository {
                     + " WHERE id = ?", at, SETTINGS_ID) != 1) {
                 throw new SQLException("记忆设置行不存在，需要先初始化");
             }
+            ChatContextCheckpointRepository.invalidateAllIn(connection);
             return require(connection);
         });
     }
@@ -124,6 +126,7 @@ public class MemorySettingsRepository {
                     fingerprint, at, at, SETTINGS_ID) != 1) {
                 throw new SQLException("记忆设置行不存在，需要先初始化");
             }
+            ChatContextCheckpointRepository.invalidateAllIn(connection);
             return require(connection);
         });
     }

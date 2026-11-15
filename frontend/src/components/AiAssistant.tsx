@@ -835,7 +835,7 @@ export function AiAssistant(): JSX.Element {
         return next;
       }
       next[index] = { ...last, content: text, reasoning: reasoning || undefined, streaming: false,
-        notice: finalRecovery ? undefined : notice, toolActivities, recovery: finalRecovery };
+        notice: finalRecovery ? undefined : notice, toolActivities, recovery: finalRecovery, contextCompacting: false };
       return next;
     });
   };
@@ -884,7 +884,7 @@ export function AiAssistant(): JSX.Element {
           recovery: snapshot.recovery === undefined ? previous?.recovery : snapshot.recovery,
           toolActivities: running ? mergeToolActivities(previous?.toolActivities, snapshot.toolActivities)
             : settleToolActivities(mergeToolActivities(previous?.toolActivities, snapshot.toolActivities)),
-          toolPhase: snapshot.phase === 'tools' ? 'tools' : 'answer',
+          toolPhase: snapshot.phase === 'tools' ? 'tools' : 'answer', contextCompacting: running && snapshot.phase === 'compacting',
           notice: running ? undefined : snapshot.status === 'COMPLETED'
             ? executionStopNotice(snapshot.finishReason) : statusNotice(snapshot), _key: previous?._key ?? (originalAnswer ? `h${originalAnswer.id}` : `a-${event.requestId}`) };
         if (index < 0) next.push(item); else next[index] = item;
@@ -909,6 +909,9 @@ export function AiAssistant(): JSX.Element {
     }
     stampTurnIdentity(event.requestId);
     switch (event.type) {
+      case 'compaction':
+        patchAssistant(() => ({ contextCompacting: event.running }));
+        return;
       case 'supplements':
         patchAssistant(() => ({ supplements: event.supplements }));
         return;
@@ -941,7 +944,8 @@ export function AiAssistant(): JSX.Element {
           requestId: event.requestId,
           turn: { ...event.view, requestId: event.requestId },
           toolActivities: settleToolActivities(mergeToolActivities(prev?.toolActivities, event.view.toolActivities)),
-          streaming: false
+          streaming: false,
+          contextCompacting: false
         }));
         invalidateSessionLists(true);
         return;
@@ -1415,6 +1419,7 @@ export function AiAssistant(): JSX.Element {
                   data-conversation-round={item.role === 'user' ? item.roundNumber : undefined}
                   className={`chat-message ${item.role}${isAssistant && item._key === lastAssistantKey ? ' is-latest' : ''}${item.id !== undefined && item.id === highlightedMessage ? ' is-jump-target' : ''}`}>
                   {isAssistant && item.model ? <p className="chat-turn-model">{item.model}{item.reasoningEffort ? ` · 思考 ${item.reasoningEffort}` : ''}</p> : null}
+                  {isAssistant && item.streaming && item.contextCompacting ? <p className="chat-turn-model" role="status">正在压缩上下文…</p> : null}
                   {isAssistant && item.reasoning ? (
                     <details className="chat-reasoning" open={item.streaming}>
                       <summary>思考过程{item.streaming ? '（生成中…）' : ''}</summary>
@@ -1442,7 +1447,7 @@ export function AiAssistant(): JSX.Element {
                   {!isAssistant && item.page ? (item.page.link
                     ? <button type="button" className="chat-bound-page" title="提交时的业务页面，点击在主窗口查看" onClick={() => { void openMaterial(item.page!.link!); }}><FileText size={12} />{item.page.title}</button>
                     : <span className="chat-bound-page" title="提交时的业务页面"><FileText size={12} />{item.page.title}</span>) : null}
-                  {item.streaming && !item.toolActivities?.length ? <span className="chat-stream-cursor" aria-hidden="true" /> : null}
+                  {item.streaming && !item.contextCompacting && !item.toolActivities?.length ? <span className="chat-stream-cursor" aria-hidden="true" /> : null}
                   {isAssistant && item.recovery ? <RecoveryFeedback value={item.recovery} active={item.streaming} onStop={stopGeneration} /> : null}
                   {item.notice && !item.recovery ? (
                     <div className="ai-retrieval-notice">

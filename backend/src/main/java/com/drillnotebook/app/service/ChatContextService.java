@@ -24,6 +24,7 @@ import com.drillnotebook.app.service.memory.MemoryVaultService;
 import java.sql.SQLException;
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
@@ -172,6 +173,10 @@ public class ChatContextService {
     private final MemoryAiWriter aiWriter;
     private final MemoryItemService items;
     private final MemoryIndexService indexes;
+    private ContextCoordinator coordinator;
+
+    @org.springframework.beans.factory.annotation.Autowired
+    public void setContextCoordinator(ContextCoordinator coordinator) { this.coordinator = coordinator; }
 
     public ChatContextService(ConversationProjection projection, ChatContextAssembler assembler,
                               ContextBudgeter budgeter, ContextMemorySource memories,
@@ -210,20 +215,27 @@ public class ChatContextService {
     public ChatContextPlan plan(ChatTurnService.Lease lease, String userText, List<RetrievalHit> hits,
                                 Map<String, Object> pageContext, Map<String, Object> memoryOptions,
                                 int contextWindow, boolean windowKnown, int outputReserve) throws SQLException {
+        return plan(lease, userText, hits, pageContext, memoryOptions, contextWindow, windowKnown, outputReserve, "", "", "");
+    }
+
+    public ChatContextPlan plan(ChatTurnService.Lease lease, String userText, List<RetrievalHit> hits,
+                                Map<String, Object> pageContext, Map<String, Object> memoryOptions,
+                                int contextWindow, boolean windowKnown, int outputReserve,
+                                String providerFingerprint, String protocol, String model) throws SQLException {
         ChatSessionMetadataRepository.State state = sessions.read(lease.sessionId())
                 .orElseThrow(() -> new ChatTurnRejectException(404, "SESSION_NOT_FOUND", "会话不存在", Map.of()));
         validatePageContext(pageContext, state);
 
         String planId = "plan-" + UuidV7.generate(System.currentTimeMillis());
         ContextAudit.Builder audit = new ContextAudit.Builder(planId, TokenEstimator.VERSION);
+        boolean allowed = memoriesAllowed(memoryOptions);
         ConversationProjection.Projection projected = projection.project(
                 new ConversationProjection.Request(lease.sessionId(), lease.turnId(), state.contextGeneration(),
-                        lease.masterPassword(), ChatContextAssembler.RECENT_TURNS_BUDGET), audit);
+                        lease.masterPassword(), contextWindow, allowed), audit);
 
         Optional<MemoryRepository.VaultEnvelope> envelope = memory.readEnvelope();
         long policyRevision = policyRevision();
-        boolean allowed = memoriesAllowed(memoryOptions);
-        ContextMemorySource.Selection selection = allowed
+        ContextMemorySource.Selection selection = allowed && (memoryOptions == null || !Boolean.FALSE.equals(memoryOptions.get("inject")))
                 ? memories.select(envelope.map(MemoryRepository.VaultEnvelope::vaultId).orElse(null),
                         state.memoryScopeType(), state.memoryNotebookId() == null ? 0L : state.memoryNotebookId(),
                         userText, System.currentTimeMillis(), MEMORY_DEADLINE_MILLIS)
@@ -240,8 +252,9 @@ public class ChatContextService {
                 projected.observedSummaryRevision(),
                 envelope.map(MemoryRepository.VaultEnvelope::epoch).orElse(null),
                 envelope.map(MemoryRepository.VaultEnvelope::revision).orElse(null),
-                policyRevision, contextWindow, windowKnown, outputReserve);
-        return budgeter.fit(draft, projected, target, audit);
+                policyRevision, contextWindow, windowKnown, outputReserve, providerFingerprint, protocol, model,
+                allowed, envelope.map(v -> v.vaultId() + ":" + v.epoch()).orElse("absent"));
+        return budgeter.fit(draft, projected, target, audit).withContinuationRevision(projected.observedContinuationRevision()).withMemoriesAllowed(allowed);
     }
 
     /**
@@ -249,6 +262,12 @@ public class ChatContextService {
      * 返回可重试的 CONTEXT_CHANGED，而不是把旧 metadata 绑到新请求上。
      */
     public boolean matches(ChatContextPlan plan) {
+        return matches(plan, true);
+    }
+
+    /** Tool access reports its specific denial; final model sends also require live memory access. */
+    private boolean matches(ChatContextPlan plan, boolean requireMemoryAccess) {
+        if (plan == null) return false;
         try {
             Snapshot current = snapshot(plan.sessionId());
             return current.historyRevision() == plan.historyRevision()
@@ -256,7 +275,9 @@ public class ChatContextService {
                     && java.util.Objects.equals(current.summaryRevision(), plan.summaryRevision())
                     && java.util.Objects.equals(current.vaultEpoch(), plan.vaultEpoch())
                     && java.util.Objects.equals(current.vaultRevision(), plan.vaultRevision())
-                    && current.policyRevision() == plan.policyRevision();
+                    && current.policyRevision() == plan.policyRevision()
+                    && (!requireMemoryAccess || !plan.memoriesAllowed() || policy.useEligibility().allowed())
+                    && (coordinator == null || Objects.equals(coordinator.revision(plan.sessionId()), plan.continuationRevision()));
         } catch (SQLException error) {
             return false;
         }
@@ -267,7 +288,7 @@ public class ChatContextService {
      * 不能相信调用方传来的计划副本或参数。
      */
     public MemoryLookup readMemoriesForTool(ChatContextPlan plan, boolean memoryUseRequested, String query) {
-        if (plan == null || !matches(plan)) return MemoryLookup.stale();
+        if (plan == null || !matches(plan, false)) return MemoryLookup.stale();
         if (!memoryUseRequested) {
             return MemoryLookup.unavailable(ContextMemorySource.Availability.NOT_REQUESTED, false);
         }
@@ -308,7 +329,7 @@ public class ChatContextService {
      */
     public MemoryListing listMemoriesForTool(ChatContextPlan plan, boolean memoryUseRequested, int limit,
                                              String scope) {
-        if (plan == null || !matches(plan)) return MemoryListing.stale();
+        if (plan == null || !matches(plan, false)) return MemoryListing.stale();
         if (!memoryUseRequested) {
             return MemoryListing.unavailable(ContextMemorySource.Availability.NOT_REQUESTED, false);
         }
@@ -350,7 +371,7 @@ public class ChatContextService {
     public MemoryWrite createMemoryForTool(ChatContextPlan plan, boolean memoryUseRequested, String text,
                                            String kind, String scope, String expiry, String userText,
                                            long turnId, long userMessageId) {
-        if (plan == null || !matches(plan)) return MemoryWrite.stale();
+        if (plan == null || !matches(plan, false)) return MemoryWrite.stale();
         if (!memoryUseRequested) {
             return MemoryWrite.unavailable(ContextMemorySource.Availability.NOT_REQUESTED);
         }
@@ -431,7 +452,7 @@ public class ChatContextService {
      */
     public MemoryWrite updateMemoryForTool(ChatContextPlan plan, boolean memoryUseRequested, String memoryId,
                                            Integer expectedVersion, String currentText, String text, String expiry) {
-        if (plan == null || !matches(plan)) return MemoryWrite.stale();
+        if (plan == null || !matches(plan, false)) return MemoryWrite.stale();
         if (!memoryUseRequested) {
             return MemoryWrite.unavailable(ContextMemorySource.Availability.NOT_REQUESTED);
         }
@@ -505,7 +526,7 @@ public class ChatContextService {
      */
     public MemoryWrite deleteMemoryForTool(ChatContextPlan plan, boolean memoryUseRequested, String memoryId,
                                            Integer expectedVersion, String currentText) {
-        if (plan == null || !matches(plan)) return MemoryWrite.stale();
+        if (plan == null || !matches(plan, false)) return MemoryWrite.stale();
         if (!memoryUseRequested) {
             return MemoryWrite.unavailable(ContextMemorySource.Availability.NOT_REQUESTED);
         }
@@ -691,11 +712,74 @@ public class ChatContextService {
                         && !java.util.Objects.equals(current.summaryRevision(), plan.summaryRevision()))) {
                 return plan;
             }
-            return plan.withMemorySnapshot(current.summaryRevision(), current.vaultEpoch(), current.vaultRevision());
+            return plan.withMemorySnapshot(current.summaryRevision(), current.vaultEpoch(), current.vaultRevision())
+                    .withContinuationRevision(coordinator == null ? plan.continuationRevision() : coordinator.revision(plan.sessionId()));
         } catch (SQLException | RuntimeException error) {
             return plan;
         }
     }
+
+    /** Re-read only historical sources at the accepted cutoff after this turn confirms memory forgetting. */
+    public ChatContextPlan restoreAfterMemoryForget(ChatContextPlan plan, ChatTurnService.Lease lease,
+            List<Map<String, Object>> existing, int window, String provider, String protocol, String model, int outputReserve) {
+        if (coordinator == null || plan == null) return plan;
+        if (!matches(plan)) throw new ChatTurnRejectException(409, "CONTEXT_CHANGED", "遗忘之后来源已变化，请重试本轮", Map.of());
+        try {
+            var audit = new ContextAudit.Builder("restore-" + lease.requestId(), TokenEstimator.VERSION);
+            var projected = projection.project(new ConversationProjection.Request(plan.sessionId(), lease.turnId(),
+                    plan.contextGeneration(), lease.masterPassword(), window, plan.memoriesAllowed()), audit);
+            var draft = assembler.assemble(new ChatContextAssembler.Input("", lease.masterPassword(), List.of(), Map.of(), "", false),
+                    projected, ContextMemorySource.Selection.EMPTY, List.of(), audit);
+            String boundary = memory.readEnvelope().map(v -> v.vaultId() + ":" + v.epoch()).orElse("absent");
+            var historical = budgeter.fit(draft, projected, new ContextBudgeter.Target("restore-" + lease.requestId(), plan.sessionId(),
+                    plan.contextGeneration(), plan.historyRevision(), plan.summaryRevision(), plan.vaultEpoch(), plan.vaultRevision(),
+                    plan.policyRevision(), window, true, outputReserve, provider, protocol, model, plan.memoriesAllowed(), boundary), audit)
+                    .messages().stream().filter(m -> com.drillnotebook.app.model.ContextSource.from(m) != null).toList();
+            var view = new ArrayList<Map<String, Object>>();
+            int insertion = -1;
+            for (var message : existing) {
+                var source = com.drillnotebook.app.model.ContextSource.from(message);
+                if (message.containsKey(ContextCoordinator.CHECKPOINT_TAG) || source != null && java.util.Set.of("TURN", "LEGACY").contains(source.kind())) {
+                    if (insertion < 0) insertion = view.size();
+                } else view.add(clearMemoryEnvelope(message));
+            }
+            if (insertion < 0) {
+                insertion = 0;
+                while (insertion < view.size() && ("system".equals(view.get(insertion).get("role")) || isDataEnvelope(view.get(insertion)))) insertion++;
+            }
+            view = new ArrayList<>(ChatContextEntryService.withoutMemoryContents(view));
+            view.addAll(insertion, historical);
+            if (!matches(plan)) throw new ChatTurnRejectException(409, "CONTEXT_CHANGED", "历史恢复期间来源已变化，请重试本轮", Map.of());
+            return plan.withRestoredHistory(view, projected.scan(), budgeter.estimate(view));
+        } catch (SQLException error) { throw new IllegalStateException("遗忘后的原历史无法恢复，本轮已停止", error); }
+    }
+
+    private boolean isDataEnvelope(Map<String, Object> message) {
+        if (!(message.get("content") instanceof List<?> blocks)) return false;
+        for (var block : blocks) if (block instanceof Map<?, ?> b && b.get("text") instanceof String text) {
+            try { if ("CONTEXT_DATA_V1".equals(mapperForContext().readTree(text).path("kind").asText())) return true; }
+            catch (com.fasterxml.jackson.core.JsonProcessingException ignored) { }
+        }
+        return false;
+    }
+
+    private Map<String, Object> clearMemoryEnvelope(Map<String, Object> message) {
+        if (!isDataEnvelope(message)) return message;
+        var copy = new LinkedHashMap<>(message);
+        copy.put("content", ((List<?>) message.get("content")).stream().map(block -> {
+            if (!(block instanceof Map<?, ?> b) || !(b.get("text") instanceof String text)) return block;
+            try {
+                var json = mapperForContext().readTree(text);
+                if (!(json instanceof com.fasterxml.jackson.databind.node.ObjectNode data) || !"CONTEXT_DATA_V1".equals(data.path("kind").asText())) return block;
+                data.putNull("summary"); data.putArray("memories");
+                return Map.of("type", "text", "text", mapperForContext().writeValueAsString(data));
+            } catch (com.fasterxml.jackson.core.JsonProcessingException error) { throw new IllegalStateException("记忆注入块无法撤回", error); }
+        }).toList());
+        return copy;
+    }
+
+    private static com.fasterxml.jackson.databind.ObjectMapper mapperForContext() { return ContextJson.MAPPER; }
+    private static final class ContextJson { private static final com.fasterxml.jackson.databind.ObjectMapper MAPPER = new com.fasterxml.jackson.databind.ObjectMapper(); }
 
     /** 同步换入新快照，让同轮后续检索能看到刚写入的版本；失败只降级为 BUILDING，不影响写入成功。 */
     private void rebuildIndexAfterWrite() {

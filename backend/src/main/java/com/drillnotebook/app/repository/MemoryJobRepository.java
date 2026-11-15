@@ -395,6 +395,12 @@ public class MemoryJobRepository {
         }
     }
 
+    public List<JobRow> findLegacySummaries(int limit) throws SQLException {
+        try (var connection = dataSource.getConnection(); var statement = connection.prepareStatement(SELECT + " WHERE kind = 'SUMMARY' AND " + ACTIVE_STATUSES + " ORDER BY id LIMIT ?")) {
+            statement.setInt(1, limit); return collect(statement.executeQuery());
+        }
+    }
+
     public Optional<JobRow> find(String jobId) throws SQLException {
         try (Connection connection = dataSource.getConnection();
              PreparedStatement statement = connection.prepareStatement(SELECT + " WHERE id = ?")) {

@@ -74,6 +74,7 @@ export interface TurnStatusView {
 }
 
 export type TurnEvent =
+  | { type: 'compaction'; requestId: string; running: boolean }
   | { type: 'recovery'; requestId: string; recovery: AiRecovery | null }
   | { type: 'supplements'; requestId: string; supplements: ChatSupplement[] }
   | { type: 'snapshot'; requestId: string; status: TurnStatusView }
@@ -336,9 +337,11 @@ export function useAiChatTurn({ sessionId, onEvent }: UseAiChatTurnOptions): {
         emit(turn, { type: 'reasoning', requestId: turn.requestId, delta });
       },
       onMetadata: (metadata) => {
+        if (metadata.requestId !== turn.requestId) return;
         turn.begun = true;
         emit(turn, { type: 'begun', requestId: turn.requestId });
         if (metadata.supplements) emit(turn, { type: 'supplements', requestId: turn.requestId, supplements: metadata.supplements });
+        if (metadata.contextCompaction) emit(turn, { type: 'compaction', requestId: turn.requestId, running: metadata.contextCompaction.running });
         const recovery = readRecovery(metadata.recovery);
         if (recovery !== undefined) emit(turn, { type: 'recovery', requestId: turn.requestId, recovery });
       },

@@ -242,6 +242,8 @@ public class ChatTurnRepository {
 
         memory.purgeEvidence(connection, null, List.of(original.id()), messageIdsOf(connection, original.id()));
         SessionContextRepository.invalidateIn(connection, original.sessionId(), original.id());
+        ChatContextCheckpointRepository.invalidateIn(connection, original.sessionId());
+        ChatContextEntryRepository.clearTurnIn(connection, original.id());
         MemoryJobRepository.supersedeForSessionIn(connection, original.sessionId());
         try (var statement = connection.prepareStatement("""
                 UPDATE ai_chat_session SET memory_scan_after_turn = MIN(memory_scan_after_turn, ?),
@@ -581,6 +583,8 @@ public class ChatTurnRepository {
 
     /** 一次事务里的单轮清理：清证据 → 删行 → 立墓碑，计数一并带回。 */
     private Released clearTurnContent(Connection connection, TurnRow turn, String deletedAt) throws SQLException {
+        ChatContextCheckpointRepository.invalidateIn(connection, turn.sessionId());
+        ChatContextEntryRepository.clearTurnIn(connection, turn.id());
         try(var statement=connection.prepareStatement("UPDATE ai_chat_pending SET payload_cipher='',payload_meta='',payload_bytes=0,state='CONSUMED' WHERE parent_request_id=?")){
             statement.setString(1,turn.requestId());statement.executeUpdate();
         }

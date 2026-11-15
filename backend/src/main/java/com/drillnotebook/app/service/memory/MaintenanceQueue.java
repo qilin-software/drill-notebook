@@ -60,6 +60,10 @@ public class MaintenanceQueue {
     private final MaintenanceSourceScanner scanner;
     private final MaintenancePorts.Extractor extractor;
     private final MaintenancePorts.SummaryDrafter drafter;
+    private boolean managedContext;
+
+    @org.springframework.beans.factory.annotation.Autowired
+    public void setContextCoordinator(com.drillnotebook.app.service.ContextCoordinator coordinator) { managedContext = true; }
 
     public MaintenanceQueue(ChatSessionMetadataRepository sessions, ChatHistoryRepository history,
                             MemoryJobRepository jobs, MemoryPolicyService policy, MemoryVaultService vault,
@@ -111,7 +115,7 @@ public class MaintenanceQueue {
             String sessionPassword = vault.sessionPassword(state.sessionId()).orElse(null);
             Counts extract = queueExtract(state, scopeId, backlog.maxTurnId(), envelope.get(), key.get(), target,
                     settings.revision(), historyFloor, timezone, sessionPassword, nowMillis);
-            Counts summary = queueSummary(state, scopeId, backlog.maxTurnId(), envelope.get(), key.get(), target,
+            Counts summary = managedContext ? Counts.NONE : queueSummary(state, scopeId, backlog.maxTurnId(), envelope.get(), key.get(), target,
                     settings.revision(), historyFloor, timezone, sessionPassword, nowMillis);
             queued += extract.queued();
             merged += extract.merged();

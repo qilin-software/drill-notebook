@@ -46,6 +46,7 @@ export interface UsageSnapshot {
 }
 
 export interface ChatResultView {
+  contextCompaction?: { running: boolean };
   recovery?: AiRecovery | null;
   supplements?: import('./chatQueue').ChatSupplement[];
   finishReason?: string;
@@ -125,6 +126,8 @@ function resultView(payload: Record<string, unknown> | null): ChatResultView {
     if (Array.isArray(payload.toolActivities)) view.toolActivities = readToolActivities(payload.toolActivities);
     const recovery = readRecovery(payload.recovery);
     if (recovery !== undefined) view.recovery = recovery;
+    const compaction = asRecord(payload.contextCompaction);
+    if (typeof compaction?.running === 'boolean') view.contextCompaction = { running: compaction.running };
   }
   return view as ChatResultView;
 }

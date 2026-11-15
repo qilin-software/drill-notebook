@@ -24,6 +24,7 @@ public class UsageRepository {
     /** 三个占后台每日额度的维护用途（§2.6：CHAT 计量但不占）。 */
     public static final String PURPOSE_MEMORY_EXTRACT = "MEMORY_EXTRACT";
     public static final String PURPOSE_SESSION_SUMMARY = "SESSION_SUMMARY";
+    public static final String PURPOSE_CONTEXT_COMPACT = "CONTEXT_COMPACT";
     public static final String PURPOSE_FORMAT_REPAIR = "FORMAT_REPAIR";
     private static final List<String> OPEN_STATES = List.of("RESERVED", "SENT");
 

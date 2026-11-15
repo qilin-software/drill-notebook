@@ -91,7 +91,7 @@ export const SessionNavigation = forwardRef<SessionNavigationHandle, Props>(func
     if (busy(id)) {
       const waiting = runtime?.status === 'QUEUED';
       const label = props.reconnecting ? '正在重新连接' : waiting ? '等待执行'
-        : ({ tools: '正在调用工具', waiting: '等待会话回复', thinking: '正在思考', stopping: '正在停止…', answer: '正在生成回复' }[runtime?.phase ?? ''] ?? '正在运行');
+        : ({ compacting: '正在压缩上下文', tools: '正在调用工具', waiting: '等待会话回复', thinking: '正在思考', stopping: '正在停止…', answer: '正在生成回复' }[runtime?.phase ?? ''] ?? '正在运行');
       return waiting || props.reconnecting ? <Clock size={14} aria-label={label}><title>{label}</title></Clock>
         : <LoaderCircle size={14} className="session-nav-spin" aria-label={label}><title>{label}</title></LoaderCircle>;
     }

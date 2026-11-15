@@ -101,7 +101,7 @@ export interface RequestContextSnapshot {
   schemaVersion: number;
   estimatorVersion: string;
   model: string;
-  kind: 'CHAT' | 'NATIVE_WEB';
+  kind: 'CHAT' | 'NATIVE_WEB' | 'CONTEXT_COMPACT';
   estimatedInputTokens: number;
   contextWindow: number;
   categories: { kind: string; estimatedTokens: number; itemCount: number;
@@ -112,6 +112,7 @@ export interface RequestContextSnapshot {
 export interface RequestContextEntry {
   attemptId: string;
   operationId: string;
+  purpose?: 'CHAT' | 'CONTEXT_COMPACT';
   ordinal: number;
   createdAt: string;
   settledAt: string | null;

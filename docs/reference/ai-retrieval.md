@@ -79,7 +79,7 @@ retrieval_embedding（float32 BLOB，L2 归一化）
 
 ## 3. 数据模型（schema v8）
 
-本节记录 schema v8 引入的六张检索表及其约束；当时 v7 首次启动幂等升级到 v8。当前整体数据库为 schema 18，检索表继续复用，v0.8.2 本次工具接入没有数据库迁移。
+本节记录 schema v8 引入的六张检索表及其约束；当时 v7 首次启动幂等升级到 v8。当前整体数据库为 schema 22，检索表继续复用；v0.8.2 的笔记混合检索工具接入本身没有数据库迁移，之后的上下文管理表见[当前数据模型](../state/data-model.md)。
 
 ### 3.1 `retrieval_chunk` — 检索分块
 
@@ -229,7 +229,7 @@ CREATE TABLE IF NOT EXISTS embedding_job (
 - hasMore/nextOffset 在当前候选内分页；达到候选边界时 searchLimited/incomplete=true，建议缩小范围或改 keyword。结果超过 60 KiB 软预算时减少行数并返回 byteLimited，nextOffset 按实际行数推进，保持共享 64 KiB 硬上限。
 - 未配置向量无 notice；已配置但不可用时返回 BM25、retrievalNotice 与 incomplete=true。searchMode 只回显请求模式，实际来源看 matchTypes。
 
-工具独立开关、模型工具能力、全局预算和停止继续生效；不依赖长期记忆开关。完整契约见[api-contracts.md §3.2.4](../state/api-contracts.md)，验证见[v0.8.2 清单](../state/v0.8.2-features.md)。
+工具独立开关、模型工具能力、全局预算和停止继续生效；不依赖长期记忆开关。完整契约见[api-contracts.md §3.2.4](../state/api-contracts.md)，验证见[v0.8.2 清单](../archive/v0.8.2/features.md)。
 
 ### 5.1.1 兼容对话检索：`POST /api/ai/chat`
 
@@ -471,7 +471,7 @@ node scripts/qa-electron.mjs              # Electron CDP UI QA，含 RAG 软检�
 - **Rust 工具链仅在开发/测试本地 embedding worker 时需要**；普通 retrieval-off 构建（只用 BM25 或远程 provider）不强制 Rust。
 - `mvp-test.ps1` Section 8：建两个笔记本 + 已知笔记 → 验证 scope=all/current BM25 citations、status 端点、reindex 409 / retry-failed、远程 embedding 失败时 chat 仍 200 + BM25 降级、删除清理。
 - `portable-audit.ps1`：运行前后递归快照固定受监控根目录（HuggingFace/fastembed 缓存、`Drill Notebook` 本地/漫游目录、TEMP 下 `fastembed/ort/drill-notebook` 条目），比较 path/size/mtime/hash，证明未在 `APP_ROOT` 外新增项目文件。
-- `qa-electron.mjs`：设置页和旧侧栏检索开关 / 范围控件的历史软检查，截图留证；软检查不影响退出码，不能作为当前资料工具接入验收。v0.8.2 实际工具链与便携验证见[实施计划](../work/material-hybrid-search/plan.md#3-验证结果)。
+- `qa-electron.mjs`：设置页和旧侧栏检索开关 / 范围控件的历史软检查，截图留证；软检查不影响退出码，不能作为当前资料工具接入验收。v0.8.2 实际工具链与便携验证见[实施计划](../archive/v0.8.2/material-hybrid-search/plan.md#3-验证结果)。
 
 Evidence 由测试内 `writeEvidence` 在 `DRILL_EVIDENCE_DIR` 环境变量指向 `.omo/evidence` 时写出（断言始终运行，写文件被门控）。
 

@@ -64,7 +64,9 @@ class DeleteToolChatPathTest {
         var updates = new MaterialUpdateService(jdbc, new DataSourceTransactionManager(ds), materials, notebooks, new BankRepository(jdbc),
                 new KnowledgePointRepository(jdbc, json), new QuestionRepository(jdbc, json),
                 new NoteIndexingService(notebooks, new RetrievalIndexRepository(jdbc), jdbc, json), wiring.handles(), json);
-        allTools = List.of(MaterialReadTools.tool("read_notebook", reads), MaterialReadTools.tool("search_materials", reads),
+        var web = mock(WebSearchService.class);
+        allTools = List.of(new SearchWebTool(web), new FetchWebTool(web),
+                MaterialReadTools.tool("read_notebook", reads), MaterialReadTools.tool("search_materials", reads),
                 MaterialReadTools.tool("read_wrong_questions", reads), MaterialReadTools.tool("read_current_page", reads),
                 MaterialReadTools.tool("read_knowledge", reads), MaterialReadTools.tool("read_question_bank", reads),
                 new MaterialCreateTool(creates), new MaterialUpdateTool(updates),
@@ -156,9 +158,9 @@ class DeleteToolChatPathTest {
                 "expectedVersion", toolResult(request, 1).path("items").path(0).path("updateVersion").asText())));
     }
 
-    @Test void catalogCoversEveryBuiltinAndDefaultChatOffersOnlyTheSixteenOrdinaryTools() {
+    @Test void catalogCoversEveryBuiltinAndDefaultChatOffersOnlyTheEighteenOrdinaryTools() {
         Set<String> catalog = new HashSet<>(AiToolSettings.TOOLS.stream().map(AiToolSettings.Tool::name).toList());
-        assertEquals(20, catalog.size());
+        assertEquals(22, catalog.size());
         assertEquals(catalog, new HashSet<>(allTools.stream().map(tool -> tool.definition().name()).toList()));
         assertEquals("COMPLETED", ai.chat(body("看看有哪些能力", true)).get("status"));
         catalog.removeAll(AiToolSettings.DELETE_TOOLS);

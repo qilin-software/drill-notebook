@@ -34,92 +34,55 @@ class ChatContextBudgetTest {
     private final ContextBudgeter budgeter = new ContextBudgeter(estimator, mapper);
 
     @Test
-    void budgetStaysBoundedAndCurrentQuestionStaysLastAndIntact() {
-        // 三十二轮、每轮都超长：任何历史长度下都必须收得进预算（T01）
+    void candidateKeepsLongHistoryUntilFinalProtocolPreflight() {
         List<ConversationProjection.Item> candidates = new ArrayList<>();
-        for (int index = 1; index <= 32; index++) {
-            candidates.add(turn(index, pad("旧问题" + index + " ", 1400), pad("旧回答" + index + " ", 1400)));
-        }
+        for (int index = 1; index <= 64; index++) candidates.add(turn(index, pad("旧问题" + index + " ", 700), pad("旧回答" + index + " ", 700)));
         ChatContextPlan plan = fit(projection(candidates), USER_TEXT, ContextMemorySource.Selection.EMPTY,
                 List.of(), Map.of(), List.of(), true, 32000, true);
-
-        assertTrue(plan.audit().estimatedInputTokens() <= plan.audit().inputBudget(),
-                "估算必须落在预算内：" + plan.audit().estimatedInputTokens() + " > " + plan.audit().inputBudget());
-        assertEquals(USER_TEXT, firstBlockText(plan.messages().get(plan.messages().size() - 1)),
-                "当前问题永远最后且一字不减");
-        assertTrue(plan.notices().contains("CONTEXT_TRIMMED"), "裁过就要如实标出来");
-        // 每轮单独就远超 2,400：区域上限从最旧整轮舍弃，不可再分的最新一轮保留（§9.2）
-        assertEquals(1, regionItemCount(plan, ContextAudit.Region.RECENT_TURNS),
-                "超上限的旧轮次整轮离开，只留最新一轮");
-        assertTrue(hasOmission(plan, ContextAudit.Omission.BUDGET, "TURN"));
-        String payload = serialized(plan.messages());
-        assertTrue(payload.contains("旧问题32 "), "留下的是最近的那一轮");
-        assertFalse(payload.contains("旧问题31 "), "旧轮次是整轮走的，不是切半句");
-    }
-
-    @Test
-    void recentTurnsAreCappedAtTheRegionBudgetByWholeTurns() {
-        List<ConversationProjection.Item> candidates = new ArrayList<>();
-        for (int index = 1; index <= 6; index++) {
-            candidates.add(turn(index, pad("轮次" + index + " ", 300), pad("回答" + index + " ", 300)));
-        }
-        ChatContextPlan plan = fit(projection(candidates), USER_TEXT, ContextMemorySource.Selection.EMPTY,
-                List.of(), Map.of(), List.of(), true, 32000, true);
-
-        int retained = regionItemCount(plan, ContextAudit.Region.RECENT_TURNS);
-        assertTrue(regionTokens(plan, ContextAudit.Region.RECENT_TURNS)
-                        <= ChatContextAssembler.RECENT_TURNS_BUDGET,
-                "近期区是上限，不是扫描停止条件：6 轮约 " + regionTokens(plan, ContextAudit.Region.RECENT_TURNS));
-        assertEquals(3, retained, "从最旧整轮舍弃到 2,400 以内：" + retained);
-        assertTrue(hasOmission(plan, ContextAudit.Omission.BUDGET, "TURN"));
-        assertTrue(plan.notices().contains("CONTEXT_TRIMMED"));
+        assertEquals(64, regionItemCount(plan, ContextAudit.Region.RECENT_TURNS));
         assertEquals(USER_TEXT, firstBlockText(plan.messages().get(plan.messages().size() - 1)));
+        assertFalse(hasOmission(plan, ContextAudit.Omission.BUDGET, "TURN"));
+        assertTrue(serialized(plan.messages()).contains("旧问题1 "));
+        assertThrows(ChatTurnRejectException.class, () -> requireFinalFits(plan, 32000));
     }
 
     @Test
-    void shortFollowUpStillSendsAfterTwoHugeTurns() {
-        // 两轮各自就超近期区上限的长回复：旧口径曾把"保留最近两轮"当硬下限，追问会被 413 堵死
+    void recentHistoryUsesTheModelWindowWithoutA2400TokenCap() {
         List<ConversationProjection.Item> candidates = new ArrayList<>();
-        for (int index = 1; index <= 2; index++) {
-            candidates.add(turn(index, pad("超长问题" + index + " ", 1600), pad("超长回答" + index + " ", 1600)));
-        }
-        ChatContextPlan plan = fit(projection(candidates), "继续", ContextMemorySource.Selection.EMPTY,
+        for (int index = 1; index <= 6; index++) candidates.add(turn(index, pad("轮次" + index + " ", 300), pad("回答" + index + " ", 300)));
+        ChatContextPlan plan = fit(projection(candidates), USER_TEXT, ContextMemorySource.Selection.EMPTY,
+                List.of(), Map.of(), List.of(), true, 32000, true);
+        assertEquals(6, regionItemCount(plan, ContextAudit.Region.RECENT_TURNS));
+        assertTrue(regionTokens(plan, ContextAudit.Region.RECENT_TURNS) > 2400);
+        requireFinalFits(plan, 32000);
+        assertFalse(hasOmission(plan, ContextAudit.Omission.BUDGET, "TURN"));
+    }
+
+    @Test
+    void recentLongTurnsRemainCompleteBeforeCompaction() {
+        var candidates = List.of(turn(1, pad("问题一 ", 1600), pad("回答一 ", 1600)),
+                turn(2, pad("问题二 ", 1600), pad("回答二 ", 1600)));
+        var plan = fit(projection(candidates), "继续", ContextMemorySource.Selection.EMPTY,
                 List.of(), Map.of(), List.of(), true, 12000, true);
-
-        assertTrue(regionItemCount(plan, ContextAudit.Region.RECENT_TURNS) <= 1,
-                "不可再分的最新一轮之外都可以按完整轮次舍弃（§9.2）");
+        assertEquals(2, regionItemCount(plan, ContextAudit.Region.RECENT_TURNS));
         assertEquals("继续", firstBlockText(plan.messages().get(plan.messages().size() - 1)));
-        assertTrue(hasOmission(plan, ContextAudit.Omission.BUDGET, "TURN"));
-        assertTrue(plan.audit().estimatedInputTokens() <= plan.audit().inputBudget());
+        assertTrue(serialized(plan.messages()).contains("问题一 "));
+        requireFinalFits(plan, 32000);
     }
 
     @Test
-    void trimOrderFollowsThePlanAndTouchesRecentTurnsLast() {
-        List<RetrievalHit> hits = new ArrayList<>();
-        for (int index = 1; index <= 8; index++) {
-            hits.add(hit(100 + index, 200 + index, pad("检索片段" + index + " ", 210)));
-        }
-        List<ConversationProjection.Item> candidates = new ArrayList<>();
-        for (int index = 1; index <= 6; index++) {
-            candidates.add(turn(index, pad("问题" + index + " ", 150), pad("回答" + index + " ", 150)));
-        }
-        ChatContextPlan plan = fit(projection(candidates), USER_TEXT,
+    void preflightDoesNotSilentlyDeleteExplicitAttachmentsOrContext() {
+        var hits = new ArrayList<RetrievalHit>();
+        for (int index = 1; index <= 8; index++) hits.add(hit(100 + index, 200 + index, pad("片段" + index + " ", 150)));
+        var plan = fit(projection(List.of(turn(1, "原问题", "原回答"))), USER_TEXT,
                 new ContextMemorySource.Selection(List.of(fact("m1", pad("记忆一 ", 230))), List.of(), 1, false),
-                List.of(text("t1", "b1", pad("附件正文 ", 950))), page("77", pad("页面正文 ", 950)), hits, true,
-                6500, true);
-
-        assertEquals(0, regionItemCount(plan, ContextAudit.Region.NOTEBOOK_RAG), "低排名笔记片段先裁（§9.2）");
-        assertEquals(0, regionItemCount(plan, ContextAudit.Region.PAGE), "页面冗余其次");
-        assertEquals(0, regionItemCount(plan, ContextAudit.Region.TEXT_ATTACHMENT), "附件低优先段落再其次");
-        assertEquals(0, regionItemCount(plan, ContextAudit.Region.MEMORY), "低相关记忆排在附件之后");
-        int retained = regionItemCount(plan, ContextAudit.Region.RECENT_TURNS);
-        assertTrue(retained >= 1 && retained < 6,
-                "四个区域都清完后才轮到近期轮次，且整轮丢弃：" + retained);
-        for (String kind : List.of("NOTEBOOK_RAG", "PAGE", "TEXT_ATTACHMENT", "MEMORY", "TURN")) {
-            assertTrue(hasOmission(plan, ContextAudit.Omission.BUDGET, kind), "省略原因要能对上：" + kind);
-        }
-        assertTrue(plan.audit().estimatedInputTokens() <= plan.audit().inputBudget());
-        assertEquals(USER_TEXT, firstBlockText(plan.messages().get(plan.messages().size() - 1)));
+                List.of(text("t1", "b1", pad("附件正文 ", 950))), page("77", pad("页面正文 ", 950)), hits, true, 6500, true);
+        assertEquals(8, regionItemCount(plan, ContextAudit.Region.NOTEBOOK_RAG));
+        assertEquals(1, regionItemCount(plan, ContextAudit.Region.PAGE));
+        assertEquals(1, regionItemCount(plan, ContextAudit.Region.TEXT_ATTACHMENT));
+        assertEquals(1, regionItemCount(plan, ContextAudit.Region.MEMORY));
+        assertTrue(serialized(plan.messages()).contains("附件正文"));
+        assertThrows(ChatTurnRejectException.class, () -> requireFinalFits(plan, 6500));
     }
 
     @Test
@@ -152,49 +115,45 @@ class ChatContextBudgetTest {
 
         assertEquals(413, error.status());
         assertEquals("CONTEXT_TOO_LARGE", error.code());
-        List<String> categories = castList(error.details().get("categoriesToShorten"));
-        assertTrue(categories.contains("USER_TEXT"), categories.toString());
+        assertEquals(4096, error.details().get("outputReserve"));
+        assertEquals(512, error.details().get("safetyMargin"));
     }
 
     @Test
-    void oversizedCurrentQuestionIsRefusedInsteadOfSilentlyTruncated() {
+    void oversizedCurrentQuestionIsRefusedByFinalPreflightInsteadOfTruncated() {
         String huge = pad("这是一段超长的当前问题，要求整段送进模型 ", 5000);
         ChatTurnRejectException error = assertThrows(ChatTurnRejectException.class,
-                () -> fit(projection(List.of()), huge, ContextMemorySource.Selection.EMPTY, List.of(), Map.of(),
-                        List.of(), true, 5000, true));
+                () -> requireFinalFits(fit(projection(List.of()), huge, ContextMemorySource.Selection.EMPTY, List.of(), Map.of(),
+                        List.of(), true, 5000, true), 5000));
 
         assertEquals(413, error.status());
         assertEquals("CONTEXT_TOO_LARGE", error.code());
-        assertEquals(List.of("USER_TEXT"), error.details().get("categoriesToShorten"),
-                "当前问题不接受裁剪，只能请用户缩短（T05）");
+        assertEquals(5000, error.details().get("contextWindow"));
     }
 
     @Test
     void oversizedCurrentQuestionWithEmojiAndCodeIsRefusedIntact() {
         String huge = "```java\n" + "😀".repeat(5000) + "\n```";
         ChatTurnRejectException error = assertThrows(ChatTurnRejectException.class,
-                () -> fit(projection(List.of()), huge, ContextMemorySource.Selection.EMPTY, List.of(), Map.of(),
-                        List.of(), true, 5000, true));
+                () -> requireFinalFits(fit(projection(List.of()), huge, ContextMemorySource.Selection.EMPTY, List.of(), Map.of(),
+                        List.of(), true, 5000, true), 5000));
 
         assertEquals(413, error.status());
         assertEquals("CONTEXT_TOO_LARGE", error.code());
-        assertEquals(List.of("USER_TEXT"), error.details().get("categoriesToShorten"),
-                "emoji/代码块同样不能被静默截断");
+        assertEquals(5000, error.details().get("contextWindow"));
     }
 
     @Test
     void currentImagesAreNeverSilentlyDropped() {
         // 窗口只够两张图的预留（每张 4,096），第三张不能"悄悄少发一张"
         ChatTurnRejectException error = assertThrows(ChatTurnRejectException.class,
-                () -> fit(projection(List.of()), USER_TEXT, ContextMemorySource.Selection.EMPTY,
+                () -> requireFinalFits(fit(projection(List.of()), USER_TEXT, ContextMemorySource.Selection.EMPTY,
                         List.of(image("a1", "b1"), image("a2", "b2"), image("a3", "b3")), Map.of(), List.of(), true,
-                        12000, true));
+                        12000, true), 12000));
 
         assertEquals(413, error.status());
         assertEquals("CONTEXT_TOO_LARGE", error.code());
-        assertTrue(castList(error.details().get("categoriesToShorten")).contains("IMAGE"),
-                "要指出该缩短图片：" + error.details().get("categoriesToShorten"));
-        assertEquals(3, ((Number) error.details().get("imagesProvided")).intValue());
+        assertEquals(12000, error.details().get("contextWindow"));
 
         ChatContextPlan two = fit(projection(List.of()), USER_TEXT, ContextMemorySource.Selection.EMPTY,
                 List.of(image("a1", "b1"), image("a2", "b2")), Map.of(), List.of(), true, 32000, true);
@@ -216,7 +175,7 @@ class ChatContextBudgetTest {
         assertEquals(TokenEstimator.IMAGE_UNKNOWN_ESTIMATED_TOKENS,
                 regionTokens(plan, ContextAudit.Region.IMAGE), "图像只按预留成本计");
         assertTrue(serialized(plan.messages()).contains(big), "发给厂商的 base64 字节一个不少");
-        assertTrue(plan.audit().estimatedInputTokens() < 2000,
+        assertTrue(plan.audit().estimatedInputTokens() - TokenEstimator.IMAGE_UNKNOWN_ESTIMATED_TOKENS < 2000,
                 "文本估算排除编码字节：" + plan.audit().estimatedInputTokens());
     }
 
@@ -486,8 +445,15 @@ class ChatContextBudgetTest {
         assertNotNull(plan.audit().scan());
         assertTrue(plan.audit().selected().size() <= ContextAudit.MAX_SELECTED);
         assertFalse(plan.audit().selected().isEmpty(), "审计要记下实际提供的来源，检查器才有东西可点");
-        assertEquals(estimator.estimateSerialized(plan.messages()), plan.audit().estimatedInputTokens(),
+        assertEquals(estimator.estimateInput(plan.messages().stream().map(com.drillnotebook.app.model.ContextSource::untag).toList()), plan.audit().estimatedInputTokens(),
                 "无图像时审计估算就是最终序列化形态的估算，不是拼装前的草稿");
+    }
+
+    private void requireFinalFits(ChatContextPlan plan, int window) {
+        var client = new AiUpstreamClient(null, mapper);
+        var target = new AiUpstreamClient.Upstream("https://example.invalid", "stub-key", "model", "chat_completions", 4096, true, false, false);
+        var prepared = client.prepare(target, plan.messages(), List.of(), false, window, "CHAT");
+        ContextWindowBudget.of(window, target.maxTokens(), com.drillnotebook.app.model.AiContextSettings.DEFAULTS).requireFits(prepared.context().estimatedInputTokens());
     }
 
     // ---------- 装配工具 ----------

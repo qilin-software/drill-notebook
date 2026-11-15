@@ -262,14 +262,52 @@ class SessionContextUsageTest {
         jdbc.execute("ALTER TABLE ai_usage_attempt DROP COLUMN cache_read_included_in_input");
         jdbc.update("UPDATE schema_version SET version = 20");
         new DatabaseInitializer(source, Schema9Fixture.resolver(root)).initialize();
-        assertEquals(21, jdbc.queryForObject("SELECT version FROM schema_version", Integer.class));
+        assertEquals(22, jdbc.queryForObject("SELECT version FROM schema_version", Integer.class));
         assertEquals(expected, cumulative());
         assertEquals(0, jdbc.queryForObject("SELECT COUNT(*) FROM ai_usage_attempt WHERE cache_read_included_in_input IS NULL", Integer.class));
         try (var backups = Files.list(root.resolve("backups"))) {
-            assertTrue(backups.anyMatch(path -> path.getFileName().toString().startsWith("pre-schema21-from-v20-")));
+            assertTrue(backups.anyMatch(path -> path.getFileName().toString().startsWith("pre-schema22-from-v20-")));
         }
         new DatabaseInitializer(source, Schema9Fixture.resolver(root)).initialize();
         assertEquals(expected, cumulative(), "再次启动迁移幂等，不重复计量");
+    }
+
+    @Test void schema21MigrationPreservesExistingRequestsAndAllowsCompactionAccounting() throws Exception {
+        String operation = turn(sessionId);
+        observe(operation, 2000, 1000, 100);
+        observe(operation, 3000, 2000, 150);
+        var requests = jdbc.queryForList("SELECT * FROM ai_usage_attempt ORDER BY id");
+        var daily = jdbc.queryForList("SELECT * FROM ai_usage_daily ORDER BY budget_date,target_fingerprint,purpose");
+        var expected = cumulative();
+        String definition = jdbc.queryForObject("SELECT sql FROM sqlite_master WHERE type='table' AND name='ai_usage_attempt'", String.class);
+        assertNotNull(definition);
+        definition = definition.replace("'CONTEXT_COMPACT', ", "");
+        assertFalse(definition.contains("CONTEXT_COMPACT"));
+        jdbc.execute("ALTER TABLE ai_usage_attempt RENAME TO ai_usage_attempt_fixture_v21");
+        jdbc.execute(definition);
+        jdbc.execute("INSERT INTO ai_usage_attempt SELECT * FROM ai_usage_attempt_fixture_v21");
+        jdbc.execute("DROP TABLE ai_usage_attempt_fixture_v21");
+        jdbc.execute("CREATE INDEX idx_ai_usage_operation ON ai_usage_attempt(operation_id,purpose)");
+        jdbc.execute("DROP TABLE ai_context_compaction_lease");
+        jdbc.execute("DROP TABLE ai_context_checkpoint");
+        jdbc.execute("DROP TABLE ai_context_entry");
+        jdbc.update("UPDATE schema_version SET version=21");
+
+        new DatabaseInitializer(source, Schema9Fixture.resolver(root)).initialize();
+        assertEquals(22, jdbc.queryForObject("SELECT version FROM schema_version", Integer.class));
+        assertEquals(requests, jdbc.queryForList("SELECT * FROM ai_usage_attempt ORDER BY id"));
+        assertEquals(daily, jdbc.queryForList("SELECT * FROM ai_usage_daily ORDER BY budget_date,target_fingerprint,purpose"));
+        assertEquals(expected, cumulative());
+        assertEquals(3, jdbc.queryForObject("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN ('ai_context_entry','ai_context_checkpoint','ai_context_compaction_lease')", Integer.class));
+        try (var backups = Files.list(root.resolve("backups"))) {
+            assertTrue(backups.anyMatch(path -> path.getFileName().toString().startsWith("pre-schema22-from-v21-")));
+        }
+        observe(operation, "openai", "CONTEXT_COMPACT", new UsageRepository.ActualUsage("provider", 100, 10, 50, 0, true));
+        assertEquals(5100, number(cumulative(), "inputTokens"));
+        assertEquals(260, number(cumulative(), "outputTokens"));
+        new DatabaseInitializer(source, Schema9Fixture.resolver(root)).initialize();
+        assertEquals(3, jdbc.queryForObject("SELECT COUNT(*) FROM ai_usage_attempt", Integer.class));
+        assertEquals(5360, number(cumulative(), "totalTokens"));
     }
 
     @Test void legacyAmbiguousOrMismatchedLedgerIsLeftUnknownInsteadOfGuessed() throws Exception {

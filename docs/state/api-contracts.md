@@ -158,8 +158,12 @@
 | `retry.streamRetries` | 5 | 0–100；0 关闭回答重连 |
 | `retry.networkPersistent` | true | 布尔；持续等待网络，仍受整轮时间和停止约束 |
 | `retry.networkRetries` | 5 | 0–100；仅有限断网模式使用，0 关闭断网重试 |
+| `context.autoCompact` | true | 布尔；自动压缩上下文，与记忆开关独立 |
+| `context.thresholdPercent` | 80 | 65–95 的整数；压缩后目标约 60% |
 
 v0.8.1 将上述四项嵌套在 `values.retry` / `defaults.retry`。旧持久化 JSON 缺少 retry 时补默认值；旧客户端 PUT 未提交 retry 时保留当前已保存配置。显式提交时须提供完整四项并严格校验类型 / 范围，原 revision 冲突规则继续生效；不新增 schema 或改变已有预算。
+
+v0.8.3 在同一 JSON 增加 `values.context / defaults.context`，不增加设置接口。旧持久化 JSON 缺 context 时补默认；旧客户端 PUT 省略 context 时保留已保存配置。显式提交必须是仅含 autoCompact / thresholdPercent 的完整对象，严格校验布尔、整数和范围，null / 缺字段 / 字符串数字 / 未知字段拒绝；关闭自动压缩时阈值仍须有效。设置随本轮受理快照冻结，保存后不改变运行中的轮次。
 
 输出预算按各请求实际 output usage 累计，缺少 usage 时仅在执行预算中保守扣除分配额度。工具阶段/执行/输出达限后撤工具，并保留一次最终回答请求；接近总期限提前收口。相同工具名、规范化参数和相同结果连续达到阈值才判无进展；模型上下文容量仍可提前收紧执行。
 
@@ -175,7 +179,7 @@ v0.8.1 将上述四项嵌套在 `values.retry` / `defaults.retry`。旧持久化
 
 searchProvider / fetchProvider 分别为 `auto|tavily|tinyfish`，默认 auto，preferNative 默认 false。`keys` 以供应商名为键，每家只有一份 `{apiKey?,clear?}`；空密钥保留，明确 clear=true 删除，不允许同时删除和修改，选择自定义服务须有可用密钥。明文输入只用于后端加密与实际请求，不在 GET、测试结果、页面上下文或活动摘要回显。配置坏值 / 未知字段拒绝，不用默认值掩盖。
 
-测试使用固定公开查询与 URL，成功要求有效来源 / 正文，不能以握手或 HTTP 200 代替；能力错误独立返回。原生优先按本轮受理的模型、端点与协议执行，测试草稿不另发原生模型请求。连接模型公开元数据增加 `nativeWeb:{search,fetch,protocol}`，protocol 为 none / anthropic_messages / openai_responses；不代表账户权限已验证。支持矩阵见[规格](../work/web-search/spec.md#原生联网支持矩阵)。
+测试使用固定公开查询与 URL，成功要求有效来源 / 正文，不能以握手或 HTTP 200 代替；能力错误独立返回。原生优先按本轮受理的模型、端点与协议执行，测试草稿不另发原生模型请求。连接模型公开元数据增加 `nativeWeb:{search,fetch,protocol}`，protocol 为 none / anthropic_messages / openai_responses；不代表账户权限已验证。支持矩阵见[规格](../archive/v0.8.2/web-search/spec.md#原生联网支持矩阵)。
 
 ### 3.2 对话
 
@@ -219,7 +223,7 @@ SSE 事件格式：`event:<name>` + `data:<json>`；事件名：
 |---|---|---|
 | `text` | `{ text }` | 回答增量；身份由本连接 metadata 确认 |
 | `reasoning` | `{ text }` | 思考增量 |
-| `metadata` | 含 `requestId`、`planId`、`recovery?` 等 | 本轮计划与恢复状态；前端据此登记请求 ID |
+| `metadata` | 含 `requestId`、`planId`、`recovery?`、`contextCompaction?` 等 | 本轮计划、恢复与压缩状态；前端据此登记请求 ID |
 | `tool_activity` | `{requestId, sessionId, toolActivities, phase}` | 有界活动快照；phase 为 tools / answer，精确读取等待期间可为 waiting |
 | `done` | 普通 chat 响应字段，额外含 reasoning | 顶层含 requestId/sessionId/status/persistenceStatus/stateDurable、finishReason、toolActivities、recovery? 及上下文/用量字段 |
 | `error` | `{message, partial, requestId?, sessionId?, code?, persistenceStatus?, stateDurable?, toolActivities?, recovery?}` | 如实保留身份、保存状态、恢复原因与已确认活动 |
@@ -227,6 +231,8 @@ SSE 事件格式：`event:<name>` + `data:<json>`；事件名：
 若流在没有 `done` / `error` 的情况下 EOF，客户端必须用 `requestId` 查询轮次状态，不能把占位内容当作完成。
 
 SSE 每 10 秒发送注释心跳，不再固定五分钟关闭。v2 任务由后端持有，断连只取消订阅，任务继续；客户端从运行快照或同 requestId 查询恢复，停止必须显式调用。旧 v1 保留断连取消的兼容行为。关闭模型正文流式不关闭活动事件。`finishReason` 包含 `budget_stages/executions/output/time/context/repeated`、`request_timeout`、`request_timeout_idle`、`stream_error` 等；达限后的「继续」使用新 requestId 和可见后续消息，不自动重放原工具。
+
+压缩执行的 metadata 为 `{sessionId,requestId,phase:"compacting",contextCompaction:{running:true}}`，结束发送 running=false / phase=answer。运行快照与轮次状态保留相同阶段，可用于切会话或断开订阅后恢复；现有取消接口同时取消压缩模型请求。
 
 #### 3.2.1 对话内记忆工具
 
@@ -313,7 +319,7 @@ SSE 每 10 秒发送注释心跳，不再固定五分钟关闭。v2 任务由后
 - 目录结果在共享 64 KiB 硬上限前使用 60 KiB 软预算；Unicode 元数据导致超量时减少条目并返回 `byteLimited=true/hasMore=true/incomplete=true`，nextOffset 依据实际返回数量推进，续页不丢项。片段足够时可直接引用，需要前后文才调用 ID 读取工具。
 - 正文使用 `offset?`、`maxChars?`（默认 4000 / 最大 8000 Unicode 码点）、`version?`；不接受 query/limit。返回单条 items，含定位字段、`text/version/offset/endOffset/totalChars`，顶层含 `version/hasMore/nextOffset?/incomplete`。offset > 0 必须带上次 version；版本变化返回 STALE，重新从 0 读取。目录不接受 maxChars/version/variant。offset 范围为 0–10,000,000。
 - 已保存的笔记、知识点 current、题目 / 错题正文额外返回 `updateVersion`，用于 §3.2.6 更新校验，与分页 `version` 区分。知识点 original / summary 与页面快照不提供更新版本。指定 notebookId / bankId 的目录返回 `container:{type,id,title,description?,sourceLink,updateVersion,truncated}`，即使目录为空也可取得容器信息；容器文本最多 2000 码点。
-- 笔记字面匹配使用现有 `retrieval_chunk` 文本的参数化 LIKE 查询，摘要优先取实际命中分块；混合查询复用既有 FTS5、embedding 空间与授权，不新增索引或资料副本。后续正文读取继续用明确 ID 与 version，保留公式、表格及嵌入题目快照；文件/视频/图片只提供引用或描述，不解析附件字节。完整范围与验证见[v0.8.2 清单](v0.8.2-features.md)。
+- 笔记字面匹配使用现有 `retrieval_chunk` 文本的参数化 LIKE 查询，摘要优先取实际命中分块；混合查询复用既有 FTS5、embedding 空间与授权，不新增索引或资料副本。后续正文读取继续用明确 ID 与 version，保留公式、表格及嵌入题目快照；文件/视频/图片只提供引用或描述，不解析附件字节。完整范围与验证见[v0.8.2 清单](../archive/v0.8.2/features.md)。
 - `pageSnapshot` 字段为 `kind/title/route/capturedAt/markdown/selection/isDraft/truncated` 和可选 `pageId/notebookId/pointId/bankId/questionId/selectedIds`。kind 为 none/note/knowledge/bank/quiz/wrong/manual；时间为 ISO Instant；路由限应用业务路径。正文最多 32000、选区 2000、标题 200、路由 500 码点，selectedIds 最多 20 个正整数；超限前端截短并标 truncated，后端拒绝非法输入。返回明确采集时间、草稿和截断状态。数据库中的明确目标已删除返回 NOT_FOUND；空业务页返回空 text 与说明，缺快照返回 UNAVAILABLE。
 - 快照绑定提交，排队后切页不改变原目标；插话单独保存请求标识，默认读取仍是主消息。模型工具关闭时只提示尚未看到页面正文，不恢复整页自动注入。
 - 常见状态为 OK、NO_MATCH、NOT_FOUND、STALE、INVALID_ARGUMENT、UNAVAILABLE；失败返回空 items 与 incomplete=true，不泄露底层异常。hasMore 控制续读，incomplete 也可表示提交时已截断。
@@ -428,7 +434,7 @@ v2、模型有效 tools=true 且对应全局权限开启时提供；不依赖记
 
 默认 search 为 Exa → Tavily Keyless，fetch 为本地正文 → Exa → Tavily，只为缺失 URL 尝试后续服务。每次远程尝试 ≤10 秒，整个工具 ≤20 秒并受本轮剩余时间约束；匿名每家每次操作至多尝试一次，按能力记录内存冷却并尊重 Retry-After。安全拒绝、参数错误和停止不降级；自定义及已支持的原生服务失败直接反馈，不静默更换远程供应商。原生模型额外请求共享预算、并发与用量账本。
 
-仅公开 HTTP(S)、80 / 443，连接时 DNS 和每次重定向均校验，最多 5 次重定向；拒绝本机 / 私网 / 元数据及危险地址。正常网页响应解压后 ≤1 MiB，服务响应 ≤2 MiB，不使用浏览器 Cookie、缓存或代理凭证。错误可为 AUTH_REQUIRED / RATE_LIMITED / QUOTA_EXHAUSTED / COOLDOWN / TIME_LIMIT / NETWORK_ERROR / UNSAFE_URL / EMPTY_CONTENT / LOGIN_REQUIRED / CONTENT_TOO_LARGE / UNSUPPORTED_CONTENT / UPSTREAM_ERROR / KEY_UNAVAILABLE，连同实际路径返回；不把业务错误当 NO_MATCH。详细协议与真实实测边界见[规格](../work/web-search/spec.md)和 [QA](../work/web-search/qa.md)。
+仅公开 HTTP(S)、80 / 443，连接时 DNS 和每次重定向均校验，最多 5 次重定向；拒绝本机 / 私网 / 元数据及危险地址。正常网页响应解压后 ≤1 MiB，服务响应 ≤2 MiB，不使用浏览器 Cookie、缓存或代理凭证。错误可为 AUTH_REQUIRED / RATE_LIMITED / QUOTA_EXHAUSTED / COOLDOWN / TIME_LIMIT / NETWORK_ERROR / UNSAFE_URL / EMPTY_CONTENT / LOGIN_REQUIRED / CONTENT_TOO_LARGE / UNSUPPORTED_CONTENT / UPSTREAM_ERROR / KEY_UNAVAILABLE，连同实际路径返回；不把业务错误当 NO_MATCH。详细协议与真实实测边界见[规格](../archive/v0.8.2/web-search/spec.md)和 [QA](../archive/v0.8.2/web-search/qa.md)。
 
 ### 3.3 轮次状态与上下文
 
@@ -452,11 +458,23 @@ v2 状态查询同时覆盖尚未建立轮次的派发收据。运行中返回 a
 
 有可读的已保存审计时，`GET /ai/turns/{requestId}/context` 在原响应 / audit 上增加 `requestContexts` 和 `usage`。沿用原记录存在、清理和解锁检查，读取不建计划、不重放工具、不调用模型；来源正文仍通过现有 preview 接口显式读取。
 
-- `requestContexts:{items,totalRequests,hasMore,nextBeforeAttemptId,limit}`，limit 固定 50。默认最新 50 条 SENT / SETTLED / UNKNOWN 的对应 CHAT 请求，页内升序；`?beforeAttemptId=<本轮 attempt ID>` 读取更早页。关联当前 requestId 及旧原地重试回执，totalRequests 不受分页限制；错误 / 跨轮游标返回 400 `CONTEXT_REQUEST_CURSOR_INVALID`。
-- 每项包含 `attemptId,operationId,ordinal,createdAt,settledAt,state,usageSource`、归一化的 `inputTokens,outputTokens,cacheReadTokens,cacheMissTokens,totalTokens` 及各字段的 `*Complete` 标志，以及 `context`。SENT 未结算时实测字段为 null；部分回报只代表已知下界。
-- `context` 为版本 1 的 `RequestContextAudit` 或 null，字段为 `schemaVersion,estimatorVersion,model,kind,estimatedInputTokens,contextWindow,categories,detailsTruncated`，kind 为 CHAT / NATIVE_WEB。每分类包含 `kind,estimatedTokens,itemCount,items:[{key,name,estimatedTokens}]`；固定类别为 SYSTEM / TOOL_DEFINITIONS / USER / INJECTED_CONTEXT / ASSISTANT / TOOL_CALLS / TOOL_RESULTS / IMAGE / OTHER。
+- `requestContexts:{items,totalRequests,hasMore,nextBeforeAttemptId,limit}`，limit 固定 50。默认最新 50 条 SENT / SETTLED / UNKNOWN 的对应 CHAT / CONTEXT_COMPACT 请求，页内升序；`?beforeAttemptId=<本轮 attempt ID>` 读取更早页。关联当前 requestId 及旧原地重试回执，totalRequests 不受分页限制；错误 / 跨轮游标返回 400 `CONTEXT_REQUEST_CURSOR_INVALID`。
+- 每项包含 `attemptId,operationId,purpose,ordinal,createdAt,settledAt,state,usageSource`、归一化的 `inputTokens,outputTokens,cacheReadTokens,cacheMissTokens,totalTokens` 及各字段的 `*Complete` 标志，以及 `context`。purpose 为 CHAT / CONTEXT_COMPACT；SENT 未结算时实测字段为 null，部分回报只代表已知下界。
+- `context` 为版本 1 的 `RequestContextAudit` 或 null，字段为 `schemaVersion,estimatorVersion,model,kind,estimatedInputTokens,contextWindow,categories,detailsTruncated`，kind 为 CHAT / NATIVE_WEB / CONTEXT_COMPACT。每分类包含 `kind,estimatedTokens,itemCount,items:[{key,name,estimatedTokens}]`；固定类别为 SYSTEM / TOOL_DEFINITIONS / USER / INJECTED_CONTEXT / ASSISTANT / TOOL_CALLS / TOOL_RESULTS / IMAGE / OTHER。
 - 组成是最终请求体的本地估算，明细最多 256 项 / 32 KiB，只含数字、位置与允许的工具名；分类总数 / 合计不因截明细而减少。分项在 UI 标 `≈`，不按实测总量缩放或用来填补缺失实测。旧记录或无法读取的组成返回 null。
-- `usage` 为本轮所有已结算 / UNKNOWN 请求的累计，字段口径与下面的 `cumulative` 相同，包含工具、自动恢复、原生联网及旧原地重试尝试。正在发送的 SENT 请求只进入请求列表，未结算用量不造数；累计不取最后一次 done 的快照代替。
+- `usage` 为本轮所有已结算 / UNKNOWN 请求的累计，字段口径与下面的 `cumulative` 相同，包含工具、自动恢复、原生联网、上下文压缩及旧原地重试尝试。正在发送的 SENT 请求只进入请求列表，未结算用量不造数；累计不取最后一次 done 的快照代替。
+
+#### 3.3.2 上下文管理与压缩（v0.8.3）
+
+管理路径在每次主请求、工具往返和断流续答前预检最终协议请求；HTTP 重试复用同一冻结正文。窗口 W、实际输出 R 与 `M=max(512,floor(W/10))` 得到 `H=W-R-M`，软门槛为 `min(floor(W×thresholdPercent/100),H)`，目标为 `min(floor(W×60%),H)`。自动压缩关闭时仍执行硬预算检查，不自动裁掉必需输入。
+
+历史投影不受前端 500 条驻留或旧 32 轮限制。读取达到 16,384 轮 / 32 MiB / 30 秒保护返回 `413 CONTEXT_SCAN_LIMIT`，单轮步骤超读取范围为 `CONTEXT_HISTORY_SCAN_LIMIT`；不把未读部分当作空历史继续发送。
+
+通用摘要保留 `goal / constraints / decisions / completed / pending / unknown / sources / receipts`。摘要请求关闭工具，只使用本轮同一聊天目标，共用停止、时间、并发和输出预算；校验终态、全部字段、来源和完整写回执，最终视图满足预算后原子发布。原始消息与附件不因压缩删除；软门槛下摘要失败仅在完整原视图仍合法且可容纳时允许继续，硬超限拒绝外发。
+
+主要拒绝码为 `CONTEXT_TOO_LARGE`、`CONTEXT_CHANGED`、`CONTEXT_COMPACTION_STOPPED / CONFLICT / BUDGET / INEFFECTIVE`、`CONTEXT_SUMMARY_INCOMPLETE / INVALID / TOO_LARGE`、`CONTEXT_COVERAGE_TOO_LARGE`、`CONTEXT_STEP_TOO_LARGE` 和 `HISTORY_STORAGE_FULL`；均保持原始历史。存储异常也不能发布半份检查点。已确认业务写入的成功活动先保留，后续步骤存储失败不改写已确认结果。
+
+来源预览仍走既有 POST 接口，只接受该轮 selected 的来源键，最多 5 项、每项 160 码点。新增 CONTINUATION 为聊天加密的有效续接摘要，STEP 为有界加密步骤；旧 SUMMARY 仍指 vault 摘要。预览重新检查截止点、来源版本、generation、权限与记忆边界，变化后返回不可用，不读取任意会话或绕过解锁。
 
 ### 3.4 会话与历史
 
@@ -499,9 +517,9 @@ runtime 响应为 `{sessions:[{sessionId,requestId,status,phase?,paused?,queueCo
 - `GET /ai/sessions/{id}/context-usage`（只读）返回 `{sessionId,current,latest,cumulative,model,contextWindow,outputReserve}`。有 current 时，model / contextWindow 使用该实际主请求冻结的模型与窗口，后续改选不重算旧请求；没有快照时可返回目标会话当前选择的模型窗口，current 仍为 null。outputReserve 仅在有效配置与快照模型匹配时提供；读取失败不清空累计实测。
 - `current:{tokens,categories,estimated,complete,estimatorVersion,model,contextWindow,contextGeneration,historyRevision,requestId,active,summaryRevision}` 是最后一次主模型实际请求及其响应的数值快照。tokens 为 Long，等于最终请求输入组成估算加该次输出；输出优先用供应商回报，否则估算该次文字、思考与调用。estimated 当前为 true，complete=false 表示响应捕获 / 回报不完整的已知下界。summaryRevision 当前为 null。
 - `current.categories:[{kind,tokens}]` 只含正数分类，kind 沿用 SYSTEM / TOOL_DEFINITIONS / USER / INJECTED_CONTEXT / ASSISTANT / TOOL_CALLS / TOOL_RESULTS / IMAGE / OTHER，tokens 为 Long。分类与快照总量同源，合计等于 current.tokens；该次输出加入 ASSISTANT 分类。分类不来自全库正文、浏览器选择的旧请求或累计计费，不保存提示词 / 工具原始数据。
-- 每次主请求（含工具往返、断流续接、新轮次和原地重试）替换输入快照并重新计该次输出。历史、资料、工具结果与协议思考状态仅在实际外发时计入；前次响应若已进入续接输入不重复追加。NATIVE_WEB 辅助请求只记账，不替换主快照。运行时读活跃数值，终态保存同一快照供重启读取；较小请求可降低占用。清理 / 编辑造成历史版本不匹配或上下文换代时旧快照失效；无实际快照返回 null。旧版本仅回退到同轮最后一份 CHAT 请求摘要及其输出，输出缺失为下界。
+- 每次主请求（含工具往返、断流续接、新轮次和原地重试）替换输入快照并重新计该次输出。历史、资料、工具结果与协议思考状态仅在实际外发时计入；前次响应若已进入续接输入不重复追加。NATIVE_WEB / CONTEXT_COMPACT 辅助请求只记账，不替换主快照；压缩后的下一次主请求实际发送时才更新占用。运行时读活跃数值，终态保存同一快照供重启读取；较小请求可降低占用。清理 / 编辑造成历史版本不匹配或上下文换代时旧快照失效；无实际快照返回 null。旧版本仅回退到同轮最后一份 CHAT 请求摘要及其输出，输出缺失为下界。
 - `latest:{requestId,inputTokens,contextWindow,model,cacheReadTokens,outputTokens}` 保留当前代里最近一次回报输入的请求实测或 null，用于请求对账。圆环和顶部使用 `current.tokens / 该快照 contextWindow`，而非多次请求的累计；只有最后请求的输入而缺少该次输出也不是完整占用。图形封顶 100%，总量及实际百分比允许超过窗口。
-- v0.8.2 的 `cumulative:{requests,inputTokens,outputTokens,cacheReadTokens,cacheMissTokens,totalTokens,inputComplete,outputComplete,cacheReadComplete,cacheMissComplete,totalComplete}` 来自持久化账本，包含该会话所有对应 CHAT 的已结算 / UNKNOWN 请求及旧重试回执，排除标题、维护、其它会话和未发送预留。输入归一化后包括缓存读写，total 为输入加输出；OpenAI 包含桶不再相加，Anthropic 独立桶加回。原始计费账本保持。
+- `cumulative:{requests,inputTokens,outputTokens,cacheReadTokens,cacheMissTokens,totalTokens,inputComplete,outputComplete,cacheReadComplete,cacheMissComplete,totalComplete}` 来自持久化账本，包含该会话所有对应 CHAT / CONTEXT_COMPACT 的已结算 / UNKNOWN 请求及旧重试回执，排除标题、长期记忆维护、其它会话和未发送预留。输入归一化后包括缓存读写，total 为输入加输出；OpenAI 包含桶不再相加，Anthropic 独立桶加回。原始计费账本保持。
 - 缺失数字为 null，部分回报仍返回已知 subtotal 并令对应 Complete=false，前端显示 `≥`；没有请求也不造全零。只有累计输入与命中都完整且输入大于 0 才计算命中率。旧缓存口径无法从独立日账本核实时保持未知；上下文换代 / 正文清理不改变已发生的累计，500 条驻留限制不截断统计。聚合使用 Long。
 - 历史助手消息的 `usage` 使用同一份本轮累计和完整性字段，包含旧原地重试尝试；用户消息的 `page:{title,link?}` 保留提交时的业务页面。没有对应请求 / 页面记录时不返回，不补估算。
 

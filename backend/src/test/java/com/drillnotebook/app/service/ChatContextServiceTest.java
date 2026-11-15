@@ -317,8 +317,12 @@ class ChatContextServiceTest {
         String input = "当前问题".repeat(100);
         ChatTurnService.Lease lease = beginTurn(input, null, PASSWORD);
         try {
-            assertThrows(ChatTurnRejectException.class, () -> stack.contexts().plan(lease, input, List.of(),
-                    Map.of(), Map.of("use", false), 600, true, 64));
+            var small = stack.contexts().plan(lease, input, List.of(), Map.of(), Map.of("use", false), 600, true, 64);
+            var client = new AiUpstreamClient(null, new ObjectMapper());
+            var target = new AiUpstreamClient.Upstream("https://example.invalid", "stub-key", "model", "chat_completions", 64, true, false, false);
+            assertThrows(ChatTurnRejectException.class, () -> ContextWindowBudget.of(600, 64,
+                    com.drillnotebook.app.model.AiContextSettings.DEFAULTS).requireFits(
+                    client.prepare(target, small.messages(), List.of(), false, 600, "CHAT").context().estimatedInputTokens()));
             ChatContextPlan plan = stack.contexts().plan(lease, input, List.of(), Map.of(), Map.of("use", false),
                     32000, true, 64);
             assertTrue(serialized(plan).contains(input));

@@ -90,7 +90,7 @@ class ConversationProjectionTest {
     }
 
     @Test
-    void scanStaysBoundedNoMatterHowLongTheHistoryIs() throws Exception {
+    void scansAllHistoryBeyond32RoundsWithinTheWorkGuards() throws Exception {
         seedTurns(60);
         long current = insertRunningTurn();
 
@@ -98,14 +98,10 @@ class ConversationProjectionTest {
         ConversationProjection.Projection result = projection.project(
                 new ConversationProjection.Request(sessionId, current, 1L, "", 2400), audit);
 
-        assertTrue(result.candidates().size() >= 2, "近期区至少要有两轮");
-        assertTrue(result.candidates().size() <= ConversationProjection.MAX_SCANNED_TURNS);
-        assertEquals(ConversationProjection.MAX_SCANNED_TURNS, result.scan().scannedTurns(),
-                "一批 16、单请求最多扫 32：更早的一律不碰（T01）");
-        assertTrue(result.scan().hasOlderUnscanned());
-        // 没有有效摘要时范围外只能报"没扫"，数量必须留空，不能假造"都已总结"
-        assertTrue(hasOmission(audit, result, ContextAudit.Omission.OUTSIDE_SCAN_WINDOW, "HISTORY"));
-        assertNull(omission(audit, result, ContextAudit.Omission.OUTSIDE_SCAN_WINDOW, "HISTORY"));
+        assertEquals(60, result.candidates().size(), "历史不再固定截到 32 轮");
+        assertEquals(60, result.scan().scannedTurns(), "在工作量保护内完整扫描 60 轮");
+        assertFalse(result.scan().hasOlderUnscanned());
+        assertFalse(hasOmission(audit, result, ContextAudit.Omission.OUTSIDE_SCAN_WINDOW, "HISTORY"));
         for (ConversationProjection.Item item : result.candidates()) {
             assertTrue(item.turnId() < current, "本轮正在跑的 RUNNING 轮次不能算自己的历史");
         }

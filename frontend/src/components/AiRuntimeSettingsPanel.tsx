@@ -1,8 +1,8 @@
 import { useCallback, useContext, useEffect, useState } from 'react';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
-import { Button, Message, Modal } from '@arco-design/web-react';
+import { Button, Message, Modal, Switch } from '@arco-design/web-react';
 import { RotateCcw } from 'lucide-react';
-import { DEFAULT_RETRY_SETTINGS, getRuntimeSettings, runtimeFields, runtimeRetrySettings, saveRuntimeSettings, validateRuntimeSettings } from '../lib/aiRuntimeSettings';
+import { DEFAULT_RETRY_SETTINGS, getRuntimeSettings, runtimeFields, runtimeRetrySettings, runtimeContextSettings, saveRuntimeSettings, validateRuntimeSettings } from '../lib/aiRuntimeSettings';
 import type { AiRuntimeSettings, AiRuntimeSettingsView } from '../lib/aiRuntimeSettings';
 import type { SettingsLeaveGuard } from './ai-connections/AiConnectionsPanel';
 import { ConnectionNavigationGuard } from './ai-connections/ConnectionNavigationGuard';
@@ -24,6 +24,7 @@ export function AiRuntimeSettingsPanel({ registerGuard }: { registerGuard?: (gua
   const dirty = !!draft && JSON.stringify(draft) !== JSON.stringify(current?.values);
   const errors = values ? validateRuntimeSettings(values) : {};
   const retry = values ? runtimeRetrySettings(values) : null;
+  const context = values ? runtimeContextSettings(values) : null;
   usePageContextSection('runtime', [
     pageContextRows('运行限制', values ? runtimeFields.map(field => [field.label,
       Number.isFinite(values[field.key]) ? `${values[field.key]}${field.unit ? ` ${field.unit}` : ''}` : '输入无效'
@@ -35,6 +36,11 @@ export function AiRuntimeSettingsPanel({ registerGuard }: { registerGuard?: (gua
       ['断网重试次数', retry.networkPersistent ? undefined : Number.isFinite(retry.networkRetries) ? retry.networkRetries : '输入无效'],
       ['等待策略', '请求与回答从 400 毫秒翻倍等待；断网按 5、10、20、40、60 秒等待，之后保持 60 秒。供应商的有效等待建议优先。'],
       ['保存状态', dirty ? '有未保存的修改' : '已保存；从下一轮对话开始生效']
+    ]) : '',
+    context ? pageContextRows('上下文管理', [
+      ['自动压缩', context.autoCompact ? '开启' : '关闭'],
+      ['压缩阈值', Number.isFinite(context.thresholdPercent) ? `${context.thresholdPercent}%` : '输入无效'],
+      ['策略', '接近模型窗口时总结较早内容，保留近期完整对话与工具结果；原始记录保留。压缩与当前回复共用时间和输出预算。']
     ]) : ''
   ].filter(Boolean).join('\n\n'), dirty);
   const guard = useCallback((go: () => void, stay?: () => void) => {
@@ -84,6 +90,24 @@ export function AiRuntimeSettingsPanel({ registerGuard }: { registerGuard?: (gua
           </div>
           <p id={`runtime-help-${field.key}`} className={errors[field.key] ? 'ai-runtime-error' : ''}>{errors[field.key] ?? field.description}</p>
         </div>)}</div>
+        {context && <fieldset className="ai-runtime-retry"><legend>上下文管理</legend>
+          <div className="ai-runtime-fields">
+            <div className="ai-runtime-field"><label htmlFor="runtime-autoCompact">自动压缩上下文</label>
+              <Switch id="runtime-autoCompact" checked={context.autoCompact} disabled={busy}
+                onChange={checked => edit({ ...values, context: { ...context, autoCompact: checked,
+                  thresholdPercent: Number.isInteger(context.thresholdPercent) && context.thresholdPercent >= 65 && context.thresholdPercent <= 95
+                    ? context.thresholdPercent : 80 } })} />
+              <p>接近模型窗口时总结较早内容，保留近期完整对话和工具结果，原始记录仍可查看。关闭后超出窗口将停止请求。</p>
+            </div>
+            <div className="ai-runtime-field"><label htmlFor="runtime-thresholdPercent">压缩阈值</label>
+              <div className="ai-runtime-input"><input id="runtime-thresholdPercent" type="number" min={65} max={95} step={1}
+                value={Number.isFinite(context.thresholdPercent) ? context.thresholdPercent : ''} disabled={busy || !context.autoCompact}
+                aria-invalid={!!errors.thresholdPercent} aria-describedby="runtime-help-thresholdPercent"
+                onChange={event => edit({ ...values, context: { ...context, thresholdPercent: event.target.value === '' ? NaN : Number(event.target.value) } })} /><span>%</span></div>
+              <p id="runtime-help-thresholdPercent" className={errors.thresholdPercent ? 'ai-runtime-error' : ''}>{errors.thresholdPercent ?? '默认 80%，压缩后目标约 60%；会为本次输出及协议开销预留空间。'}</p>
+            </div>
+          </div>
+        </fieldset>}
         {retry && <fieldset className="ai-runtime-retry"><legend>失败重连</legend>
           <div className="ai-runtime-fields">{([
             ['httpRetries', '请求重试次数', '初始请求之外的重试上限，默认 4 次；设为 0 关闭。'],

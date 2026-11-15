@@ -87,7 +87,7 @@ function RequestContextBrowserBody({ requestId, page }: { requestId: string; pag
         setSelectedId(event.target.value === entries.at(-1)?.attemptId ? null : event.target.value);
       }}>
         {[...entries].reverse().map(item => <option key={item.attemptId} value={item.attemptId}>
-          第 {item.ordinal} 次请求 · {timeOf(item.createdAt)}{item.context?.kind === 'NATIVE_WEB' ? ' · 原生联网' : ''}
+          第 {item.ordinal} 次请求 · {timeOf(item.createdAt)}{item.context?.kind === 'NATIVE_WEB' ? ' · 原生联网' : item.context?.kind === 'CONTEXT_COMPACT' || item.purpose === 'CONTEXT_COMPACT' ? ' · 上下文压缩' : ''}
         </option>)}
         {paging.hasMore ? <option value="older">加载更早请求…</option> : null}
       </select>

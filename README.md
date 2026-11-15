@@ -1,6 +1,6 @@
 # Drill Notebook（面向开发者）
 
-**v0.8.2 已进入发布准备，尚未发布**：笔记混合检索、联网搜索 / 网页读取、原地重试、会话独立选模和上下文统计已实现并通过相关工程验证。范围与验证见[当前功能清单](docs/state/v0.8.2-features.md)，发行产物与升级说明见[v0.8.2 说明](docs/release/v0.8.2-release-notes.md)；云端与本地打包默认版本已同步为 v0.8.2。[v0.8.1 说明](docs/release/v0.8.1-release-notes.md)继续保留；v0.8.0 相关材料已[归档](docs/archive/v0.8.0/README.md)。**v1.0 之前的所有版本均为不保证稳定性的预发行版。**
+**当前开发版本 v0.8.3，已实现上下文管理与压缩，工程验证通过**：统一加密工具步骤、模型窗口预算、最终请求预检与续接摘要；自动压缩默认 80% 触发、目标约 60%。范围见[当前功能清单](docs/state/v0.8.3-features.md)，机制见[上下文管理规格](docs/work/ai-context-management/spec.md)。v0.8.2 的清单、施工文档和草图已[归档](docs/archive/v0.8.2/README.md)，已验证能力与边界保留，[发行说明](docs/release/v0.8.2-release-notes.md)继续原位维护。**v1.0 之前的所有版本均为不保证稳定性的预发行版。**
 
 | 项 | 说明 |
 |---|---|
@@ -243,11 +243,24 @@
 | **联网服务与入口** | 工具页独立选搜索 / 读取服务，Tavily / TinyFish 共用各自加密密钥，可保存 / 取消 / 测试；助手附件旁的地球按钮控制同一对全局权限 |
 | **原生 Web 优先与安全** | 默认关闭；按官方端点 / 型号分别判断能力，共享预算与用量账本；限制公开 URL、DNS、重定向、响应与时间 |
 
-上述笔记检索能力已实现并通过工程验证；范围见[本版清单](docs/state/v0.8.2-features.md)，结果见[QA](docs/test/QA_CHECKLIST.md#模块三十三笔记混合检索接入资料工具v082)。复用既有授权与 APP_ROOT 落点，不承诺未经实测的准确度或 Token 节省幅度。
+上述笔记检索能力已实现并通过工程验证；范围见[本版清单](docs/archive/v0.8.2/features.md)，结果见[QA](docs/test/QA_CHECKLIST.md#模块三十三笔记混合检索接入资料工具v082)。复用既有授权与 APP_ROOT 落点，不承诺未经实测的准确度或 Token 节省幅度。
 
-联网 F02 已完成工程验证与真实匿名搜索 / 抓取探测，构建及便携审计通过；配置保存于 schema 19 的便携数据库。工具设置、助手地球按钮与草图见 [UI/UX](docs/work/web-search/ui-ux.md)，原生能力矩阵见[规格](docs/work/web-search/spec.md)，测试与真实账户 / 实机边界见 [QA](docs/work/web-search/qa.md)。匿名额度与网络条件可能变化，不承诺固定用量或持续可用性。
+联网 F02 已完成工程验证与真实匿名搜索 / 抓取探测，构建及便携审计通过；配置保存于 schema 19 的便携数据库。工具设置、助手地球按钮与草图见 [UI/UX](docs/archive/v0.8.2/web-search/ui-ux.md)，原生能力矩阵见[规格](docs/archive/v0.8.2/web-search/spec.md)，测试与真实账户 / 实机边界见 [QA](docs/archive/v0.8.2/web-search/qa.md)。匿名额度与网络条件可能变化，不承诺固定用量或持续可用性。
 
-### 1.19 明确后置（未作为当前目标）
+### 1.19 v0.8.3（上下文管理与窗口压缩）
+
+| 功能 | 说明 |
+|---|---|
+| **统一模型上下文** | 原始历史、发送视图、最后实际主请求快照与累计用量分开；取消管理路径的固定 32 轮与 Token 裁剪 |
+| **工具证据与来源** | 有界调用 / 结果配对加密保存，保留来源版本与确认回执；原地重试、恢复、清理和授权撤回使相关派生状态失效 |
+| **自动压缩** | 默认开启，阈值 80%（65–95% 可设），目标约 60%；保留必要输入和近期完整内容，摘要校验后原子发布，失败保留原历史 |
+| **配置与进度** | 设置 → AI 对话 → 运行限制 → 上下文管理；原回复处显示压缩进度，现有停止入口有效 |
+| **占用与计费** | 压缩只改变后续发送视图，辅助请求进入会话累计；圆环仍为最后实际主请求及该次输出 / 模型窗口 |
+| **存储与兼容** | schema 22 的步骤 / 检查点 / 租约使用便携数据库和聊天加密，续接独立于长期记忆 |
+
+机制与实现见[规格](docs/work/ai-context-management/spec.md)、[实现说明](docs/work/ai-context-management/implementation.md)及[本版清单](docs/state/v0.8.3-features.md)，结果见[验证记录](docs/work/ai-context-management/qa.md)。发布配置继续保持 v0.8.2；真实供应商摘要质量、缓存和实机体验另行验收。
+
+### 1.20 明确后置（未作为当前目标）
 
 当前 MVP 核心闭环、后续方向与长期 Non-Goals 见[全局功能清单](docs/features.md)。v0.8.0 的[实现清单](docs/archive/v0.8.0/features.md)已归档；v0.8.1 的[失败重连、会话跳转与模型选择](docs/state/v0.8.1-features.md)已完成工程验证。v0.8.2 的笔记检索接入与联网搜索已实现；长期记忆向量化、移动与批量删除仍为后续方向。
 
@@ -394,7 +407,7 @@
 7. **笔记本检索（v0.8.2 接入工具）**：模型支持工具且开启 search_materials 时，助手按需用自然语言混合检索笔记，返回片段与来源；需要前后文再按 ID 读取，精确查找可用 keyword。向量来源在「设置 → 嵌入与检索」主动启用，未配置时用 BM25，不自动下载模型；远程 embedding 继续需要授权（见[检索说明](docs/reference/ai-retrieval.md)）。
 8. **长期记忆与工具**：开启记忆且模型支持工具时，助手可按需检索、列出、新增和更新记忆；回复内的工具活动组显示执行中、成功、失败或未执行等真实状态，可展开安全摘要并在历史中恢复。删除来源会话不删除长期记忆。
 9. **阅读与长轮次**：流式生成期间向上滚动会暂停自动跟随，回到底部后恢复；达到运行限制会保留已有结果并说明原因，「继续」开启同会话新一轮。独立助手窗口全局选择模型与支持的思考档位，已受理的轮次保留提交时配置。
-10. **联网工具（v0.8.2）**：附件旁地球按钮控制联网；在「设置 → 工具」分别启停搜索 / 网页读取、选择免配置内置自动或自定义 Tavily / TinyFish、测试连接。模型按需调用，不强制每轮联网；原生 Web 优先默认关闭，支持范围见[规格](docs/work/web-search/spec.md#原生联网支持矩阵)。
+10. **联网工具（v0.8.2）**：附件旁地球按钮控制联网；在「设置 → 工具」分别启停搜索 / 网页读取、选择免配置内置自动或自定义 Tavily / TinyFish、测试连接。模型按需调用，不强制每轮联网；原生 Web 优先默认关闭，支持范围见[规格](docs/archive/v0.8.2/web-search/spec.md#原生联网支持矩阵)。
 
 ### 2.11 设置
 
@@ -534,7 +547,10 @@ python scripts/seed-test-bank.py  # 造题种子（v0.5+）
 |---|---|
 | [docs/README.md](docs/README.md) | 文档体系、更新规则与归档约定 |
 | [docs/features.md](docs/features.md) | 全局功能清单：已交付能力、后续方向与长期边界，发布前同步 |
-| [docs/state/v0.8.2-features.md](docs/state/v0.8.2-features.md) | 当前 v0.8.2：笔记混合检索与联网工具已实现，工程验证通过 |
+| [docs/state/v0.8.3-features.md](docs/state/v0.8.3-features.md) | 当前 v0.8.3：统一上下文管理、窗口阈值压缩与验证状态 |
+| [docs/work/ai-context-management/spec.md](docs/work/ai-context-management/spec.md) | 上下文管理、预算、工具证据与压缩的现行规格 |
+| [docs/work/ai-context-management/qa.md](docs/work/ai-context-management/qa.md) | v0.8.3 工程回归、构建、便携与启动验证记录 |
+| [docs/archive/v0.8.2/README.md](docs/archive/v0.8.2/README.md) | v0.8.2 清单、施工材料、草图及历史验证归档 |
 | [docs/state/v0.8.1-features.md](docs/state/v0.8.1-features.md) | v0.8.1 功能清单与既有验证：失败重连、会话跳转与助手模型持久化 |
 | [docs/state/data-model.md](docs/state/data-model.md) | 已落地数据模型与关键约束（schema 19） |
 | [docs/state/api-contracts.md](docs/state/api-contracts.md) | 核心 REST / SSE 契约与错误格式 |

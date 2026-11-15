@@ -26,7 +26,15 @@ public class ChatHistoryRepository {
                               String contentDeletedAt, String startedAt, String finishedAt,
                               Long userMessageId, String userContent, String userContentCipher, String userContentMeta,
                               Long assistantMessageId, String assistantContent, String assistantContentCipher,
-                              String assistantContentMeta) {
+                              String assistantContentMeta, long sourceRevision) {
+        public TurnHistory(long turnId, String requestId, String status, long contextGeneration,
+                           String contentDeletedAt, String startedAt, String finishedAt,
+                           Long userMessageId, String userContent, String userContentCipher, String userContentMeta,
+                           Long assistantMessageId, String assistantContent, String assistantContentCipher, String assistantContentMeta) {
+            this(turnId, requestId, status, contextGeneration, contentDeletedAt, startedAt, finishedAt,
+                    userMessageId, userContent, userContentCipher, userContentMeta, assistantMessageId, assistantContent,
+                    assistantContentCipher, assistantContentMeta, 1);
+        }
     }
 
     /** 附件身份（不含密文）：投影据此判断"哪几轮有可重放的图片"。 */
@@ -45,7 +53,7 @@ public class ChatHistoryRepository {
                              boolean legacy, String resultMetaCipher, String resultMetaCrypto) {
     }
 
-    private static final String TURN_SELECT = "SELECT t.id, t.request_id, t.status, t.context_generation,"
+    private static final String TURN_SELECT = "SELECT t.id, t.request_id, t.status, t.context_generation, t.source_revision,"
             + " t.content_deleted_at, t.started_at, t.finished_at,"
             + " u.id AS u_id, u.content AS u_content, u.content_cipher AS u_cipher, u.content_meta AS u_meta,"
             + " a.id AS a_id, a.content AS a_content, a.content_cipher AS a_cipher, a.content_meta AS a_meta";
@@ -91,7 +99,7 @@ public class ChatHistoryRepository {
                             result.getString("u_content"), result.getString("u_cipher"),
                             result.getString("u_meta"), nullableLong(result, "a_id"),
                             result.getString("a_content"), result.getString("a_cipher"),
-                            result.getString("a_meta")));
+                            result.getString("a_meta"), result.getLong("source_revision")));
                 }
             }
             return rows;
@@ -371,6 +379,38 @@ public class ChatHistoryRepository {
                 }
             }
             return rows;
+        }
+    }
+
+    public static com.drillnotebook.app.model.ContextSource legacySource(LegacyMessage user, LegacyMessage assistant) {
+        String id = user.messageId() + ":" + assistant.messageId();
+        var identity = new StringBuilder();
+        for (LegacyMessage row : List.of(user, assistant)) for (String value : new String[]{String.valueOf(row.messageId()), row.role(),
+                row.content(), row.contentCipher(), row.contentMeta(), row.createdAt()}) {
+            identity.append(value == null ? -1 : value.length()).append(':'); if (value != null) identity.append(value);
+        }
+        return new com.drillnotebook.app.model.ContextSource("LEGACY", id, 0, id, 1,
+                com.drillnotebook.app.service.ChatContextEntryService.fingerprint(identity.toString()));
+    }
+
+    static boolean legacySourceMatchesIn(Connection connection, long sessionId, com.drillnotebook.app.model.ContextSource source) throws SQLException {
+        var ids = source.id().split(":");
+        if (ids.length != 2) return false;
+        long userId, assistantId;
+        try { userId = Long.parseLong(ids[0]); assistantId = Long.parseLong(ids[1]); } catch (NumberFormatException error) { return false; }
+        try (var statement = connection.prepareStatement("SELECT id, role, content, content_cipher, content_meta, created_at FROM ai_chat_message WHERE session_id = ? AND turn_id IS NULL AND id IN (?, ?) ORDER BY id")) {
+            statement.setLong(1, sessionId); statement.setLong(2, userId); statement.setLong(3, assistantId);
+            var rows = new java.util.ArrayList<LegacyMessage>();
+            try (var result = statement.executeQuery()) { while (result.next()) rows.add(new LegacyMessage(result.getLong(1), result.getString(2), result.getString(3), result.getString(4), result.getString(5), result.getString(6))); }
+            return rows.size() == 2 && rows.get(0).messageId() == userId && rows.get(1).messageId() == assistantId
+                    && "user".equals(rows.get(0).role()) && "assistant".equals(rows.get(1).role()) && legacySource(rows.get(0), rows.get(1)).equals(source);
+        }
+    }
+
+    public long messageCutoffOfTurn(long sessionId, long turnId) throws SQLException {
+        try (var connection = dataSource.getConnection(); var statement = connection.prepareStatement("SELECT user_message_id FROM ai_chat_turn WHERE id = ? AND session_id = ?")) {
+            statement.setLong(1, turnId); statement.setLong(2, sessionId);
+            try (var result = statement.executeQuery()) { return result.next() && result.getLong(1) > 0 ? result.getLong(1) : maxMessageId(sessionId) + 1; }
         }
     }
 

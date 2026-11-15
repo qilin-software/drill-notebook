@@ -27,13 +27,10 @@ import org.springframework.stereotype.Component;
 @Component
 public class ChatContextAssembler {
     /** 区域上限（§9.2 的工程默认值，估算 Token）。 */
-    public static final int SYSTEM_BUDGET = 600;
     public static final int MEMORY_BUDGET = 240;
     public static final int SESSION_STATE_BUDGET = 600;
-    public static final int RECENT_TURNS_BUDGET = 2400;
     public static final int PAGE_BUDGET = 1000;
     public static final int RAG_BUDGET = 1800;
-    public static final int USER_TEXT_BUDGET = 2000;
     public static final int TEXT_ATTACHMENT_BUDGET = 1000;
     /** 笔记片段最多 8 个（§4.5），超出在 fit 阶段标 ITEM_LIMIT。 */
     public static final int MAX_RAG_ITEMS = 8;
@@ -72,7 +69,13 @@ public class ChatContextAssembler {
 
     /** 一轮近期对话（user + assistant 成对），带可选的历史图片。 */
     public record Turn(Long turnId, boolean legacy, Long userMessageId, Long assistantMessageId, String userText,
-                       String assistantText, List<Image> images, int estimatedTokens,List<ChatSupplement> supplements) {
+                        String assistantText, List<Image> images, int estimatedTokens,List<ChatSupplement> supplements,
+                        List<ChatContextEntryService.Step> steps, long sourceRevision, String requestId) {
+        public Turn(Long turnId, boolean legacy, Long userMessageId, Long assistantMessageId, String userText,
+                    String assistantText, List<Image> images, int estimatedTokens, List<ChatSupplement> supplements) {
+            this(turnId, legacy, userMessageId, assistantMessageId, userText, assistantText, images, estimatedTokens,
+                    supplements, List.of(), 1, "");
+        }
         public Turn(Long turnId,boolean legacy,Long userMessageId,Long assistantMessageId,String userText,String assistantText,List<Image> images,int estimatedTokens){
             this(turnId,legacy,userMessageId,assistantMessageId,userText,assistantText,images,estimatedTokens,List.of());
         }
@@ -302,7 +305,8 @@ public class ChatContextAssembler {
                     : imagesByTurn.getOrDefault(item.turnId(), List.of());
             int estimated = item.estimatedTokens() + 2 * TokenEstimator.MESSAGE_OVERHEAD_TOKENS;
             turns.add(new Turn(item.legacy() ? null : item.turnId(), item.legacy(), item.userMessageId(),
-                    item.assistantMessageId(), item.userText(), item.assistantText(), images, estimated,item.supplements()));
+                    item.assistantMessageId(), item.userText(), item.assistantText(), images, estimated, item.supplements(),
+                    item.steps(), item.sourceRevision(), item.requestId() == null ? "" : item.requestId()));
         }
         return List.copyOf(turns);
     }
