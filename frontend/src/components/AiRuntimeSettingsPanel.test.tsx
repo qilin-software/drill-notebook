@@ -19,6 +19,27 @@ beforeEach(() => { vi.clearAllMocks(); getSettings.mockResolvedValue(view);
   saveSettings.mockImplementation(async (revision, values) => ({ revision: revision + 1, values, defaults })); });
 
 describe('全局 AI 调用预算', () => {
+  it('旧设置默认开启 80% 压缩，独立校验和保存阈值', async () => {
+    mount();
+    const threshold = await screen.findByRole('spinbutton', { name: '压缩阈值' });
+    expect(threshold).toHaveValue(80);
+    expect(screen.getByRole('switch', { name: '自动压缩上下文' })).toBeChecked();
+    fireEvent.change(threshold, { target: { value: '64' } });
+    expect(screen.getByRole('button', { name: '保存' })).toBeDisabled();
+    fireEvent.change(threshold, { target: { value: '85' } });
+    fireEvent.click(screen.getByRole('button', { name: '保存' }));
+    await waitFor(() => expect(saveSettings).toHaveBeenCalledWith(4, { ...view.values, context: { autoCompact: true, thresholdPercent: 85 } }));
+  });
+  it('关闭压缩后禁用阈值，未完成的空值不会锁住保存', async () => {
+    mount();
+    const threshold = await screen.findByRole('spinbutton', { name: '压缩阈值' });
+    fireEvent.change(threshold, { target: { value: '' } });
+    fireEvent.click(screen.getByRole('switch', { name: '自动压缩上下文' }));
+    expect(threshold).toBeDisabled();
+    expect(screen.getByRole('button', { name: '保存' })).toBeEnabled();
+    fireEvent.click(screen.getByRole('button', { name: '保存' }));
+    await waitFor(() => expect(saveSettings).toHaveBeenCalledWith(4, { ...view.values, context: { autoCompact: false, thresholdPercent: 80 } }));
+  });
   it('切回持续等待后隐藏的无效次数不会锁住保存', async () => {
     mount();
     const mode = await screen.findByLabelText('断网等待');

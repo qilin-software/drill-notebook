@@ -33,7 +33,7 @@ import org.springframework.stereotype.Service;
  * <p>四条硬规则：</p>
  * <ul>
  *   <li>只排除被<b>有效 coverage</b> 替代的原轮次，绝不按 {@code through_turn_id} 一刀切；</li>
- *   <li>一批最多 16 轮、单请求最多扫 32 轮，更早的内容只能由有效检查点代表，不做全量读取再过滤；</li>
+ *   <li>一批最多 16 轮，分页读取有时间、字节与工作量保护；没有有效摘要时保留连续的合格历史；</li>
  *   <li>本轮正在跑的 RUNNING 轮次不算自己的历史——当前用户输入由请求单独放最后；</li>
  *   <li>coverage 也不能把最近 2 个完整轮次整段替掉（§9.2 近期区目标）。</li>
  * </ul>
@@ -45,8 +45,10 @@ import org.springframework.stereotype.Service;
 public class ConversationProjection {
     /** 一批最多 16 轮（§7.2.2 尾段）。 */
     public static final int BATCH_TURNS = 16;
-    /** 单请求最多扫 32 轮。 */
-    public static final int MAX_SCANNED_TURNS = 32;
+    /** Resource guard, not a model retention policy. Hitting it produces an explicit gap error. */
+    public static final int MAX_SCANNED_TURNS = 16384;
+    private static final long MAX_SCAN_BYTES = 32L * 1024 * 1024;
+    private static final long MAX_SCAN_NANOS = java.util.concurrent.TimeUnit.SECONDS.toNanos(30);
     /** 摘要加密 payload 明文上限（§2.5）：超过就不信任这份检查点。 */
     static final int MAX_SUMMARY_PAYLOAD_BYTES = 32 * 1024;
     /** coverage 段数上限（§2.5）：超了旧检查点失效，从当前窗口重建并标缺口。 */
@@ -60,13 +62,23 @@ public class ConversationProjection {
 
     /** 一次投影所需的最小上下文：本轮 turnId 之前的历史才可能是候选。 */
     public record Request(long sessionId, long currentTurnId, long contextGeneration, String masterPassword,
-                          int recentTokenBudget) {
+                          int recentTokenBudget, boolean memoriesAllowed) {
+        public Request(long sessionId, long currentTurnId, long contextGeneration, String masterPassword, int recentTokenBudget) {
+            this(sessionId, currentTurnId, contextGeneration, masterPassword, recentTokenBudget, true);
+        }
     }
 
     /** 一条候选：正文已解密，附件只带身份（要不要取密文由组装器按图片策略决定）。 */
     public record Item(long turnId, String requestId, boolean legacy, Long userMessageId, Long assistantMessageId,
                        String userText, String assistantText, List<AttachmentStub> attachments, String startedAt,
-                       int estimatedTokens, List<ChatSupplement> supplements) {
+                       int estimatedTokens, List<ChatSupplement> supplements,
+                       List<ChatContextEntryService.Step> steps, long sourceRevision) {
+        public Item(long turnId, String requestId, boolean legacy, Long userMessageId, Long assistantMessageId,
+                    String userText, String assistantText, List<AttachmentStub> attachments, String startedAt,
+                    int estimatedTokens, List<ChatSupplement> supplements) {
+            this(turnId, requestId, legacy, userMessageId, assistantMessageId, userText, assistantText,
+                    attachments, startedAt, estimatedTokens, supplements, List.of(), 1);
+        }
         public Item(long turnId,String requestId,boolean legacy,Long userMessageId,Long assistantMessageId,
                     String userText,String assistantText,List<AttachmentStub> attachments,String startedAt,int estimatedTokens){
             this(turnId,requestId,legacy,userMessageId,assistantMessageId,userText,assistantText,attachments,startedAt,estimatedTokens,List.of());
@@ -83,7 +95,12 @@ public class ConversationProjection {
     /** 投影结果：候选按时间升序，外加扫描范围、有效摘要、中断态与会话版本。 */
     public record Projection(List<Item> candidates, ContextAudit.Scan scan, SummaryView summary,
                              ContextAudit.ResumeState resumeState, List<String> notices, long historyRevision,
-                             List<Item> coveredCandidates, Long observedSummaryRevision) {
+                             List<Item> coveredCandidates, Long observedSummaryRevision, Long observedContinuationRevision) {
+        public Projection(List<Item> candidates, ContextAudit.Scan scan, SummaryView summary,
+                          ContextAudit.ResumeState resumeState, List<String> notices, long historyRevision,
+                          List<Item> coveredCandidates, Long observedSummaryRevision) {
+            this(candidates, scan, summary, resumeState, notices, historyRevision, coveredCandidates, observedSummaryRevision, null);
+        }
     }
 
     /** 扫描中间态：候选 + 各类排除的计数，最后统一进审计。 */
@@ -100,6 +117,9 @@ public class ConversationProjection {
         private int completeSeen;
         private int rowsRead;
         private Long oldestScannedTurn;
+        private long bytes;
+        private final long deadline = System.nanoTime() + MAX_SCAN_NANOS;
+        private boolean legacyExhausted;
     }
 
     private final ChatHistoryRepository history;
@@ -112,6 +132,14 @@ public class ConversationProjection {
     private final MemoryPolicyService policy;
     private final TokenEstimator estimator;
     private final ObjectMapper mapper;
+    private ChatContextEntryService entries;
+    private ContextCoordinator coordinator;
+
+    @org.springframework.beans.factory.annotation.Autowired
+    public void setContextEntries(ChatContextEntryService entries) { this.entries = entries; }
+
+    @org.springframework.beans.factory.annotation.Autowired
+    public void setContextCoordinator(ContextCoordinator coordinator) { this.coordinator = coordinator; }
 
     public ConversationProjection(ChatHistoryRepository history, SessionContextRepository checkpoints,
                                   ChatSessionMetadataRepository sessions, ChatMessageCipher cipher,
@@ -137,16 +165,21 @@ public class ConversationProjection {
         List<String> notices = new ArrayList<>();
         long historyRevision = sessions.read(request.sessionId())
                 .map(ChatSessionMetadataRepository.State::historyRevision).orElse(0L);
+        Long continuationRevision = coordinator == null ? null : coordinator.revision(request.sessionId());
+        var continuation = coordinator == null ? null : coordinator.load(request.sessionId(), request.contextGeneration(),
+                policy.current().revision(), request.currentTurnId(), request.masterPassword(), request.memoriesAllowed()).orElse(null);
         // 观测到的检查点版本与实际采用的摘要分开记：无效/锁定摘要降级成"没有摘要"时，
         // 发送前复核仍要能发现检查点真的被替换过（§4.5）
         Optional<SessionContextRepository.Checkpoint> checkpoint = checkpoints.read(request.sessionId());
         Long observedSummaryRevision = checkpoint.map(SessionContextRepository.Checkpoint::revision).orElse(null);
-        SummaryView summaryView = readSummary(request, checkpoint, audit, notices);
+        // Legacy vault checkpoints remain readable through their old API; the new chat-domain view
+        // is rebuilt from real sources without extending vault unlock/consent to migrate a summary.
+        SummaryView summaryView = entries == null ? readSummary(request, checkpoint, audit, notices) : null;
         ContextAudit.Summary covered = summaryView == null ? null : summaryView.audit();
 
-        Scan scan = scanTurns(request, covered);
-        if (request.contextGeneration() == 1 && !enough(scan.newestFirst, request.recentTokenBudget())) {
-            appendLegacy(request, scan, audit);
+        Scan scan = scanTurns(request, covered, continuation);
+        if (request.contextGeneration() == 1) {
+            appendLegacy(request, scan, audit, continuation);
         }
         List<Item> candidates = withAttachmentIdentities(scan.newestFirst);
         Collections.reverse(candidates);
@@ -179,11 +212,11 @@ public class ConversationProjection {
         boolean hasOlder = hasOlder(request, scan);
         ContextAudit.Scan window = new ContextAudit.Scan(firstTurnId, lastTurnId, scan.rowsRead, hasOlder);
         return new Projection(List.copyOf(candidates), window, summaryView, resumeState(request),
-                List.copyOf(notices), historyRevision, List.copyOf(coveredCandidates), observedSummaryRevision);
+                List.copyOf(notices), historyRevision, List.copyOf(coveredCandidates), observedSummaryRevision, continuationRevision);
     }
 
-    /** 倒序有界扫描：早停在"近期区已经填满"，而不是把所有历史读出来再挑。 */
-    private Scan scanTurns(Request request, ContextAudit.Summary summary) throws SQLException {
+    /** 倒序分页扫描：有效 coverage 不解密；工作量保护触发时明确拒绝有缺口的发送。 */
+    private Scan scanTurns(Request request, ContextAudit.Summary summary, ContextCoordinator.Loaded continuation) throws SQLException {
         Scan scan = new Scan();
         long cursor = request.currentTurnId();
         int remaining = MAX_SCANNED_TURNS;
@@ -197,6 +230,10 @@ public class ConversationProjection {
             scan.oldestScannedTurn = cursor;
             for (int index = 0; index < batch.size(); index++) {
                 TurnHistory row = batch.get(index);
+                scan.bytes += com.drillnotebook.app.repository.ChatStorageSizer.storedBytes(row.userContent(), row.userContentCipher(), row.userContentMeta(),
+                        row.assistantContent(), row.assistantContentCipher(), row.assistantContentMeta());
+                if (scan.bytes > MAX_SCAN_BYTES || System.nanoTime() > scan.deadline)
+                    throw scanLimit();
                 if (row.contextGeneration() != request.contextGeneration()) {
                     // 切过作用域的旧正文永远不再进新代次的上下文（§2.2）
                     scan.wrongGeneration++;
@@ -212,6 +249,7 @@ public class ConversationProjection {
                     scan.unfinished++;
                     continue;
                 }
+                if (continuation != null && continuation.coversTurn(row.turnId())) { scan.covered++; continue; }
                 // 先解密再判去留：坏行要如实计入 SOURCE_CHANGED，不能因为"反正被摘要替了"就当它不存在
                 String userText;
                 String assistantText;
@@ -227,8 +265,11 @@ public class ConversationProjection {
                     continue;
                 }
                 Item item;
-                try { item=itemOf(row,userText,assistantText,request); }
+                try { item=itemOf(row,userText,assistantText,request, continuation); }
                 catch(ChatCryptoException error){scan.unreadable++;continue;}
+                scan.bytes += item.steps().stream().mapToLong(s -> s.entry().bytes()).sum()
+                        + item.supplements().stream().mapToLong(s -> s.contextText().getBytes(StandardCharsets.UTF_8).length).sum();
+                if (scan.bytes > MAX_SCAN_BYTES || System.nanoTime() > scan.deadline) throw scanLimit();
                 scan.completeSeen++;
                 // 最近两条完整轮次永远留原文：摘要替掉它们会让近期区凭空消失（T02）
                 if (isCovered(summary, row.turnId()) && scan.completeSeen > MIN_RECENT_TURNS) {
@@ -240,69 +281,60 @@ public class ConversationProjection {
                 scan.newestFirst.add(item);
             }
             if (batch.size() < limit) break;
-            if (enough(scan.newestFirst, request.recentTokenBudget())) break;
         }
+        if (remaining == 0 && history.hasOlderTurn(request.sessionId(), cursor)) throw scanLimit();
         return scan;
     }
 
-    private Item itemOf(TurnHistory row, String userText, String assistantText,Request request) throws SQLException {
+    private Item itemOf(TurnHistory row, String userText, String assistantText,Request request, ContextCoordinator.Loaded continuation) throws SQLException {
         var supplements=history.supplements(row.requestId(),cipher,request.masterPassword());
+        var steps = entries == null ? List.<ChatContextEntryService.Step>of() : entries.read(row.turnId(), request.masterPassword(),
+                continuation == null ? java.util.Set.of() : continuation.coveredEntries());
         return new Item(row.turnId(), row.requestId(), false, row.userMessageId(),
                 row.assistantMessageId(), userText, assistantText, List.of(), row.startedAt(),
                 estimator.estimateText(userText) + estimator.estimateText(assistantText)
-                        +supplements.stream().mapToInt(s->estimator.estimateText(s.contextText())).sum(),supplements);
+                        +supplements.stream().mapToInt(s->estimator.estimateText(s.contextText())).sum()
+                        +steps.stream().mapToInt(s->s.entry().estimatedTokens()).sum(), supplements, steps, row.sourceRevision());
     }
 
-    /** 只在初始 generation 补 legacy（§2.2：切过作用域后旧正文不再自动带入上下文）。 */
-    private void appendLegacy(Request request, Scan scan, ContextAudit.Builder audit) throws SQLException {
-        int remaining = Math.max(0, MAX_SCANNED_TURNS - scan.rowsRead);
-        if (remaining == 0) return;
-        List<LegacyMessage> rows = history.legacyBatch(request.sessionId(),
-                history.maxMessageId(request.sessionId()) + 1, remaining * 2);
-        if (rows.isEmpty()) return;
-        Collections.reverse(rows);
-        List<Item> items = new ArrayList<>();
-        for (int index = 0; index < rows.size() && items.size() < remaining; index++) {
-            LegacyMessage message = rows.get(index);
-            if (!"user".equals(message.role())) {
-                scan.legacyIncomplete++;
-                continue;
+    /** Legacy pairs are paged backwards with the same work guards and precise encrypted-source identities. */
+    private void appendLegacy(Request request, Scan scan, ContextAudit.Builder audit, ContextCoordinator.Loaded continuation) throws SQLException {
+        long cursor = history.messageCutoffOfTurn(request.sessionId(), request.currentTurnId());
+        LegacyMessage reply = null;
+        int inspected = 0;
+        while (inspected < MAX_SCANNED_TURNS * 2 - scan.rowsRead * 2) {
+            List<LegacyMessage> rows = history.legacyBatch(request.sessionId(), cursor, BATCH_TURNS * 2);
+            if (rows.isEmpty()) { scan.legacyExhausted = true; break; }
+            inspected += rows.size();
+            cursor = rows.get(rows.size() - 1).messageId();
+            for (LegacyMessage message : rows) {
+                scan.bytes += com.drillnotebook.app.repository.ChatStorageSizer.storedBytes(message.content(), message.contentCipher(), message.contentMeta());
+                if (scan.bytes > MAX_SCAN_BYTES || System.nanoTime() > scan.deadline) throw scanLimit();
+                if ("assistant".equals(message.role())) {
+                    if (reply != null) scan.legacyIncomplete++;
+                    reply = message;
+                    continue;
+                }
+                if (!"user".equals(message.role()) || reply == null) { scan.legacyIncomplete++; reply = null; continue; }
+                var pairReply = reply;
+                reply = null;
+                var source = ChatHistoryRepository.legacySource(message, pairReply);
+                if (continuation != null && continuation.keys().contains(source.key())) { scan.covered++; continue; }
+                String userText, assistantText;
+                try { userText = readLegacy(message, request); assistantText = readLegacy(pairReply, request); }
+                catch (ChatCryptoException error) { scan.unreadable++; continue; }
+                if (userText == null || userText.isBlank() || assistantText == null || assistantText.isBlank()) { scan.legacyIncomplete++; continue; }
+                scan.newestFirst.add(new Item(0, source.fingerprint(), true, message.messageId(), pairReply.messageId(), userText, assistantText,
+                        List.of(), pairReply.createdAt(), estimator.estimateText(userText) + estimator.estimateText(assistantText)));
             }
-            if (index + 1 >= rows.size() || !"assistant".equals(rows.get(index + 1).role())) {
-                scan.legacyIncomplete++;
-                continue;
-            }
-            LegacyMessage reply = rows.get(++index);
-            String userText;
-            String assistantText;
-            try {
-                userText = readLegacy(message, request);
-                assistantText = readLegacy(reply, request);
-            } catch (ChatCryptoException error) {
-                scan.unreadable++;
-                continue;
-            }
-            if (userText == null || userText.isBlank() || assistantText == null || assistantText.isBlank()) {
-                scan.legacyIncomplete++;
-                continue;
-            }
-            items.add(new Item(0, null, true, message.messageId(), reply.messageId(), userText, assistantText,
-                    List.of(), reply.createdAt(),
-                    estimator.estimateText(userText) + estimator.estimateText(assistantText)));
+            if (rows.size() < BATCH_TURNS * 2) { scan.legacyExhausted = true; break; }
         }
-        if (rows.size() >= remaining * 2) {
-            // 一次取满说明更早处还有旧消息：范围外数量不知道，只报"没扫"
-            audit.omit(ContextAudit.Omission.OUTSIDE_SCAN_WINDOW, "LEGACY", null);
-        }
-        // newestFirst 全程是"新→旧"：legacy 是最旧的一批，只能倒着接到尾部，
-        // 否则末尾整体反转后会跑到最新的位置上，模型会把迁移前的旧对话当成刚刚发生过
-        for (int index = items.size() - 1; index >= 0; index--) {
-            scan.newestFirst.add(items.get(index));
-        }
-        scan.rowsRead += items.size();
+        if (!scan.legacyExhausted && !history.legacyBatch(request.sessionId(), cursor, 1).isEmpty()) throw scanLimit();
+        scan.legacyExhausted = true;
+        if (reply != null) scan.legacyIncomplete++;
+        scan.rowsRead += inspected;
     }
 
-    /** 一批取回候选的附件身份：一次查询，不逐轮打 SQL。 */
     private List<Item> withAttachmentIdentities(List<Item> newestFirst) {
         List<Long> turnIds = new ArrayList<>();
         for (Item item : newestFirst) {
@@ -324,7 +356,7 @@ public class ConversationProjection {
             enriched.add(stubs.isEmpty() ? item
                     : new Item(item.turnId(), item.requestId(), item.legacy(), item.userMessageId(),
                             item.assistantMessageId(), item.userText(), item.assistantText(), List.copyOf(stubs),
-                            item.startedAt(), item.estimatedTokens(),item.supplements()));
+                            item.startedAt(), item.estimatedTokens(), item.supplements(), item.steps(), item.sourceRevision()));
         }
         return enriched;
     }
@@ -332,7 +364,7 @@ public class ConversationProjection {
     private boolean hasOlder(Request request, Scan scan) throws SQLException {
         long boundary = scan.oldestScannedTurn == null ? request.currentTurnId() : scan.oldestScannedTurn;
         if (boundary > 1 && history.hasOlderTurn(request.sessionId(), boundary)) return true;
-        return request.contextGeneration() == 1 && history.hasLegacyMessages(request.sessionId());
+        return request.contextGeneration() == 1 && !scan.legacyExhausted && history.hasLegacyMessages(request.sessionId());
     }
 
     /** 范围外的历史：有有效摘要时给出准确计数，没有摘要时只报"没扫"、数量留 null（§4.5）。 */
@@ -366,6 +398,10 @@ public class ConversationProjection {
         int total = 0;
         for (Item item : candidates) total += item.estimatedTokens();
         return total >= recentTokenBudget;
+    }
+
+    private static ChatTurnRejectException scanLimit() {
+        return new ChatTurnRejectException(413, "CONTEXT_SCAN_LIMIT", "历史读取达到时间或空间保护上限，未丢弃未读历史；请清理旧内容或缩小会话范围", Map.of("hasUnscannedHistory", true));
     }
 
     /**

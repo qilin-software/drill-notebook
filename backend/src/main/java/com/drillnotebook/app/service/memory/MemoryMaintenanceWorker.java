@@ -133,6 +133,10 @@ public class MemoryMaintenanceWorker {
     });
     private final AtomicBoolean drainQueued = new AtomicBoolean();
     private volatile boolean backgroundDrain = true;
+    private boolean managedContext;
+
+    @Autowired
+    public void setContextCoordinator(com.drillnotebook.app.service.ContextCoordinator coordinator) { managedContext = true; }
     @Autowired(required=false)
     private com.drillnotebook.app.config.PortableUpdateRequestGate updateGate;
 
@@ -238,10 +242,16 @@ public class MemoryMaintenanceWorker {
 
     public Drain drainOnce(long nowMillis) throws SQLException {
         int recovered = recover(nowMillis);
+        int legacyCancelled = 0;
+        if (managedContext) for (var legacy : jobs.findLegacySummaries(RECOVERY_PER_DRAIN)) {
+            settleLeftoverAttempts(legacy.id(), MemoryTimes.formatMillis(nowMillis));
+            legacyCancelled += jobs.cancel(List.of(legacy.id()), MemoryTimes.formatMillis(nowMillis));
+            reconcileWake(legacy.sessionId());
+        }
         MaintenanceQueue.Sweep sweep = queue.sweep(clock.getAsLong());
         int claimed = 0;
         int committed = 0;
-        int superseded = 0;
+        int superseded = legacyCancelled;
         int retried = 0;
         int failed = 0;
         int waiting = 0;
@@ -321,6 +331,11 @@ public class MemoryMaintenanceWorker {
     // ---- 单个任务 ----
 
     private JobResult process(JobRow job, long claimedAt) throws SQLException {
+        if (managedContext && "SUMMARY".equals(job.kind())) {
+            jobs.cancel(List.of(job.id()), MemoryTimes.formatMillis(claimedAt));
+            reconcileWake(job.sessionId());
+            return JobResult.SUPERSEDED;
+        }
         String leaseToken = UUID.randomUUID().toString();
         String leaseUntil = MemoryTimes.formatMillis(claimedAt + MaintenanceRules.LEASE_MILLIS);
         if (jobs.claim(job.id(), leaseToken, leaseUntil, MemoryTimes.formatMillis(claimedAt))
@@ -781,7 +796,7 @@ public class MemoryMaintenanceWorker {
                 policy.extractionEligibility(state.memoryScopeType(), scopeId).gate())
                 && history.maintenanceBacklog(sessionId, state.memoryScanAfterTurn(), bound,
                         state.contextGeneration(), floor).eligibleTurns() > 0;
-        boolean summaryPending = !MemoryPolicyService.switchedOff(policy.summaryEligibility().gate())
+        boolean summaryPending = !managedContext && !MemoryPolicyService.switchedOff(policy.summaryEligibility().gate())
                 && history.summarySourceBound(sessionId, state.summaryScanAfterTurn(), bound,
                         state.contextGeneration(), floor, MaintenanceRules.SUMMARY_RESERVED_RECENT_TURNS)
                 > state.summaryScanAfterTurn();

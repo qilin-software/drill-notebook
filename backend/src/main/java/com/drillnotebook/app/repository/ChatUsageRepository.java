@@ -40,7 +40,7 @@ public class ChatUsageRepository {
                     SELECT r.request_id, t.request_id FROM ai_chat_retry_receipt r JOIN turns t ON t.id = r.turn_id
                 ), reported AS (
                     SELECT r.request_id, a.id AS attempt_id,
-                """ + (includePending ? "a.operation_id, a.created_at, a.settled_at, a.state, a.usage_source, a.context_breakdown,\n" : "") + """
+                """ + (includePending ? "a.operation_id, a.purpose, a.created_at, a.settled_at, a.state, a.usage_source, a.context_breakdown,\n" : "") + """
                         CASE WHEN a.state = 'SETTLED' AND a.usage_source = 'provider' AND a.input_tokens >= 0
                             THEN CASE
                                 WHEN a.cache_read_included_in_input = 1 THEN a.input_tokens
@@ -61,7 +61,7 @@ public class ChatUsageRepository {
                                     AND COALESCE(a.cache_read_tokens, 0) = 0 AND COALESCE(a.cache_write_tokens, 0) = 0)
                             THEN 1 ELSE 0 END AS input_complete
                     FROM receipts r JOIN ai_usage_attempt a ON a.operation_id = r.operation_id
-                    WHERE a.purpose = 'CHAT' AND a.state IN ('SETTLED', 'UNKNOWN'
+                    WHERE a.purpose IN ('CHAT', 'CONTEXT_COMPACT') AND a.state IN ('SETTLED', 'UNKNOWN'
                 """ + (includePending ? ", 'SENT'" : "") + """
                     )
                 ), measured AS (
@@ -147,6 +147,7 @@ public class ChatUsageRepository {
                         var item = new LinkedHashMap<String, Object>();
                         item.put("attemptId", rows.getString("attempt_id"));
                         item.put("operationId", rows.getString("operation_id"));
+                        item.put("purpose", rows.getString("purpose"));
                         item.put("ordinal", rows.getLong("ordinal"));
                         item.put("createdAt", rows.getString("created_at"));
                         item.put("settledAt", rows.getString("settled_at"));

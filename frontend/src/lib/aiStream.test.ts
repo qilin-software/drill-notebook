@@ -63,6 +63,21 @@ const run = async (frames: string[], hooks: Partial<StreamCallbacks> = {}): Prom
 };
 
 describe('aiStream metadata 事件', () => {
+  it('压缩元数据只交付运行状态，不把摘要正文当作回答进展', async () => {
+    const captured = await run([
+      'event:metadata\ndata:{"requestId":"r-compact","contextCompaction":{"running":true,"summary":"PRIVATE"}}\n\n',
+      'event:metadata\ndata:{"requestId":"r-compact","contextCompaction":{"running":false}}\n\n',
+      'event:metadata\ndata:{"requestId":"r-compact","contextCompaction":{"running":"true"}}\n\n',
+      'event:done\ndata:{"reply":"ok","requestId":"r-compact"}\n\n'
+    ]);
+    expect(captured.metadata).toEqual([
+      { requestId: 'r-compact', contextCompaction: { running: true } },
+      { requestId: 'r-compact', contextCompaction: { running: false } },
+      { requestId: 'r-compact' }
+    ]);
+    expect(captured.deltas).toEqual([]);
+    expect(captured.done?.reply).toBe('ok');
+  });
   it('工具帧算实际进展并只投影安全字段，断流不变成零输出重试', async () => {
     const onToolActivity = vi.fn();
     const record = { sequence: 1, toolName: 'create_memory', state: 'FINISHED', outcome: 'CREATED',

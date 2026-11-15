@@ -66,6 +66,25 @@ afterEach(() => {
 });
 
 describe('useAiChatTurn 请求体', () => {
+  it('压缩开始与结束保留同一轮身份，其他轮的元数据不会改变当前状态', async () => {
+    const turn = renderTurn();
+    await act(async () => turn.result.current.send({ sessionId: 10, userText: '继续长会话' }));
+    const id = turnId();
+    act(() => {
+      callbacks!.onMetadata!({ requestId: 'another-turn', contextCompaction: { running: true } });
+      callbacks!.onMetadata!({ requestId: id, contextCompaction: { running: true } });
+      callbacks!.onMetadata!({ requestId: id, contextCompaction: { running: false } });
+    });
+    expect(events.filter(event => event.type === 'compaction')).toEqual([
+      { type: 'compaction', requestId: id, running: true },
+      { type: 'compaction', requestId: id, running: false }
+    ]);
+    expect(turn.result.current.busy).toBe(true);
+    expect(streamChatMock).toHaveBeenCalledTimes(1);
+    act(() => callbacks!.onDone(donePayload('继续完成')));
+    expect(turn.result.current.busy).toBe(false);
+    expect(events.at(-1)).toMatchObject({ type: 'result', requestId: id, reply: '继续完成' });
+  });
   it('v2 单轮输入：不拼 system、不回传历史，页面正文走 pageContext', async () => {
     const turn = renderTurn();
     await act(async () => {

@@ -52,6 +52,16 @@ public class ContextInspector {
     private final RetrievalIndexRepository index;
     private final NoteNormalizer normalizer;
     private final ObjectMapper mapper;
+    private ChatContextEntryService contextEntries;
+    private ContextCoordinator coordinator;
+    private com.drillnotebook.app.service.memory.MemoryPolicyService policy;
+
+    @org.springframework.beans.factory.annotation.Autowired
+    public void setContextEntries(ChatContextEntryService service) { contextEntries = service; }
+    @org.springframework.beans.factory.annotation.Autowired
+    public void setContextCoordinator(ContextCoordinator service) { coordinator = service; }
+    @org.springframework.beans.factory.annotation.Autowired
+    public void setMemoryPolicy(com.drillnotebook.app.service.memory.MemoryPolicyService service) { policy = service; }
 
     public ContextInspector(ChatTurnRepository turns, ChatHistoryRepository history,
                             ChatSessionMetadataRepository sessions, ChatMessageCipher cipher,
@@ -169,6 +179,9 @@ public class ContextInspector {
         switch (item.kind()) {
             case "MEMORY" -> row.putAll(memoryPreview(turn, item));
             case "SUMMARY" -> row.putAll(summaryPreview(turn.sessionId(), item));
+            case "CONTINUATION" -> row.putAll(continuationPreview(turn, item, password));
+            case "STEP" -> row.putAll(stepPreview(turn, item, password));
+            case "LEGACY" -> row.putAll(legacyPairPreview(turn, item, password));
             case "TURN", "LEGACY_MESSAGE" -> row.putAll(turnPreview(turn, item, password));
             case "TEXT_ATTACHMENT", "IMAGE" -> row.putAll(attachmentPreview(turn, item, password));
             case "NOTEBOOK_RAG" -> row.putAll(chunkPreview(item));
@@ -176,6 +189,46 @@ public class ContextInspector {
             default -> row.put("available", false);
         }
         return row;
+    }
+
+    private Map<String, Object> continuationPreview(TurnRow audited, ContextAudit.Selected item, String password) throws SQLException {
+        if (coordinator == null || policy == null) return placeholder("SOURCE_CHANGED");
+        var loaded = coordinator.load(audited.sessionId(), audited.contextGeneration(), policy.current().revision(), audited.id(), password, policy.useEligibility().allowed());
+        if (loaded.isEmpty() || !String.valueOf(loaded.get().row().revision()).equals(item.version())) return placeholder("SOURCE_CHANGED");
+        try { return text(mapper.writeValueAsString(loaded.get().summary())); }
+        catch (com.fasterxml.jackson.core.JsonProcessingException error) { return placeholder("SOURCE_CHANGED"); }
+    }
+
+    private Map<String, Object> stepPreview(TurnRow audited, ContextAudit.Selected item, String password) throws SQLException {
+        if (contextEntries == null) return placeholder("SOURCE_CHANGED");
+        try {
+            var found = contextEntries.readEntry(item.id(), password);
+            if (found.isEmpty()) return placeholder("SOURCE_DELETED");
+            var step = found.get();
+            if (step.entry().sessionId() != audited.sessionId() || step.entry().turnId() > audited.id()
+                    || step.entry().generation() != audited.contextGeneration()) return placeholder("WRONG_GENERATION");
+            if (!step.source().selected().version().equals(item.version())) return placeholder("SOURCE_CHANGED");
+            var origin = turns.findByRequestId(step.entry().requestId());
+            if (origin.isEmpty() || origin.get().contentDeletedAt() != null) return placeholder("SOURCE_DELETED");
+            if (ChatContextEntryService.usesMemory(step.messages()) && (policy == null || !policy.useEligibility().allowed()
+                    || step.memoryBoundary() != null && !step.memoryBoundary().equals(
+                            memory.readEnvelope().map(v -> v.vaultId() + ":" + v.epoch()).orElse("absent")))) return placeholder("SOURCE_CHANGED");
+            return text(mapper.writeValueAsString(step.messages()));
+        } catch (ChatCryptoException | com.fasterxml.jackson.core.JsonProcessingException error) { return placeholder("SOURCE_CHANGED"); }
+    }
+
+    private Map<String, Object> legacyPairPreview(TurnRow audited, ContextAudit.Selected item, String password) throws SQLException {
+        if (audited.contextGeneration() != 1) return placeholder("WRONG_GENERATION");
+        var ids = item.id().split(":");
+        if (ids.length != 2) return placeholder("SOURCE_CHANGED");
+        try {
+            long userId = Long.parseLong(ids[0]), assistantId = Long.parseLong(ids[1]);
+            var rows = history.legacyBatch(audited.sessionId(), assistantId + 1, 2);
+            if (rows.size() != 2 || rows.get(0).messageId() != assistantId || rows.get(1).messageId() != userId) return placeholder("SOURCE_DELETED");
+            if (!ChatHistoryRepository.legacySource(rows.get(1), rows.get(0)).selected().version().equals(item.version())) return placeholder("SOURCE_CHANGED");
+            return text(cipher.readLegacy(rows.get(1).content(), rows.get(1).contentCipher(), rows.get(1).contentMeta(), password).orSentinel()
+                    + "\n" + cipher.readLegacy(rows.get(0).content(), rows.get(0).contentCipher(), rows.get(0).contentMeta(), password).orSentinel());
+        } catch (IllegalArgumentException error) { return placeholder("SOURCE_CHANGED"); }
     }
 
     private Map<String, Object> memoryPreview(TurnRow audited, ContextAudit.Selected item) throws SQLException {
@@ -249,6 +302,8 @@ public class ContextInspector {
         TurnHistory row = rows.get(0);
         if (row.contextGeneration() != audited.contextGeneration()) return placeholder("WRONG_GENERATION");
         if (row.contentDeletedAt() != null) return placeholder("SOURCE_DELETED");
+        if (row.turnId() >= audited.id() || !"COMPLETED".equals(row.status())) return placeholder("SOURCE_CHANGED");
+        if (item.version() != null && !item.version().equals(row.sourceRevision() + "@" + ChatContextEntryService.fingerprint(row.requestId() + ":" + row.sourceRevision()))) return placeholder("SOURCE_CHANGED");
         String user = cipher.readLegacy(row.userContent(), row.userContentCipher(), row.userContentMeta(), password)
                 .orSentinel();
         String assistant = cipher.readLegacy(row.assistantContent(), row.assistantContentCipher(),

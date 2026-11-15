@@ -175,6 +175,10 @@ const REGION_TEXT: Record<string, string> = {
 const KIND_TEXT: Record<string, string> = {
   MEMORY: '记忆',
   SUMMARY: '续接摘要',
+  CONTINUATION: '续接摘要',
+  STEP: '模型步骤',
+  ANCHOR: '当前要求',
+  CONTEXT_SOURCE: '已压缩来源',
   RESUME_STATE: '会话状态',
   TURN: '对话轮次',
   LEGACY_MESSAGE: '旧消息',

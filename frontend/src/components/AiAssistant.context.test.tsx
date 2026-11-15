@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { render, screen, fireEvent, waitFor } from '@testing-library/react';
+import { act, render, screen, fireEvent, waitFor } from '@testing-library/react';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { MemoryRouter } from 'react-router-dom';
 import { AiAssistant } from './AiAssistant';
@@ -13,11 +13,13 @@ import type { StreamCallbacks, StreamDonePayload } from '../lib/aiStream';
  * 消息被 refetch 升级时身份快照要跟着留下，历史加载的消息在本片还没有 requestId 所以不给徽标。
  */
 
-const { apiGet, apiPost } = vi.hoisted(() => ({ apiGet: vi.fn(), apiPost: vi.fn() }));
+const { apiGet, apiPost, streamControl } = vi.hoisted(() => ({ apiGet: vi.fn(), apiPost: vi.fn(),
+  streamControl: { callbacks: null as StreamCallbacks | null } }));
 
 // 将既有统一结果 fixture 交给 SSE done，保留上下文检查器本身的断言。
 vi.mock('../lib/aiStream', () => ({
   streamChat: async (_path: string, body: unknown, callbacks: StreamCallbacks) => {
+    streamControl.callbacks = callbacks;
     void apiPost('/api/ai/chat', body).then((view: StreamDonePayload) => callbacks.onDone({ ...view, reasoning: view.reasoning ?? '' }));
     return () => undefined;
   }
@@ -91,6 +93,7 @@ const openBadgeInspector = async (): Promise<void> => {
 
 beforeEach(() => {
   vi.clearAllMocks();
+  streamControl.callbacks = null;
   localStorage.clear();
   setContext({ kind: 'none', title: '无页面上下文', markdown: '' });
   apiGet.mockImplementation((url: string) => {
@@ -139,6 +142,25 @@ beforeEach(() => {
 });
 
 describe('AiAssistant 记忆徽标与上下文检查器', () => {
+  it('压缩时显示状态，结束后回到当前回答并清除压缩提示', async () => {
+    let finish!: (value: StreamDonePayload) => void;
+    apiPost.mockImplementation((url: string) => url === '/api/ai/chat'
+      ? new Promise<StreamDonePayload>(resolve => { finish = resolve; }) : Promise.resolve({}));
+    renderAssistant();
+    await waitFor(() => expect(screen.getByRole('button', { name: '发送' })).toBeEnabled());
+    fireEvent.change(screen.getByPlaceholderText(/提问/), { target: { value: '继续长会话' } });
+    fireEvent.click(screen.getByRole('button', { name: '发送' }));
+    await waitFor(() => expect(streamControl.callbacks).not.toBeNull());
+    act(() => streamControl.callbacks!.onMetadata!({ requestId: chatRequestId(), contextCompaction: { running: true } }));
+    expect(await screen.findByText('正在压缩上下文…')).toBeTruthy();
+    expect(document.querySelector('.chat-stream-cursor')).toBeNull();
+    act(() => streamControl.callbacks!.onMetadata!({ requestId: chatRequestId(), contextCompaction: { running: false } }));
+    await act(async () => finish({ reply: '压缩后继续回答', reasoning: '', protocolVersion: 2,
+      requestId: chatRequestId(), sessionId: 10, status: 'COMPLETED', stateDurable: true, persistenceStatus: 'saved' }));
+    expect(await screen.findByText('压缩后继续回答')).toBeTruthy();
+    expect(screen.queryByText('正在压缩上下文…')).toBeNull();
+    expect(apiPost.mock.calls.filter(([url]) => url === '/api/ai/chat')).toHaveLength(1);
+  });
   it('计数来自本轮 done，徽标出现前没有额外请求', async () => {
     renderAssistant();
     const before = apiGet.mock.calls.length + apiPost.mock.calls.length;
@@ -231,7 +253,7 @@ describe('AiAssistant 记忆徽标与上下文检查器', () => {
     await waitFor(() => expect(screen.getByText('OLD ANSWER')).toBeTruthy());
     // D156 结清：/history 现在给 requestId，重开抽屉后的旧回答也能追回本轮账本
     expect(screen.queryByRole('button', { name: /本轮提供/ })).toBeNull();
-    fireEvent.click(screen.getByRole('button', { name: /上下文占用/ }));
+    fireEvent.click(await screen.findByRole('button', { name: /上下文占用/ }));
     fireEvent.click(screen.getByRole('button', { name: '查看上下文详情' }));
     await waitFor(() => expect(apiGet).toHaveBeenCalledWith(`/api/ai/turns/${historyTurn}/context`));
     await waitFor(() => expect(screen.getByText('已发送给模型')).toBeTruthy());

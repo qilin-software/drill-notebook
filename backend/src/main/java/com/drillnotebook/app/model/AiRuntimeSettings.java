@@ -3,7 +3,8 @@ package com.drillnotebook.app.model;
 /** 对话执行预算，独立于供应商和模型；一轮开始后使用不可变快照。 */
 public record AiRuntimeSettings(int maxToolStages, int maxToolExecutions, int turnTimeoutMinutes,
                                 int requestTimeoutMinutes, int maxOutputTokens, int requestOutputTokens,
-                                int finalOutputTokens, int repeatedToolLimit, AiRetrySettings retry) {
+                                int finalOutputTokens, int repeatedToolLimit, AiRetrySettings retry,
+                                AiContextSettings context) {
     public static final AiRuntimeSettings DEFAULTS = new AiRuntimeSettings(50, 100, 30, 15,
             128_000, 16_384, 8_192, 3);
 
@@ -14,8 +15,16 @@ public record AiRuntimeSettings(int maxToolStages, int maxToolExecutions, int tu
                 requestOutputTokens, finalOutputTokens, repeatedToolLimit, AiRetrySettings.DEFAULTS);
     }
 
+    public AiRuntimeSettings(int maxToolStages, int maxToolExecutions, int turnTimeoutMinutes,
+                             int requestTimeoutMinutes, int maxOutputTokens, int requestOutputTokens,
+                             int finalOutputTokens, int repeatedToolLimit, AiRetrySettings retry) {
+        this(maxToolStages, maxToolExecutions, turnTimeoutMinutes, requestTimeoutMinutes, maxOutputTokens,
+                requestOutputTokens, finalOutputTokens, repeatedToolLimit, retry, AiContextSettings.DEFAULTS);
+    }
+
     public AiRuntimeSettings {
         if (retry == null) retry = AiRetrySettings.DEFAULTS;
+        if (context == null) context = AiContextSettings.DEFAULTS;
         check(maxToolStages, 1, 500, "工具阶段上限");
         check(maxToolExecutions, 1, 1000, "工具执行上限");
         check(turnTimeoutMinutes, 1, 240, "整轮最长时间");

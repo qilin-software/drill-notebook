@@ -33,9 +33,9 @@ docs/
 | 文档 | 内容 |
 |---|---|
 | [state/architecture.md](state/architecture.md) | 项目架构、进程与模块边界、数据与便携约定 |
-| [state/v0.8.2-features.md](state/v0.8.2-features.md) | 当前 v0.8.2：笔记混合检索与联网工具已实现，工程验证通过 |
+| [state/v0.8.3-features.md](state/v0.8.3-features.md) | 当前 v0.8.3：统一上下文管理与窗口阈值压缩已实现，工程验证通过 |
 | [state/v0.8.1-features.md](state/v0.8.1-features.md) | v0.8.1 功能与既有验证：失败重连、会话内对话跳转、助手模型选择持久化及页面适配 |
-| [state/data-model.md](state/data-model.md) | 当前数据库表与关键约束（schema 21）；完整 DDL 以 `backend/src/main/resources/schema.sql` 为准 |
+| [state/data-model.md](state/data-model.md) | 当前数据库表与关键约束（schema 22）；完整 DDL 以 `backend/src/main/resources/schema.sql` 为准 |
 | [state/api-contracts.md](state/api-contracts.md) | 核心 REST / SSE 契约与错误格式 |
 
 版本启动前先收尾并归档上一版材料，再在 `docs/state/` 编写新版功能需求清单。开发期间原位维护范围与状态，不把规划提前写成全局已交付能力。切片验收完成后更新该版清单，同步已落地的数据结构、接口等状态文档；施工材料继续保留在 `docs/work/`，标明完成状态，不因单个功能完成立即归档。涉及全局设计规范或专题说明时原位维护。
@@ -59,7 +59,7 @@ docs/
 2. 需求变更直接原地覆盖，不新增「补充决策」文档。
 3. 功能完成后标记结果并同步状态，施工材料保留至本版收尾；**下一版本开始前**统一移入 `docs/archive/<version>/`。归档时保留真实未完成项和验收限制，不以归档代替验收。
 
-v0.8.0 的功能清单、助手窗口与软件内更新施工材料、交互草图已于 2026-11-12 按用户要求统一移入[版本归档](archive/v0.8.0/README.md)。AI 助手已完成用户验收，更新切片已通过工程验证，历史验收缺口保留原口径。v0.8.1 的[清单](state/v0.8.1-features.md)、[UI/UX](work/ai-conversation/ui-ux.md)、[规格](work/ai-conversation/spec.md)、[计划与验证](work/ai-conversation/plan.md)及[草图](work/ai-conversation/conversation-preview.html)保留既有实现与验证入口。[v0.8.2 清单](state/v0.8.2-features.md)中的笔记混合检索和联网工具均已实现并通过工程验证；材料分别位于 [work/material-hybrid-search/](work/material-hybrid-search/requirements.md)与 [work/web-search/](work/web-search/requirements.md)。联网的真实匿名探测、构建、便携审计及真实账户 / 实机边界见 [QA](work/web-search/qa.md)。此前的 [v0.7.3](archive/v0.7.3/README.md)与 [v0.7.2](archive/v0.7.2/README.md)归档继续保留，历史测试见[测试清单](test/QA_CHECKLIST.md)。
+当前施工为 [v0.8.3](state/v0.8.3-features.md) 的[上下文管理与压缩](work/ai-context-management/spec.md)，统一地基、结构化摘要、窗口预检、配置与进度已实现；源码分工见[实现说明](work/ai-context-management/implementation.md)，结果见[验证记录](work/ai-context-management/qa.md)。2026-11-15 已将 v0.8.2 清单、三个施工目录和草图共 16 份原文件移入[版本归档](archive/v0.8.2/README.md)。其中 `ai-conversation/` 包含 v0.8.1 与 v0.8.2 的连续施工记录，统一归档后继续供[v0.8.1 历史清单](state/v0.8.1-features.md)引用；原工程验证、匿名探测、实机 / 真实账户边界保留。此前的 [v0.8.0](archive/v0.8.0/README.md)、[v0.7.3](archive/v0.7.3/README.md)与 [v0.7.2](archive/v0.7.2/README.md)归档继续保留，历史测试见[测试清单](test/QA_CHECKLIST.md)。
 
 ## 3. 测试文档
 
@@ -90,7 +90,7 @@ v0.8.0 的功能清单、助手窗口与软件内更新施工材料、交互草�
 | [reference/knowledge-point-import.md](reference/knowledge-point-import.md) | 知识点 Markdown 导入 |
 | [reference/quiz-markdown-flow.md](reference/quiz-markdown-flow.md) | 刷题 Markdown 解析与渲染 |
 
-`docs/release/v<版本>-release-notes.md` 保存各版发行记录，当前 [v0.8.2 发行准备说明](release/v0.8.2-release-notes.md)已补齐，云端与本地打包默认版本同步为 v0.8.2。[v0.8.1](release/v0.8.1-release-notes.md)与 [v0.8.0 发行说明](release/v0.8.0-release-notes.md)继续原位保留，不随施工材料迁移；历史工程验证、人工验收及发布边界见[归档入口](archive/v0.8.0/README.md)。实际发行状态以标签、GitHub Actions 与 Release 为准。**v1.0 之前均为不保证稳定性的预发行版**，没有预发行后缀也不代表稳定。工作流固定使用 Pre-release，不标记 Latest；正式发行渠道在 v1.0 时另行确认。正文按标签的完整基础版本选择，例如 `v0.8.2-rc.1` 选择 v0.8.2，缺失或空白即失败。
+`docs/release/v<版本>-release-notes.md` 保存各版发行记录，[v0.8.2 发行准备说明](release/v0.8.2-release-notes.md)继续原位保留，云端与本地打包默认版本仍为 v0.8.2；v0.8.3 开发不提前调整发行配置。[v0.8.1](release/v0.8.1-release-notes.md)与 [v0.8.0 发行说明](release/v0.8.0-release-notes.md)也不随施工材料迁移；历史工程验证、人工验收及发布边界见[归档入口](archive/v0.8.2/README.md)。实际发行状态以标签、GitHub Actions 与 Release 为准。**v1.0 之前均为不保证稳定性的预发行版**，没有预发行后缀也不代表稳定。工作流固定使用 Pre-release，不标记 Latest；正式发行渠道在 v1.0 时另行确认。正文按标签的完整基础版本选择，例如 `v0.8.2-rc.1` 选择 v0.8.2，缺失或空白即失败。
 
 ## 5. 交接记忆
 
@@ -104,7 +104,7 @@ v0.8.0 的功能清单、助手窗口与软件内更新施工材料、交互草�
 
 ## 6. 归档
 
-`docs/archive/<version>/` 在下一版本开始前接收上一版的功能清单（`features.md`）、施工文档、草图与版本验收证据。长期架构、数据模型、接口留在 `docs/state/` 原位更新，发布说明留在 `docs/release/`，通用测试文档留在 `docs/test/`，不复制成第二份事实来源。上一版入口见 [v0.8.0 归档说明](archive/v0.8.0/README.md)，更早的 [v0.7.3](archive/v0.7.3/README.md)等归档继续保留。
+`docs/archive/<version>/` 在下一版本开始前接收上一版的功能清单（`features.md`）、施工文档、草图与版本验收证据。长期架构、数据模型、接口留在 `docs/state/` 原位更新，发布说明留在 `docs/release/`，通用测试文档留在 `docs/test/`，不复制成第二份事实来源。上一版入口见 [v0.8.2 归档说明](archive/v0.8.2/README.md)，更早的 [v0.8.0](archive/v0.8.0/README.md)、[v0.7.3](archive/v0.7.3/README.md)等归档继续保留。
 
 归档后只作历史参考，不自动加载为当前施工依据；已经提前归档的旧切片不来回搬动，本次补齐上一版材料即可。迁移时修正相对链接和状态说明，保留历史测试结论、未完成验收与风险，不把 PARTIAL 改为 PASS。截图仍只留本地。
 

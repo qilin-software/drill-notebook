@@ -216,22 +216,70 @@ public class AiUpstreamClient {
     public Result callWithTools(Upstream upstream, List<Map<String, Object>> messages, List<ToolDefinition> tools,
                                 boolean stream, StreamListener listener, int timeoutSeconds,
                                 ActiveTurnRegistry.Handle handle) {
-        List<ToolDefinition> safeTools = sanitizeTools(tools);
+        return callPrepared(upstream, prepare(upstream, messages, tools, stream, 0, "CHAT"), listener, timeoutSeconds, handle, null);
+    }
+
+    public com.drillnotebook.app.model.PreparedRequest prepare(Upstream upstream, List<Map<String, Object>> messages,
+            List<ToolDefinition> tools, boolean stream, int window, String kind) {
+        var effective = cacheUnsupported(upstream) ? upstream.withCacheBreakpoints(false) : upstream;
+        var safeTools = sanitizeTools(tools);
+        var body = effective.anthropic() ? buildAnthropicRequest(effective, messages, stream, safeTools)
+                : buildChatCompletionRequest(effective, messages, stream, safeTools);
+        var names = safeTools.stream().map(ToolDefinition::name).collect(java.util.stream.Collectors.toSet());
+        return new com.drillnotebook.app.model.PreparedRequest(body, writeJson(body),
+                new RequestContextAnalyzer(mapper).analyze(body, window, kind, names), stream);
+    }
+
+    /** HTTP retries reuse the frozen payload; cache fallback is a new explicitly observed prepared payload. */
+    public Result callPrepared(Upstream upstream, com.drillnotebook.app.model.PreparedRequest prepared,
+            StreamListener listener, int timeoutSeconds, ActiveTurnRegistry.Handle handle,
+            java.util.function.Consumer<com.drillnotebook.app.model.PreparedRequest> onSend) {
         long requestStarted = System.nanoTime();
-        Upstream effective = cacheUnsupported(upstream) ? upstream.withCacheBreakpoints(false) : upstream;
+        boolean unsupported = cacheUnsupported(upstream);
+        Upstream effective = unsupported ? upstream.withCacheBreakpoints(false) : upstream;
+        if (unsupported) prepared = withoutCache(prepared);
         try {
-            return callOnce(effective, messages, safeTools, stream, listener, timeoutSeconds, handle);
+            return callOnce(effective, prepared, listener, timeoutSeconds, handle, onSend);
         } catch (IllegalArgumentException error) {
             if (effective.cacheBreakpoints() && isCacheUnsupported(error.getMessage())) {
                 rememberCacheUnsupported(upstream);
                 upstream.onCacheFallback().run();
                 int remaining = timeoutSeconds - (int) ((System.nanoTime() - requestStarted) / 1_000_000_000L);
                 if (remaining <= 0) return new Result("", "", "deadline", false, false, false, Usage.unknown());
-                return callOnce(upstream.withCacheBreakpoints(false), messages, safeTools, stream, listener,
-                        remaining, handle);
+                var fallback = withoutCache(prepared);
+                return callOnce(upstream.withCacheBreakpoints(false), fallback, listener, remaining, handle, onSend);
             }
             throw error;
         }
+    }
+
+    private com.drillnotebook.app.model.PreparedRequest withoutCache(com.drillnotebook.app.model.PreparedRequest prepared) {
+        var body = withoutCacheControls(prepared.body());
+        var names = requestToolNames(body);
+        return new com.drillnotebook.app.model.PreparedRequest(body, writeJson(body),
+                new RequestContextAnalyzer(mapper).analyze(body, prepared.context().contextWindow(), prepared.context().kind(), names), prepared.stream());
+    }
+
+    private static java.util.Set<String> requestToolNames(Map<String, Object> body) {
+        var names = new java.util.LinkedHashSet<String>();
+        if (body.get("tools") instanceof List<?> tools) for (var item : tools) {
+            if (!(item instanceof Map<?, ?> tool)) continue;
+            Object name = tool.get("name");
+            if (tool.get("function") instanceof Map<?, ?> function) name = function.get("name");
+            if (name instanceof String value) names.add(value);
+        }
+        return names;
+    }
+
+    @SuppressWarnings("unchecked")
+    private static <T> T withoutCacheControls(T value) {
+        if (value instanceof Map<?, ?> map) {
+            var out = new LinkedHashMap<String, Object>();
+            map.forEach((key, item) -> { if (!"cache_control".equals(key)) out.put(String.valueOf(key), withoutCacheControls(item)); });
+            return (T) out;
+        }
+        if (value instanceof List<?> list) return (T) list.stream().map(AiUpstreamClient::withoutCacheControls).toList();
+        return value;
     }
 
     static void resetCacheCapabilityForTests() {
@@ -250,18 +298,16 @@ public class AiUpstreamClient {
         return upstream.apiFormat() + "|" + upstream.baseUrl() + "|" + upstream.model();
     }
 
-    private Result callOnce(Upstream upstream, List<Map<String, Object>> messages, List<ToolDefinition> tools,
-                            boolean stream, StreamListener listener, int timeoutSeconds,
-                            ActiveTurnRegistry.Handle handle) {
+    private Result callOnce(Upstream upstream, com.drillnotebook.app.model.PreparedRequest prepared,
+                            StreamListener listener, int timeoutSeconds, ActiveTurnRegistry.Handle handle,
+                            java.util.function.Consumer<com.drillnotebook.app.model.PreparedRequest> onSend) {
         boolean anthropic = upstream.anthropic();
+        boolean stream = prepared.stream();
         String target = anthropic ? anthropicMessagesUrl(upstream.baseUrl()) : chatCompletionsUrl(upstream.baseUrl());
-        Map<String, Object> request = anthropic
-                ? buildAnthropicRequest(upstream, messages, stream, tools)
-                : buildChatCompletionRequest(upstream, messages, stream, tools);
         HttpRequest.Builder builder = HttpRequest.newBuilder(URI.create(target))
                 .timeout(Duration.ofSeconds(Math.max(timeoutSeconds, 1)))
                 .header("Content-Type", "application/json")
-                .POST(HttpRequest.BodyPublishers.ofString(writeJson(request)));
+                .POST(HttpRequest.BodyPublishers.ofString(prepared.serialized()));
         if (anthropic) {
             if (upstream.apiKey() != null && !upstream.apiKey().isBlank()) builder.header("x-api-key", upstream.apiKey());
             builder.header("anthropic-version", ANTHROPIC_VERSION);
@@ -279,6 +325,7 @@ public class AiUpstreamClient {
         }
         HttpResponse<InputStream> response;
         try {
+            if (onSend != null) onSend.accept(prepared);
             var pending = http.sendAsync(httpRequest, HttpResponse.BodyHandlers.ofInputStream());
             deadline.attach(pending);
             response = pending.get();
@@ -488,7 +535,11 @@ public class AiUpstreamClient {
                                                    List<ToolDefinition> tools) {
         Map<String, Object> request = new LinkedHashMap<>();
         request.put("model", upstream.model());
-        request.put("messages", messages);
+        request.put("messages", messages.stream().map(message -> {
+            var clean = com.drillnotebook.app.model.ContextSource.untag(message);
+            clean.keySet().removeIf(key -> key.startsWith("_context")); clean.remove("anthropic_thinking");
+            return clean;
+        }).toList());
         request.put("stream", stream);
         if (stream && ProviderCapabilities.of(upstream.baseUrl(), upstream.apiFormat(), upstream.model())
                 .streamUsage()) {

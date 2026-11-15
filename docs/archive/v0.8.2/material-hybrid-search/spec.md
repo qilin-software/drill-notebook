@@ -1,6 +1,6 @@
 # 笔记混合检索接入资料工具：规格
 
-> v0.8.2 F01，已实现并通过工程验证（2026-11-14）。需求见[requirements.md](requirements.md)，长期接口以[api-contracts.md §3.2.4](../../state/api-contracts.md)为准。
+> v0.8.2 F01，已实现并通过工程验证（2026-11-14）。需求见[requirements.md](requirements.md)，长期接口以[api-contracts.md §3.2.4](../../../state/api-contracts.md)为准。
 
 ## 1. 数据与服务边界
 

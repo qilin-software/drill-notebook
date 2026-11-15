@@ -119,8 +119,7 @@ class MemoryToolChatPathTest {
         assertTrue(bodies.get(1).contains("\"role\":\"tool\""), "续写请求必须带工具结果消息");
         assertTrue(bodies.get(1).contains(FACT), "续写请求必须带上工具返回的事实");
         assertTokenBudgets(bodies);
-        assertFalse(dbContains("\"tool_call_id\""), "工具消息不能落进持久化转录");
-        assertFalse(dbContains(MemorySearchTool.NAME), "工具名不能落进持久化转录");
+        assertNoPlaintextToolPayload(FACT);
     }
 
     @ParameterizedTest
@@ -385,8 +384,7 @@ class MemoryToolChatPathTest {
             assertTrue(listServer.bodies().get(3).contains(FACT));
             assertFalse(deltas.toString().contains(MemoryListTool.NAME), "工具调用不能作为正文发给前端");
             assertFalse(deltas.toString().contains("\"items\""), "工具结果不能作为正文发给前端");
-            assertFalse(dbContains(MemoryListTool.NAME), "工具名不能落进持久化转录");
-            assertFalse(dbContains("\"tool_call_id\""), "工具消息不能落进持久化转录");
+            assertNoPlaintextToolPayload(FACT);
         } finally {
             listServer.close();
         }
@@ -429,7 +427,8 @@ class MemoryToolChatPathTest {
                     "tools", true, "streaming", true, "contextWindow", 128000, "maxOutputTokens", 32000));
             state = configs.connections().read();
             var models = state.provider(providerId).models();
-            connections.selectChatModel(Map.of("revision", state.revision(), "modelConfigId", models.get(models.size() - 1).id()));
+            connections.selectChatModel(Map.of("revision", state.revision(), "sessionId", sessionId,
+                    "modelConfigId", models.get(models.size() - 1).id()));
             assertEquals(executionSettings, new AiRuntimeSettingsRepository(jdbc).read().values(), "切供应商或模型不得影响全局预算");
 
             assertTrue(stack.policy().current().enabled());
@@ -479,8 +478,7 @@ class MemoryToolChatPathTest {
             assertEquals("user-message", evidence.get(0).get("source_block_id"));
             assertNotNull(evidence.get(0).get("turn_id"));
             assertNotNull(evidence.get(0).get("message_id"));
-            assertFalse(dbContains(MemoryCreateTool.NAME), "工具名不能落进持久化转录");
-            assertFalse(dbContains("tool_call_id"), "工具消息不能落进持久化转录");
+            assertNoPlaintextToolPayload("我每周三晚上复习");
         } finally {
             createServer.close();
         }
@@ -508,8 +506,7 @@ class MemoryToolChatPathTest {
             assertEquals("SUPERSEDED", oldRow.get("status"));
             assertEquals(1, jdbc.queryForObject("SELECT COUNT(*) FROM ai_memory_item WHERE status = 'ACTIVE'"
                     + " AND value_hmac IS NOT NULL AND kind = 'GOAL'", Integer.class));
-            assertFalse(dbContains(MemoryUpdateTool.NAME), "工具名不能落进持久化转录");
-            assertFalse(dbContains("\"tool_call_id\""), "工具消息不能落进持久化转录");
+            assertNoPlaintextToolPayload("考试改到周五");
         } finally {
             updateServer.close();
         }
@@ -588,7 +585,19 @@ class MemoryToolChatPathTest {
         return "memory-tool-chat-" + action + '-' + (++sequence);
     }
 
-    /** 扫库文件与 WAL：工具消息一旦被当成普通消息落盘，这里立刻暴露。 */
+    /** 公开标题可复用用户原话；工具名只作数值明细，参数及受保护负载须保持加密。 */
+    private void assertNoPlaintextToolPayload(String privateText) throws Exception {
+        assertFalse(dbContains("\"arguments\""), "原始工具参数不能明文落库");
+        assertFalse(dbContains("\"tool_call_id\""), "原始工具配对消息不能明文落库");
+        String protectedRows = jdbc.queryForList("SELECT content, content_cipher, content_meta FROM ai_chat_message").toString()
+                + jdbc.queryForList("SELECT request_meta_cipher, result_meta_cipher FROM ai_chat_turn")
+                + jdbc.queryForList("SELECT payload_cipher, payload_crypto FROM ai_context_entry")
+                + jdbc.queryForList("SELECT payload_cipher, payload_crypto FROM ai_context_checkpoint")
+                + jdbc.queryForList("SELECT context_breakdown FROM ai_usage_attempt");
+        assertFalse(protectedRows.contains(privateText), "工具相关正文不能出现在未加密负载或数值明细中");
+    }
+
+    /** 扫库文件与 WAL，核对没有明文工具正文。 */
     private boolean dbContains(String text) throws Exception {
         StringBuilder raw = new StringBuilder();
         for (String suffix : List.of("", "-wal", "-shm")) {

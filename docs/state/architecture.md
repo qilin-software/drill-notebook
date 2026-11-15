@@ -92,10 +92,10 @@ AI 助手自 v0.8 起是独立系统窗口：主进程维护唯一的助手窗�
 | 附件 | `note_attachment`：上传/列表/内容/删除 API，SHA-256 去重，存储于 `data/attachments/` |
 | 计划 | 日历计划组与条目（题目/知识点/笔记） |
 | 复习 | spaced repetition 配置、enrollment、schedule、log |
-| AI | 多供应商与模型、各会话独立选模与新会话继承、导入绑定、全局运行限制、多会话与加密历史、chat/summarize 代理、长期记忆与工具活动 |
+| AI | 多供应商与模型、各会话独立选模与新会话继承、导入绑定、全局运行限制、多会话与加密历史、统一窗口管理 / 上下文压缩、长期记忆与工具活动 |
 | 知识点总结 | `knowledge_point_original` 双角色快照（original/summary）；`KnowledgePointSummaryService` + `AiService.summarizeKnowledgePoint` / `summarizeMarkdown`（v0.5） |
 
-当前 schema 19，完整 DDL 以 `backend/src/main/resources/schema.sql` 为准；表与迁移边界见 [data-model.md](data-model.md)。
+当前 schema 22，完整 DDL 以 `backend/src/main/resources/schema.sql` 为准；表与迁移边界见 [data-model.md](data-model.md)。
 
 ### 3.1 AI 连接、轮次与工具（v0.7.1）
 
@@ -103,10 +103,10 @@ AI 助手自 v0.8 起是独立系统窗口：主进程维护唯一的助手窗�
 - 模型上下文窗口和最大输出为必填正整数；`AiModelLimits` 统一约束保存、应用、探测与实际请求。旧缺值配置提示补全，不再使用缺省窗口；最大输入字段已取消。输入与输出共享窗口，正常安全余量和全局运行限制仍生效。
 - 模型发现与验证使用后端代理；最多三个模型并发验证，各模型的文本、图片与工具请求分别记录。文本决定是否加入，工具验证成功才自动开启对应能力。配置版本用于避免旧验证覆盖后续编辑。
 - 对话工具循环按阶段、执行次数、输出额度、单请求/整轮期限和重复无进展共同约束；达限停止新工具并尽量总结。上游请求可取消，SSE 有心跳；正文与活动独立传递，「继续」建立新一轮。
-- 活动按 `requestId` 与轮内 `sequence` 关联，服务端只发白名单摘要，不暴露上游调用 ID；原始参数与工具结果不入 SSE、日志或历史。安全活动元数据随助手消息加密持久化，检查点不推进 `history_revision`，避免使本轮冻结计划失效。
+- 活动按 `requestId` 与轮内 `sequence` 关联，服务端只发白名单摘要，不暴露上游调用 ID；原始参数与工具结果不入 SSE、日志或数值审计。安全活动随助手消息加密持久化；v0.8.3 的模型证据另存加密步骤，不用活动概述替代结果。检查点不推进 `history_revision`，避免使本轮冻结计划失效。
 - `AiToolSettingsRepository` 持久化全部工具的独立全局开关；`AiService` 在轮次开始过滤，在执行前重新读取防止已关闭项继续运行。工具派发通过 `SessionExecution.delegated` 禁用删除能力。`AiToolSettingsPanel` 提供即存开关、失败回退与恢复默认；`WebSearchSettingsPanel` 的服务 / 密钥草稿独立保存，原生优先即点即存。助手 `WebSearchButton` 一次原子修改 search / fetch 权限，沿用窗口失效消息同步，旧 GET 不覆盖新确认的 revision。
 - `SearchWebTool/FetchWebTool` → `WebSearchService` → `WebProviders/LocalWebFetcher` 接入默认 Exa → Tavily 搜索与本地正文优先读取，只为缺失 URL 尝试远程服务。固定官方接口经 OkHttp / jsoup 处理；公开 IP、连接时 DNS 与重定向逐次验证，响应 / 解压 / 结果与 10 秒尝试、20 秒工具总时限有界。限流冷却只在内存中，配置密钥加密进入 `ai_web_settings`，不新增外部运行时或系统落点。
-- `NativeWebCapabilities` 按官方端点、协议与明确型号提供安全能力元数据；原生优先默认关闭。Anthropic 使用 Messages search / fetch，OpenAI 使用同一受理模型的隔离 Responses search；只发送必要查询 / URL，额外请求复用阶段 / 输出 / 时间 / 停止、并发许可与 `ai_usage_attempt` 账本。实际服务与白名单失败路径进入现有工具活动，未知能力使用所选服务，已支持的原生调用失败不重复向另一家服务发出。矩阵与测试边界见[联网规格](../work/web-search/spec.md)及 [QA](../work/web-search/qa.md)。
+- `NativeWebCapabilities` 按官方端点、协议与明确型号提供安全能力元数据；原生优先默认关闭。Anthropic 使用 Messages search / fetch，OpenAI 使用同一受理模型的隔离 Responses search；只发送必要查询 / URL，额外请求复用阶段 / 输出 / 时间 / 停止、并发许可与 `ai_usage_attempt` 账本。实际服务与白名单失败路径进入现有工具活动，未知能力使用所选服务，已支持的原生调用失败不重复向另一家服务发出。矩阵与测试边界见[联网规格](../archive/v0.8.2/web-search/spec.md)及 [QA](../archive/v0.8.2/web-search/qa.md)。
 - 前端连接页使用供应商/模型列表与二级编辑页；`ToolActivityGroup` 展示、折叠活动，保留用户手动选择和滚动位置。失败轮次提示归属助手回复；正文流式更新不强制打断向上阅读。
 - 记忆词法索引以 vault、epoch、revision 判定是否可复用，同版本构建合并、解锁时异步预热；聊天模型不参与索引身份。实际记忆变更或重启后的预热仍可能需要时间，不承诺零延迟。
 - 删除来源会话/历史只清理来源证据，长期记忆及原 origin 保留；删除笔记本仍清理所属 NOTEBOOK scope。接口与安全边界见 [api-contracts.md](api-contracts.md)。
@@ -129,8 +129,8 @@ AI 助手自 v0.8 起是独立系统窗口：主进程维护唯一的助手窗�
 - `toolMutationEffects` 从本次运行的安全活动刷新目录，笔记删除先通过 `materialEvents` 同步通知 `NotebookPage` 丢弃草稿，再清除缓存。`NoteAutosave` 忽略已删页面的迟到结果和回声。历史活动不重放删除；已删对象不显示打开入口，错题移出仍可查看原题。
 - 人工错题仅记录真实作答基线，普通错题页与读取工具共享成员 SQL，不生成虚假答题。前端成功活动刷新相关资料、提供「查看资料」。笔记正文刷新由 `NoteAutosave` 的待保存、在途和失败状态保护，普通自动保存与后台 keepalive 都跟踪到结果，并及时刷新提交快照的 isDraft，避免已保存内容一直被误判为草稿。
 - `MaterialText` 将指定笔记页的 TipTap 数据转为可读正文，保留公式及嵌入题目 / 文件引用，不改变既有 `NoteNormalizer` 的索引规则。知识点当前、原文、总结分别读取；错题成员 SQL 与人工页面共用，统计来自真实答题记录。
-- `PageSnapshot` 校验消息级快照、生成指纹与无正文定位提示。`AiService` 在本轮内存中按 requestId 保存主消息与插话快照，只在调用工具时提供正文。队列复用既有加密载荷，元数据只记录指纹；工具原始资料结果仍不落历史，仅安全活动摘要随既有加密元数据保存。
-- 目录最多 20 条，正文最多 8000 Unicode 码点，续读校验版本；删除、缺失和不可读明确返回。搜索片段足够时直接引用，需要上下文再按 ID 读取，不重复自动注入整页。来源链接只支持六种本地资料类型与正整数 ID；点击题目时通过单题 GET 取得所属题库，不注册系统协议。契约见 [api-contracts.md §3.2.4](api-contracts.md)，本次检索验证见[v0.8.2 清单](v0.8.2-features.md)。
+- `PageSnapshot` 校验消息级快照、生成指纹与无正文定位提示。`AiService` 在本轮内存中按 requestId 保存主消息与插话快照，只在调用工具时提供正文。队列复用既有加密载荷，元数据只记录指纹；实际返回给模型的有界资料结果在 v0.8.3 进入加密上下文步骤，SSE 仍只提供安全活动摘要。
+- 目录最多 20 条，正文最多 8000 Unicode 码点，续读校验版本；删除、缺失和不可读明确返回。搜索片段足够时直接引用，需要上下文再按 ID 读取，不重复自动注入整页。来源链接只支持六种本地资料类型与正整数 ID；点击题目时通过单题 GET 取得所属题库，不注册系统协议。契约见 [api-contracts.md §3.2.4](api-contracts.md)，本次检索验证见[v0.8.2 清单](../archive/v0.8.2/features.md)。
 
 ### 3.3 失败恢复、会话内定位与模型选择（v0.8.1，含 v0.8.2 修正）
 
@@ -142,7 +142,23 @@ AI 助手自 v0.8 起是独立系统窗口：主进程维护唯一的助手窗�
 - `ChatHistoryRepository` 对已有用户消息计数并查询轮次对应 ID；`ChatHistoryService` 提供有界预览及 history 的 totalRounds / firstRound / hasOlder。`useChatHistoryPages` 按目标加载阅读窗口，50 条一页、最多 500 条驻留，回到最新恢复最新窗口；请求身份和阅读锚点保护会话切换、定稿与迟到响应。
 - `ConversationNavigation` 使用正文右侧单一键盘定位控件，最多 64 个连续刻度，矮窗按高度减少；非 passive 滚轮翻阅窗口并阻止正文滚动。静止短线、悬停邻近刻度渐长；整卡显示轮次 / 时间、两行粗体提问、三行浅色回答及 `...`。预览只读取已有消息，文字复制 / 引用或覆盖详情期间隐藏导航。
 
-本片的工程验证与尚未执行的实机 / 供应商验收见[实施计划](../work/ai-conversation/plan.md)和[测试清单](../test/QA_CHECKLIST.md)，接口见[api-contracts.md](api-contracts.md)。
+本片的工程验证与尚未执行的实机 / 供应商验收见[实施计划](../archive/v0.8.2/ai-conversation/plan.md)和[测试清单](../test/QA_CHECKLIST.md)，接口见[api-contracts.md](api-contracts.md)。
+
+### 3.4 上下文管理与窗口压缩（v0.8.3）
+
+`ConversationProjection → ChatContextAssembler / ChatContextPlan → ContextCoordinator → AiUpstreamClient / PreparedRequest` 形成统一准备链路。先完成真实协议转换和输出分配，再计数预检；冻结后发送与 HTTP 重试复用同一正文。普通请求、SSE、工具往返和断流续答均接入此链路，原地重试仍受原轮截止点约束。
+
+原始加密历史、模型发送视图、最后实际主请求占用和累计计费分别维护。管理投影取消固定 32 轮和 2,400 / 8,000 / 2,000 Token 的历史裁剪；按分页读取合格历史并复核来源、版本、授权与工具配对。扫描保护触发时显式拒绝，不把未读历史当作不存在。
+
+`ChatContextEntryService` 保存工具闭合步骤、已确认助手片段和必要协议状态，复用聊天加密、轮次身份与容量事务。成功业务写入的活动先保留，再保存模型证据；后者失败不把业务成功改成失败，也不因此重执行已确认工具。
+
+`ContextWindowBudget` 按模型窗口、实际输出和安全余量分配输入。自动压缩默认开启、阈值 80%（65–95% 可设），目标约 60%。`ContextCoordinator` 分组生成结构化摘要，在内存中合并覆盖，复核来源和写回执后由 `ChatContextCheckpointRepository` 租约 / CAS 发布一次。当前输入、最新活动工具组与已确认续答片段受保护，近期两轮仅在预算可容纳时保留。
+
+schema 22 的步骤、检查点和租约位于便携数据库。编辑、清理、原地重试、换代和记忆授权撤回同步使相关派生状态失效；摘要网络调用在事务外，失败保留原历史。摘要请求共用本轮停止、并发、时间和输出预算，以 CONTEXT_COMPACT 记账；其输入不替换主占用圆环。
+
+续接服务不依赖长期记忆启用或提取。管理路径从原历史重建，不自动迁移旧 vault 摘要；`MemoryMaintenanceWorker` 取消旧 SUMMARY 作业，只维护记忆提取。涉及记忆的步骤仍受授权与 vault 边界约束，撤回后不能继续通过摘要或旧结果外发。
+
+接口与错误见[API 契约](api-contracts.md)，存储见[数据模型](data-model.md#44-上下文步骤与续接检查点v22)，具体分工与参考源码见[实现说明](../work/ai-context-management/implementation.md)。真实供应商摘要质量、协议缓存和 Electron 实机体验的验收不由本地夹具代替。
 
 ## 4. 导入 / 导出
 

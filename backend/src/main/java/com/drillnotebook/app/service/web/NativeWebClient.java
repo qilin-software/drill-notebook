@@ -18,16 +18,24 @@ public class NativeWebClient {
 
     public Response call(AiUpstreamClient.Upstream target, boolean fetch, String query, List<String> urls,
                          int count, int maxOutput, WebRequestContext context) {
+        var caps = NativeWebCapabilities.of(target.baseUrl(), target.apiFormat(), target.model());
+        var body = request(target.model(), "anthropic_messages".equals(caps.protocol()), fetch, query, urls, maxOutput);
+        var prepared = new com.drillnotebook.app.model.PreparedRequest(body, WebProviders.json(body),
+                new com.drillnotebook.app.service.RequestContextAnalyzer(JSON).analyze(body, 0, "NATIVE_WEB", Set.of("web_search", "web_fetch")), false);
+        return callPrepared(target, fetch, urls, count, prepared, context);
+    }
+
+    public Response callPrepared(AiUpstreamClient.Upstream target, boolean fetch, List<String> urls,
+                         int count, com.drillnotebook.app.model.PreparedRequest prepared, WebRequestContext context) {
         NativeWebCapabilities caps = NativeWebCapabilities.of(target.baseUrl(), target.apiFormat(), target.model());
         if (!(fetch ? caps.fetch() : caps.search())) throw new WebFailure(WebFailure.Code.NATIVE_UNSUPPORTED);
         if (target.apiKey() == null || target.apiKey().isBlank()) throw new WebFailure(WebFailure.Code.AUTH_REQUIRED, 401, null);
         boolean anthropic = "anthropic_messages".equals(caps.protocol());
         WebResult.Provider provider = anthropic ? WebResult.Provider.anthropic : WebResult.Provider.openai;
-        Map<String, Object> request = request(target.model(), anthropic, fetch, query, urls, maxOutput);
         Map<String, String> auth = anthropic ? Map.of("x-api-key", target.apiKey(), "anthropic-version", "2023-06-01", "Accept", "application/json")
                 : Map.of("Authorization", "Bearer " + target.apiKey(), "Accept", "application/json");
         var reply = http.request("POST", URI.create(anthropic ? "https://api.anthropic.com/v1/messages" : "https://api.openai.com/v1/responses"),
-                auth, WebProviders.json(request), 2_097_152, context);
+                auth, prepared.serialized(), 2_097_152, context);
         JsonNode root;
         try { root = JSON.readTree(reply.text()); }
         catch (Exception failure) {

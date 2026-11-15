@@ -60,7 +60,9 @@ class ChatContextPayloadGoldenTest {
         assertEquals("golden-model", body.get("model"));
         assertEquals(false, body.get("stream"));
         assertEquals(2048, body.get("max_tokens"));
-        assertEquals(plan.messages(), body.get("messages"), "请求体里的消息就是计划本身，不再二次拼装");
+        assertEquals(plan.messages().stream().map(com.drillnotebook.app.model.ContextSource::untag).toList(), body.get("messages"),
+                "协议发送前去掉内部来源标签，正文和顺序保持一致");
+        assertFalse(body.toString().contains("_context"));
     }
 
     @Test

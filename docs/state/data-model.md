@@ -1,6 +1,6 @@
 # 数据模型
 
-当前 schema 版本：**21**。完整 DDL 以 `backend/src/main/resources/schema.sql` 为准；本文只记录已落地表、职责与关键约束，便于快速定位，不复制字段级定义。
+当前 schema 版本：**22**。完整 DDL 以 `backend/src/main/resources/schema.sql` 为准；本文只记录已落地表、职责与关键约束，便于快速定位，不复制字段级定义。
 
 ## 1. 通用约定
 
@@ -44,7 +44,7 @@
 
 人工加入错题以该题最后一条真实 answer_record.id 为基线，从未作答为 0，旧题为 NULL。成员须未被人工移出，且曾答错或被人工加入；最近答错 / 人工加入两者较新的基线之后，连续答对未满两次。重复加入当前成员不重置进度，不生成答题记录；统计仍来自真实作答。
 
-## 4. AI 配置、会话、记忆与用量域（schema v9–v21）
+## 4. AI 配置、会话、记忆与用量域（schema v9–v22）
 
 ### 4.1 配置与会话
 
@@ -52,7 +52,7 @@
 |---|---|---|
 | `ai_config` | 旧配置迁移源与其他用途配置 | `purpose` 主键；chat/import 迁移后由集合绑定解析；memory/embedding 仍使用原表 |
 | `ai_connections` | 供应商、模型、继承默认与导入绑定（v10） | 单行 `id=1`、`revision`、`document` JSON；供应商和模型均为稳定 UUID，密钥保持密文，模型配置不复制；chatModelId / chatReasoningEffort 保存新会话继承的最近选择，可空 importModelId 独立绑定；已有会话不随默认改变 |
-| `ai_runtime_settings` | 全局对话运行限制（v11） | 单行 `id=1`、`revision`、`document` JSON；v0.8.1 增加嵌套 retry 四项，旧 JSON 缺项补默认，旧客户端不提交时保留原值；保存按 revision 检查冲突，不随模型切换 |
+| `ai_runtime_settings` | 全局对话运行限制（v11） | 单行 `id=1`、`revision`、`document` JSON；嵌套 retry 与 v0.8.3 context 配置，context 默认 autoCompact=true / thresholdPercent=80；旧 JSON 缺项补默认，旧客户端不提交时保留原值，坏类型 / 阈值 / 未知 context 字段拒绝；保存按 revision 检查冲突，不随模型切换 |
 | `ai_tool_settings` | 全局工具开关（v17） | 单行 `id=1`、revision、document JSON；v0.8.2 起管理全部 22 个内置工具，只存与默认值不同的选择（18 个非删除默认开，4 个删除默认关）；旧配置缺项取默认，保存检查版本冲突，坏配置报错 |
 | `ai_web_settings` | 联网服务配置（v19） | 单行 `id=1`、非负 revision、document JSON；分别保存 searchProvider / fetchProvider、preferNative 与两家供应商的加密 keys；默认 auto / auto / false，无密钥；同供应商共用一份密钥，CAS 冲突不覆盖 |
 | `ai_chat_session` | 会话 | 标题、归档、模型、标签；v12 增加唯一 `session_ref` 与标题元数据；v18 的 `model_config_id` / `reasoning_effort` 在 v0.8.2 恢复为会话独立选择，v20 增加 `model_choice_revision`；新会话固定继承最近选择，旧空选择只初始化一次；标题 / 置顶 / 选模更新不推进聊天活动时间 |
@@ -132,13 +132,27 @@ v0.7.1 的对话内记忆工具不新增表：`search_memories` 与 `list_memori
 | `ai_usage_daily` | 按日聚合 | `(budget_date, budget_timezone, target_fingerprint, purpose)` 主键 |
 | `ai_chat_storage` | 逻辑容量账本 | 单行；历史与附件上限、已用与预留字节 |
 
-工具循环的每次上游请求按 `ai_usage_attempt` 单独结算，供应商缺少 usage 时按未知记账。工具结果发送给模型后已包含在上游输入用量内，不另重复计费；原始工具结果不写入会话历史。结果元数据原文上限 512 KiB，单轮回复容量预留 3 MiB，包含正文、思考与加密开销；检查点已用字节在最终结算时扣除，避免双计。
+工具循环和上下文压缩的每次上游请求按 `ai_usage_attempt` 单独结算，供应商缺少 usage 时按未知记账。工具结果发送给模型后已包含在上游输入用量内，不另重复计费；v0.8.3 起有界工具证据保存在独立加密步骤中，不进入安全活动或数值用量正文。结果元数据原文上限 512 KiB，单轮回复容量预留 3 MiB，包含正文、思考与加密开销；已用字节在最终结算时扣除，避免双计。
 
-v21 的 `cache_read_included_in_input` 为 1 / 0 / null：1 表示原输入已包含缓存桶，0 表示独立缓存读写需加回输入，null 表示旧口径尚未核实。原始桶和 `ai_usage_daily` 的计费聚合保持。`ChatUsageRepository` 经当前轮与 `ai_chat_retry_receipt` 去重关联所有对应 CHAT 请求，统一返回会话 / 本轮累计；不按正文删除标记或上下文代数扣减，不受前端分页影响。未知字段保持 null，部分回报保留已知下界并附完整性标志；独立缓存桶缺失时输入和未命中也不能称为完整。
+v21 的 `cache_read_included_in_input` 为 1 / 0 / null：1 表示原输入已包含缓存桶，0 表示独立缓存读写需加回输入，null 表示旧口径尚未核实。原始桶和 `ai_usage_daily` 的计费聚合保持。`ChatUsageRepository` 经当前轮与 `ai_chat_retry_receipt` 去重关联对应 CHAT / CONTEXT_COMPACT 请求，统一返回会话 / 本轮累计；不按正文删除标记或上下文代数扣减，不受前端分页影响。原生联网仍以 CHAT 用途记账、以 NATIVE_WEB 请求类别区分。未知字段保持 null，部分回报保留已知下界并附完整性标志；独立缓存桶缺失时输入和未命中也不能称为完整。
 
-`context_breakdown` 是每次已发请求的数值摘要，版本 1、≤32 KiB、全分类最多 256 条明细；只在 SENT 态以空值 CAS 写入一次。包括模型、窗口、估算器版本、普通 / 原生联网类别、固定组成分类、工具名和请求内消息位置；不保存提示词、参数 / 结果正文、URL 或图片字节。较大分类只保留占用较高的明细，分类计数和合计仍完整。请求页最多 50 条，按真实创建时刻 / attempt ID 排序，游标仅属于当前轮；只解析该页摘要，格式错误或未来版本明细视为不可用，实际累计不受影响。
+`context_breakdown` 是每次已发请求的数值摘要，版本 1、≤32 KiB、全分类最多 256 条明细；只在 SENT 态以空值 CAS 写入一次。包括模型、窗口、估算器版本、CHAT / NATIVE_WEB / CONTEXT_COMPACT 类别、固定组成分类、工具名和请求内消息位置；不保存提示词、参数 / 结果正文、URL 或图片字节。较大分类只保留占用较高的明细，分类计数和合计仍完整。请求页最多 50 条，按真实创建时刻 / attempt ID 排序，游标仅属于当前轮；只解析该页摘要，格式错误或未来版本明细视为不可用，实际累计不受影响。
 
 删除回执与业务删除、关联清理及笔记本范围记忆清理同事务提交；失败整体回滚。重复调用或显式重试链只返回原操作已处理，不重复删除。记忆与会话删除不建新回执，重复调用按目标不存在返回。删除会话保留长期记忆原类型并断开来源；移出错题不删除原题与作答记录。
+
+### 4.4 上下文步骤与续接检查点（v22）
+
+| 表 | 职责 | 关键约束 |
+|---|---|---|
+| `ai_context_entry` | 模型已确认的工具步骤、助手片段与恢复片段 | TEXT ID 主键，session / turn 级联删除，`(turn_id,sequence)` 唯一；记录 request / generation / revision / fingerprint 与协议身份；TOOL_STEP / ASSISTANT_SEGMENT / RECOVERY，OPEN → CLOSED，闭合后不可改写；载荷使用聊天密文 |
+| `ai_context_checkpoint` | 当前会话唯一续接摘要 | session_id 主键且级联删除；记录 revision / generation / history / policy、memory boundary / revision、生成目标与策略；加密载荷内含结构化摘要、真实来源覆盖和 memorySensitive |
+| `ai_context_compaction_lease` | 压缩互斥与输入指纹 | session_id 主键且级联删除，租约标识 / 输入指纹 / 过期时刻，RUNNING / SUCCEEDED / FAILED；相同输入防重复执行 |
+
+原始消息与附件沿用旧表。新步骤保留实际提供给模型的有界调用 / 结果及必要协议状态，不保存网络原始 HTML、请求头或密钥。步骤载荷最多 2 MiB，摘要载荷最多 512 KiB、覆盖最多 4,096 个来源；密文及加密元数据按真实字节进入历史容量账本。步骤保存与轮次身份 / 容量更新同事务，检查点替换计净增量，不重复计费。
+
+检查点只由上下文协调器在最终视图预检后发布一次，覆盖绑定 TURN / STEP / LEGACY / ANCHOR 的版本和指纹；模型网络调用不占数据库写事务。原地重试、清理、换代和记忆撤回使相关检查点失效，清理同时释放容量。记忆敏感步骤在授权撤回后被遮蔽，不继续进入模型请求。
+
+管理投影不自动迁移或使用 `ai_session_context` 的旧 vault 摘要。新续接不依赖记忆开启；管理路径的维护队列取消旧 SUMMARY 作业，只执行记忆提取。旧表和兼容读取保留。完整执行边界见[实现说明](../work/ai-context-management/implementation.md)。
 
 ## 5. 版本与迁移
 
@@ -146,6 +160,7 @@ v21 的 `cache_read_included_in_input` 为 1 / 0 / null：1 表示原输入已�
 - v19 新增 `ai_web_settings`，现有工具开关 JSON 不改写，新联网项缺省开启。升级继续使用上述快照与未来版本拒绝逻辑，不复制网页正文、索引或历史；联网服务与权限在同一便携数据库内分别持久化。
 - v20 新增 `ai_chat_retry_receipt` 与 `ai_chat_session.model_choice_revision`，会话选模复用 v18 两列。连接初始化优先为旧空选择匹配最近实际模型与供应商，无法唯一匹配则固定继承当前默认；已有选择不改写。升级沿用 APP_ROOT 升级前快照与未来版本拒绝逻辑。
 - v21 新增上述两列及 `idx_ai_usage_operation`。升级前在 APP_ROOT 的 backups/ 留快照；旧缓存口径仅在原始用量桶、次数、终态与日计费账本完整吻合时回填，同 target 指纹的核实结果可传播，冲突或缺账保持 null。旧请求没有组成摘要时不回放 / 重建正文，再次启动不重复迁移或累计。
+- v22 新增上述三个上下文表，`ContextSchemaMigration` 扩展 `ai_usage_attempt.purpose` 约束以允许 CONTEXT_COMPACT，保留原用量记录与索引。升级前快照仍在 APP_ROOT/backups；不伪造旧工具步骤、不把旧摘要转换为新检查点，重复启动不重复迁移或累计。
 - `AiConnectionsStore` 在首次管理读取时幂等迁移旧 chat/import，保留密文与参数；旧表保留为迁移源，已迁移的用途写入统一走连接接口。全局预算不由模型参数迁移，不创建重复的每模型副本。
 - 旧备份缺列时按兼容路径读取；恢复流程在换库前做 staged 校验，换库后执行安全事务（重置记忆启用/同意指纹、推进 vault epoch 与会话 generation、处理 RUNNING turn 与活动 job）。
 - 修改表结构时同步更新本文与 `schema.sql`，并补迁移测试；数据模型属于状态文档，不写未落地的计划字段。

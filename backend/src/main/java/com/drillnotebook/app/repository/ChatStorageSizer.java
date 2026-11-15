@@ -68,7 +68,9 @@ public final class ChatStorageSizer {
     public static long globalHistoryBytes(Connection connection) throws SQLException {
         String sql = "SELECT"
                 + " (SELECT COALESCE(SUM(" + MESSAGE_BYTES_SQL + "), 0) FROM ai_chat_message)"
-                + " + (SELECT COALESCE(SUM(" + TURN_META_BYTES_SQL + "), 0) FROM ai_chat_turn)";
+                + " + (SELECT COALESCE(SUM(" + TURN_META_BYTES_SQL + "), 0) FROM ai_chat_turn)"
+                + " + (SELECT COALESCE(SUM(byte_length), 0) FROM ai_context_entry)"
+                + " + (SELECT COALESCE(SUM(byte_length), 0) FROM ai_context_checkpoint)";
         return singleScalar(connection, sql);
     }
 
@@ -85,7 +87,9 @@ public final class ChatStorageSizer {
         return scalar(connection, "SELECT COALESCE(SUM(" + MESSAGE_BYTES_SQL + "), 0) FROM ai_chat_message"
                 + " WHERE session_id = ?", sessionId)
                 + scalar(connection, "SELECT COALESCE(SUM(" + TURN_META_BYTES_SQL + "), 0) FROM ai_chat_turn"
-                + " WHERE session_id = ?", sessionId);
+                + " WHERE session_id = ?", sessionId)
+                + scalar(connection, "SELECT COALESCE(SUM(byte_length), 0) FROM ai_context_entry WHERE session_id = ?", sessionId)
+                + scalar(connection, "SELECT COALESCE(SUM(byte_length), 0) FROM ai_context_checkpoint WHERE session_id = ?", sessionId);
     }
 
     /** 某会话的附件字节（经轮次归属）。 */
@@ -117,7 +121,8 @@ public final class ChatStorageSizer {
                 long bytes = result.getLong(1);
                 long userMessageId = result.getLong(2);
                 long assistantMessageId = result.getLong(3);
-                return bytes + messageBytesById(connection, userMessageId) + messageBytesById(connection, assistantMessageId);
+                return bytes + messageBytesById(connection, userMessageId) + messageBytesById(connection, assistantMessageId)
+                        + scalar(connection, "SELECT COALESCE(SUM(byte_length), 0) FROM ai_context_entry WHERE turn_id = ?", turnId);
             }
         }
     }

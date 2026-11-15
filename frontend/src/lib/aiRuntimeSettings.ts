@@ -8,8 +8,14 @@ export interface AiRetrySettings {
 }
 export const DEFAULT_RETRY_SETTINGS: AiRetrySettings = { httpRetries: 4, streamRetries: 5, networkPersistent: true, networkRetries: 5 };
 export const runtimeRetrySettings = (values: AiRuntimeSettings): AiRetrySettings => values.retry ?? DEFAULT_RETRY_SETTINGS;
-export type RuntimeLimitKey = Exclude<keyof AiRuntimeSettings, 'retry'>;
-export type RuntimeErrorKey = RuntimeLimitKey | 'httpRetries' | 'streamRetries' | 'networkRetries';
+export interface AiContextSettings {
+  autoCompact: boolean;
+  thresholdPercent: number;
+}
+export const DEFAULT_CONTEXT_SETTINGS: AiContextSettings = { autoCompact: true, thresholdPercent: 80 };
+export const runtimeContextSettings = (values: AiRuntimeSettings): AiContextSettings => values.context ?? DEFAULT_CONTEXT_SETTINGS;
+export type RuntimeLimitKey = Exclude<keyof AiRuntimeSettings, 'retry' | 'context'>;
+export type RuntimeErrorKey = RuntimeLimitKey | 'httpRetries' | 'streamRetries' | 'networkRetries' | 'thresholdPercent';
 
 export interface AiRuntimeSettings {
   maxToolStages: number;
@@ -21,6 +27,7 @@ export interface AiRuntimeSettings {
   finalOutputTokens: number;
   repeatedToolLimit: number;
   retry?: AiRetrySettings;
+  context?: AiContextSettings;
 }
 export interface AiRuntimeSettingsView {
   revision: number;
@@ -50,6 +57,10 @@ export function validateRuntimeSettings(values: AiRuntimeSettings): Partial<Reco
   const retry = runtimeRetrySettings(values);
   for (const key of ['httpRetries', 'streamRetries', 'networkRetries'] as const) {
     if (!Number.isInteger(retry[key]) || retry[key] < 0 || retry[key] > 100) errors[key] = '请输入 0–100 之间的整数';
+  }
+  const context = runtimeContextSettings(values);
+  if (!Number.isInteger(context.thresholdPercent) || context.thresholdPercent < 65 || context.thresholdPercent > 95) {
+    errors.thresholdPercent = '请输入 65–95 之间的整数';
   }
   return errors;
 }

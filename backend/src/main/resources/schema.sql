@@ -2,6 +2,57 @@ CREATE TABLE IF NOT EXISTS schema_version (
     version INTEGER NOT NULL
 );
 
+-- v0.8.3: encrypted model-visible steps. Bodies never enter usage/context numeric audits.
+CREATE TABLE IF NOT EXISTS ai_context_entry (
+    id TEXT PRIMARY KEY,
+    session_id INTEGER NOT NULL REFERENCES ai_chat_session(id) ON DELETE CASCADE,
+    turn_id INTEGER NOT NULL REFERENCES ai_chat_turn(id) ON DELETE CASCADE,
+    request_id TEXT NOT NULL,
+    context_generation INTEGER NOT NULL,
+    sequence INTEGER NOT NULL CHECK (sequence > 0),
+    revision INTEGER NOT NULL CHECK (revision > 0),
+    kind TEXT NOT NULL CHECK (kind IN ('TOOL_STEP', 'ASSISTANT_SEGMENT', 'RECOVERY')),
+    state TEXT NOT NULL CHECK (state IN ('OPEN', 'CLOSED')),
+    provider_fingerprint TEXT NOT NULL,
+    protocol TEXT NOT NULL,
+    model TEXT NOT NULL,
+    payload_cipher TEXT NOT NULL,
+    payload_crypto TEXT NOT NULL,
+    fingerprint TEXT NOT NULL,
+    estimated_tokens INTEGER NOT NULL CHECK (estimated_tokens >= 0),
+    byte_length INTEGER NOT NULL CHECK (byte_length >= 0),
+    created_at TEXT NOT NULL,
+    UNIQUE (turn_id, sequence)
+);
+CREATE INDEX IF NOT EXISTS idx_context_entry_turn ON ai_context_entry(turn_id, sequence);
+
+-- Continuation checkpoints use chat encryption, independently of the memory vault.
+CREATE TABLE IF NOT EXISTS ai_context_checkpoint (
+    session_id INTEGER PRIMARY KEY REFERENCES ai_chat_session(id) ON DELETE CASCADE,
+    revision INTEGER NOT NULL CHECK (revision > 0),
+    context_generation INTEGER NOT NULL,
+    history_revision INTEGER NOT NULL,
+    policy_revision INTEGER NOT NULL,
+    memory_boundary TEXT NOT NULL,
+    memory_revision INTEGER,
+    provider_fingerprint TEXT NOT NULL,
+    protocol TEXT NOT NULL,
+    model TEXT NOT NULL,
+    strategy_version TEXT NOT NULL,
+    payload_cipher TEXT NOT NULL,
+    payload_crypto TEXT NOT NULL,
+    byte_length INTEGER NOT NULL CHECK (byte_length >= 0),
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS ai_context_compaction_lease (
+    session_id INTEGER PRIMARY KEY REFERENCES ai_chat_session(id) ON DELETE CASCADE,
+    lease_token TEXT NOT NULL,
+    input_fingerprint TEXT NOT NULL,
+    expires_at INTEGER NOT NULL,
+    state TEXT NOT NULL CHECK (state IN ('RUNNING', 'SUCCEEDED', 'FAILED'))
+);
+
 CREATE TABLE IF NOT EXISTS ai_connections (
     id INTEGER PRIMARY KEY CHECK (id = 1),
     revision INTEGER NOT NULL,
@@ -626,7 +677,7 @@ CREATE TABLE IF NOT EXISTS ai_usage_attempt (
     operation_id TEXT NOT NULL,
     context_plan_id TEXT,
     purpose TEXT NOT NULL CHECK (purpose IN
-        ('CHAT', 'MEMORY_EXTRACT', 'SESSION_SUMMARY', 'FORMAT_REPAIR')),
+        ('CHAT', 'CONTEXT_COMPACT', 'MEMORY_EXTRACT', 'SESSION_SUMMARY', 'FORMAT_REPAIR')),
     target_fingerprint TEXT NOT NULL,
     budget_date TEXT NOT NULL,
     budget_timezone TEXT NOT NULL,

@@ -2,6 +2,7 @@ package com.drillnotebook.app.controller;
 
 import com.drillnotebook.app.model.AiRuntimeSettings;
 import com.drillnotebook.app.model.AiRetrySettings;
+import com.drillnotebook.app.model.AiContextSettings;
 import com.drillnotebook.app.repository.AiRuntimeSettingsRepository;
 import com.fasterxml.jackson.databind.JsonNode;
 import java.util.Map;
@@ -25,7 +26,7 @@ public class AiRuntimeSettingsController {
         var next = new AiRuntimeSettings(integer(values, "maxToolStages"), integer(values, "maxToolExecutions"),
                 integer(values, "turnTimeoutMinutes"), integer(values, "requestTimeoutMinutes"),
                 integer(values, "maxOutputTokens"), integer(values, "requestOutputTokens"),
-                integer(values, "finalOutputTokens"), integer(values, "repeatedToolLimit"), retry(values));
+                integer(values, "finalOutputTokens"), integer(values, "repeatedToolLimit"), retry(values), context(values));
         return view(settings.save(body.path("revision").longValue(), next));
     }
 
@@ -42,6 +43,15 @@ public class AiRuntimeSettingsController {
         if (!retry.path("networkPersistent").isBoolean()) throw new IllegalArgumentException("请选择断网等待方式");
         return new AiRetrySettings(integer(retry, "httpRetries"), integer(retry, "streamRetries"),
                 retry.path("networkPersistent").booleanValue(), integer(retry, "networkRetries"));
+    }
+
+    private AiContextSettings context(JsonNode values) {
+        if (!values.has("context")) return settings.read().values().context();
+        JsonNode context = values.path("context");
+        if (!context.isObject() || context.size() != 2 || !context.path("autoCompact").isBoolean()) {
+            throw new IllegalArgumentException("上下文管理须提供自动压缩开关和阈值");
+        }
+        return new AiContextSettings(context.path("autoCompact").booleanValue(), integer(context, "thresholdPercent"));
     }
 
     private static Map<String, Object> view(AiRuntimeSettingsRepository.Snapshot snapshot) {

@@ -32,7 +32,7 @@ export function MemorySettingsCard(): JSX.Element {
   const settings = settingsQuery.data;
   usePageContextSection('memory-settings', pageContextRows('记忆', settings ? [
     ['启用记忆', settings.enabled],
-    ['自动整理对话', settings.enabled ? settings.autoExtract && settings.compressSession : undefined],
+    ['自动整理对话', settings.enabled ? settings.autoExtract : undefined],
     ['当前 AI 连接', Object.values(settings.consents).some(consent => consent?.target?.configured && consent.target.keyPresent) ? '已配置' : '未配置'],
     ['存储', '记忆保存在本机，只交给当前配置的 AI 连接']
   ] : [['状态', settingsQuery.isPending ? '正在读取记忆设置…' : '记忆设置读取失败']]));
@@ -82,7 +82,6 @@ export function MemorySettingsCard(): JSX.Element {
       await updateMemorySettings(revision, {
         enabled: true,
         autoExtract: true,
-        compressSession: true,
         autoApplyLowRisk: true
       });
     },
@@ -144,7 +143,7 @@ export function MemorySettingsCard(): JSX.Element {
   const targetReady = Object.values(settings.consents).some(
     (consent) => consent?.target?.configured && consent?.target?.keyPresent
   );
-  const autoOrganize = settings.autoExtract && settings.compressSession;
+  const autoOrganize = settings.autoExtract;
 
   return (
     <section className="panel">
@@ -183,12 +182,12 @@ export function MemorySettingsCard(): JSX.Element {
             <div>
               <Typography.Text bold>自动整理对话</Typography.Text>
               <br />
-              <Typography.Text type="secondary">关闭后仍可手动添加，已有记忆不受影响。</Typography.Text>
+              <Typography.Text type="secondary">从已授权的对话整理长期记忆；关闭后仍可手动添加。</Typography.Text>
             </div>
             <Switch
               checked={autoOrganize}
               loading={patchMutation.isPending}
-              onChange={(checked) => patchMutation.mutate({ autoExtract: checked, compressSession: checked })}
+              onChange={(checked) => patchMutation.mutate({ autoExtract: checked })}
               aria-label="自动整理对话"
             />
           </div>

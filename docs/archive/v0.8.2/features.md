@@ -1,6 +1,6 @@
 # v0.8.2 功能需求清单
 
-> 状态：F01 笔记混合检索、F02 联网搜索工具与 F03 会话重试 / 模型选择修正均已实现并通过工程验证（2026-11-14）。F02 的真实匿名搜索 / 抓取探测通过，持钥及原生供应商仍为协议桩验证。本版尚未发布。此前从 v0.8.1 顺延的检索接入决定见[全局清单](../features.md#笔记混合检索接入资料工具v082已实现)。
+> 状态：F01 笔记混合检索、F02 联网搜索工具与 F03 会话重试 / 模型选择修正均已实现并通过工程验证（2026-11-14）。F02 的真实匿名搜索 / 抓取探测通过，持钥及原生供应商仍为协议桩验证。本版尚未发布。此前从 v0.8.1 顺延的检索接入决定见[全局清单](../../features.md#笔记混合检索接入资料工具v082已实现)。
 
 > F04 上下文统计与逐请求详情已实现并通过工程验证（2026-11-15）：上下文总量是最后实际主请求及其响应的快照，输入 / 输出 / 缓存是会话累计；阈值触发的上下文压缩计划在 v0.8.3 实现。
 
@@ -14,10 +14,10 @@
 
 | 功能 | 状态 | 入口 |
 |---|---|---|
-| F01 笔记混合检索接入资料工具 | 已实现，工程验证通过 | [需求](../work/material-hybrid-search/requirements.md)、[UI/UX](../work/material-hybrid-search/ui-ux.md)、[规格](../work/material-hybrid-search/spec.md)、[计划与验证](../work/material-hybrid-search/plan.md) |
-| F02 联网搜索工具接入 | 已实现，工程验证与匿名服务探测通过 | [需求](../work/web-search/requirements.md)、[UI/UX](../work/web-search/ui-ux.md)、[规格](../work/web-search/spec.md)、[实施](../work/web-search/plan.md)、[QA](../work/web-search/qa.md)、[工具设置草图](../work/web-search/settings-preview.html)、[助手搜索草图](../work/web-search/assistant-preview.html) |
-| F03 会话原地重试与独立模型选择修正 | 已实现，工程验证通过 | [范围](#6-会话原地重试与独立模型选择修正)、[规格](../work/ai-conversation/spec.md)、[UI/UX](../work/ai-conversation/ui-ux.md)、[验证](../work/ai-conversation/plan.md#原地重试与会话独立选模修正2026-11-14) |
-| F04 上下文统计与逐请求详情 | 已实现，工程验证通过 | [范围](#7-f04-上下文统计与逐请求详情)、[规格](../work/ai-conversation/spec.md#上下文统计与逐请求详情)、[UI/UX](../work/ai-conversation/ui-ux.md#8-上下文统计与逐请求详情)、[验证](../work/ai-conversation/plan.md#上下文统计与逐请求详情2026-11-15) |
+| F01 笔记混合检索接入资料工具 | 已实现，工程验证通过 | [需求](material-hybrid-search/requirements.md)、[UI/UX](material-hybrid-search/ui-ux.md)、[规格](material-hybrid-search/spec.md)、[计划与验证](material-hybrid-search/plan.md) |
+| F02 联网搜索工具接入 | 已实现，工程验证与匿名服务探测通过 | [需求](web-search/requirements.md)、[UI/UX](web-search/ui-ux.md)、[规格](web-search/spec.md)、[实施](web-search/plan.md)、[QA](web-search/qa.md)、[工具设置草图](web-search/settings-preview.html)、[助手搜索草图](web-search/assistant-preview.html) |
+| F03 会话原地重试与独立模型选择修正 | 已实现，工程验证通过 | [范围](#6-会话原地重试与独立模型选择修正)、[规格](ai-conversation/spec.md)、[UI/UX](ai-conversation/ui-ux.md)、[验证](ai-conversation/plan.md#原地重试与会话独立选模修正2026-11-14) |
+| F04 上下文统计与逐请求详情 | 已实现，工程验证通过 | [范围](#7-f04-上下文统计与逐请求详情)、[规格](ai-conversation/spec.md#上下文统计与逐请求详情)、[UI/UX](ai-conversation/ui-ux.md#8-上下文统计与逐请求详情)、[验证](ai-conversation/plan.md#上下文统计与逐请求详情2026-11-15) |
 
 ## 2. F01 范围与行为
 
@@ -33,7 +33,7 @@
 
 后端相关 **16 类 / 202 项：201 通过、0 失败、0 错误、1 项既有跳过**；前端相关 **4 文件 / 38 项全部通过**。已覆盖同义查询的 provider 桩、精确查找、范围、分页 / 去重、Unicode 片段与字节预算、过期分块、向量降级、Chat Completions 普通 / 流式与 Anthropic 工具编排，以及 OpenAI / Ollama 授权配置到索引和查询的协议桩链路。
 
-TypeScript / Vite 构建和后端隔离打包通过；647 个应用 class 与隔离编译逐一一致，开发 JAR 已同步并核对 SHA-256。运行时落盘与静态便携审计通过。详细证据及跳过条件见[计划](../work/material-hybrid-search/plan.md#3-验证结果)和[QA](../test/QA_CHECKLIST.md#模块三十三笔记混合检索接入资料工具v082)。
+TypeScript / Vite 构建和后端隔离打包通过；647 个应用 class 与隔离编译逐一一致，开发 JAR 已同步并核对 SHA-256。运行时落盘与静态便携审计通过。详细证据及跳过条件见[计划](material-hybrid-search/plan.md#3-验证结果)和[QA](../../test/QA_CHECKLIST.md#模块三十三笔记混合检索接入资料工具v082)。
 
 工程验证不等于真实中文笔记的召回率、单轮准确度或 Token 收益评测。真实本地模型下载、真实供应商对照、Electron 实机及完整发行验收尚未执行；本次未修改版本默认值、打标签或发布。
 
@@ -41,15 +41,15 @@ TypeScript / Vite 构建和后端隔离打包通过；647 个应用 class 与隔
 
 - 助手按需调用 search 查找网页与来源，再用 fetch 读取指定 URL 正文；两类工具均纳入现有全局工具目录、运行限制与停止机制。
 - 无自定义配置时，免配置内置服务默认启用。首批自定义供应商为 **TinyFish、Tavily**，搜索与 URL 抓取可分别选择供应商，配置可保存并测试连接。
-- 提供「优先使用模型内置 Web 工具」开关，默认关闭；按本轮受理时的模型、端点与协议分别判断能力。已适配 Anthropic 官方 Messages search / fetch 与 OpenAI 官方连接的隔离 Responses search；未知网关或不支持的能力使用所选服务，具体矩阵见[规格](../work/web-search/spec.md#原生联网支持矩阵)。原生调用共用阶段、输出、时间与用量账本。
+- 提供「优先使用模型内置 Web 工具」开关，默认关闭；按本轮受理时的模型、端点与协议分别判断能力。已适配 Anthropic 官方 Messages search / fetch 与 OpenAI 官方连接的隔离 Responses search；未知网关或不支持的能力使用所选服务，具体矩阵见[规格](web-search/spec.md#原生联网支持矩阵)。原生调用共用阶段、输出、时间与用量账本。
 - 用户已确认默认采用 **「内置自动」**：search 优先 Exa 官方免密钥 MCP，受限或不可用时有界尝试 Tavily Keyless；fetch 优先本地 HTTP 正文提取，正文不足时尝试 Exa fetch / Tavily Extract。Exa 当前匿名实际搜索返回 3 个来源，抓取也取得正文；Tavily 当前两项探测均返回日额度 429，不将单次成功当作持续服务保证。
 - 「设置 → 工具」增加联网搜索、网页读取及服务配置；搜索与读取默认开启。助手输入栏增加地球按钮，快速控制同一对全局权限，全开时点击全关、全关或部分开启时点击全开；跨会话、重启保存。服务配置只在工具页编辑，开关即点即存，服务草稿保存 / 取消 / 测试；同一供应商共用密钥，不增加重复开关或重复供应商菜单。
 - 匿名服务有独立限流，官方定位为探索与轻量使用；不承诺无限额度或长期服务保证。额度不足、超时与真实上游报错须可见，不通过轮换公共实例或内置共享密钥掩盖限制。
 - 工具只接收必要查询或目标 URL，返回有界片段、正文和真实来源；不自动上传本地笔记、记忆或整段会话。配置、缓存与临时数据落在 APP_ROOT，URL 抓取限公开 HTTP(S)，不复用用户登录状态。
 
-两项工具已进入统一普通 / SSE 编排，目录共 22 项、默认 18 开 / 4 关。服务配置使用 schema 19 的 `ai_web_settings`，同供应商共享加密密钥，revision 冲突不覆盖其它窗口。公开 URL、连接时 DNS、重定向、解压与内容预算已约束；单次远程尝试不超过 10 秒，整个工具不超过 20 秒，停止与安全拒绝不以降级掩盖。协议与接口见[规格](../work/web-search/spec.md)，已核对的供应商依据见[需求](../work/web-search/requirements.md)，界面行为见 [UI/UX](../work/web-search/ui-ux.md)。
+两项工具已进入统一普通 / SSE 编排，目录共 22 项、默认 18 开 / 4 关。服务配置使用 schema 19 的 `ai_web_settings`，同供应商共享加密密钥，revision 冲突不覆盖其它窗口。公开 URL、连接时 DNS、重定向、解压与内容预算已约束；单次远程尝试不超过 10 秒，整个工具不超过 20 秒，停止与安全拒绝不以降级掩盖。协议与接口见[规格](web-search/spec.md)，已核对的供应商依据见[需求](web-search/requirements.md)，界面行为见 [UI/UX](web-search/ui-ux.md)。
 
-后端相关 **46 类 / 443 项**，回归阶段 442 通过、1 项匿名探测按条件跳过，随后显式运行该探测并通过；最终 443 项均通过、0 失败、0 错误。前端相关 **17 文件 / 180 项：178 通过，2 项既有证据截图测试跳过**。TypeScript / Vite 构建与隔离后端打包通过，679 个应用 class 与同轮编译逐一一致，开发 JAR 已同步并核对 SHA-256。真实匿名搜索由 Exa 完成，fetch 在本地读取超时后由 Exa 取得正文；运行时落盘与静态便携审计通过。完整结果、命令与实测边界见 [QA](../work/web-search/qa.md)。
+后端相关 **46 类 / 443 项**，回归阶段 442 通过、1 项匿名探测按条件跳过，随后显式运行该探测并通过；最终 443 项均通过、0 失败、0 错误。前端相关 **17 文件 / 180 项：178 通过，2 项既有证据截图测试跳过**。TypeScript / Vite 构建与隔离后端打包通过，679 个应用 class 与同轮编译逐一一致，开发 JAR 已同步并核对 SHA-256。真实匿名搜索由 Exa 完成，fetch 在本地读取超时后由 Exa 取得正文；运行时落盘与静态便携审计通过。完整结果、命令与实测边界见 [QA](web-search/qa.md)。
 
 ## 5. 本版暂不纳入
 
@@ -59,7 +59,7 @@ TypeScript / Vite 构建和后端隔离打包通过；647 个应用 class 与隔
 - 长期记忆联网同步、通用 MCP 市场、浏览器登录 / 自动操作、批量全站爬取，以及随软件打包 SearXNG / Docker / Crawl4AI 服务。
 - 按上下文占用阈值触发的自动压缩，计划 v0.8.3 实现；当前发送仍采用既有有界投影和输入预算。
 
-F01 施工材料保留在 `docs/work/material-hybrid-search/`，F02 材料保留在 `docs/work/web-search/`；当前接口、架构、数据模型与 QA 已同步已验证行为。真实 Tavily / TinyFish 持钥账户、OpenAI / Anthropic 原生账户、Electron 明暗 / 窄宽布局及完整发行验收尚未执行；不把协议桩或单次匿名成功作为持续可用性承诺。本次不修改版本默认值、不提交、推送或发布。
+F01 施工材料保留在 `docs/archive/v0.8.2/material-hybrid-search/`，F02 材料保留在 `docs/archive/v0.8.2/web-search/`；当前接口、架构、数据模型与 QA 已同步已验证行为。真实 Tavily / TinyFish 持钥账户、OpenAI / Anthropic 原生账户、Electron 明暗 / 窄宽布局及完整发行验收尚未执行；不把协议桩或单次匿名成功作为持续可用性承诺。本次不修改版本默认值、不提交、推送或发布。
 
 ## 6. 会话原地重试与独立模型选择修正
 
@@ -71,7 +71,7 @@ F01 施工材料保留在 `docs/work/material-hybrid-search/`，F02 材料保留
 
 schema **20** 增加 `ai_chat_retry_receipt` 和 `ai_chat_session.model_choice_revision`，其余会话模型字段继续复用；数据库、升级快照和测试材料保持 APP_ROOT / 工作区落点。
 
-后端相关 **26 类 / 335 项全部通过**；前端相关 **9 文件 / 143 项：141 通过、2 项既有证据截图测试跳过**，最终窗口 29 项复验通过。TypeScript / Vite 构建、后端隔离打包与两项便携审计通过，680 个应用 class 与同轮编译逐一一致，开发 JAR 已同步。覆盖原轮身份 / 位置 / 时间、完整附件、拒绝后的再次重试、较早轮上下文截止、容量事务、会话隔离与重启、配置快照、标题生成及旧库升级；详细命令和验收范围见[计划](../work/ai-conversation/plan.md#原地重试与会话独立选模修正2026-11-14)。
+后端相关 **26 类 / 335 项全部通过**；前端相关 **9 文件 / 143 项：141 通过、2 项既有证据截图测试跳过**，最终窗口 29 项复验通过。TypeScript / Vite 构建、后端隔离打包与两项便携审计通过，680 个应用 class 与同轮编译逐一一致，开发 JAR 已同步。覆盖原轮身份 / 位置 / 时间、完整附件、拒绝后的再次重试、较早轮上下文截止、容量事务、会话隔离与重启、配置快照、标题生成及旧库升级；详细命令和验收范围见[计划](ai-conversation/plan.md#原地重试与会话独立选模修正2026-11-14)。
 
 ## 7. F04 上下文统计与逐请求详情
 
@@ -86,6 +86,6 @@ schema **20** 增加 `ai_chat_retry_receipt` 和 `ai_chat_session.model_choice_r
 - 最近 50 次已发请求优先展示，更早请求按同轮游标分页；选定旧请求后不会被刷新替换。运行中只读刷新数值，关闭或换轮后忽略迟到响应，来源正文仍须显式逐条对照；顶部当前卡片独立刷新，不依赖旧账本可用性或最后一次 done。
 - schema **21** 增加缓存桶包含标志和每次请求的组成摘要，最多 256 项 / 32 KiB；省略明细仍计入分类总数与总量。当前主请求快照复用 `result_meta_crypto.modelContext` 保存版本、模型、窗口、代数 / 历史版本、分类数字和该次输出，不新增表 / 列。原始参数、结果、提示词和附件不复制落库。旧版本只回退到同轮最后一份 CHAT 请求摘要和该次输出，不借用 NATIVE_WEB 或整轮拼接回答；缺少输出为下界，缺少请求快照为未知。
 
-最后实际请求快照修正的后端相关 **15 类 / 189 项**、前端相关 **3 文件 / 41 项**全部通过，0 失败、0 错误、0 跳过。覆盖实际 HTTP 接收的连续两轮与续接请求、主 / 原生联网请求隔离、602 条本地消息不额外计入、流式 / 终态 / 重启一致、旧数据下界、窗口冻结和既有累计 / 缓存 / 容量事务。TypeScript / Vite、隔离后端打包和两项便携审计通过，124 个前端文件及 696 个应用 class 已核对并同步开发产物。完整结果与复跑命令见[计划](../work/ai-conversation/plan.md#实际请求快照统计修正2026-11-15)和[QA](../test/QA_CHECKLIST.md#模块三十五上下文统计与逐请求详情v082)。
+最后实际请求快照修正的后端相关 **15 类 / 189 项**、前端相关 **3 文件 / 41 项**全部通过，0 失败、0 错误、0 跳过。覆盖实际 HTTP 接收的连续两轮与续接请求、主 / 原生联网请求隔离、602 条本地消息不额外计入、流式 / 终态 / 重启一致、旧数据下界、窗口冻结和既有累计 / 缓存 / 容量事务。TypeScript / Vite、隔离后端打包和两项便携审计通过，124 个前端文件及 696 个应用 class 已核对并同步开发产物。完整结果与复跑命令见[计划](ai-conversation/plan.md#实际请求快照统计修正2026-11-15)和[QA](../../test/QA_CHECKLIST.md#模块三十五上下文统计与逐请求详情v082)。
 
-此前逐行统计全库正文的口径已被修正，验证记录仅作历史基线保留在计划中。harness 调查、窗口驱动的历史预算与压缩仍规划在 [v0.8.3](v0.8.3-features.md)，当前仍为 v0.8.2。真实供应商 Token 对账、Electron 实机和完整发行验收未执行。
+此前逐行统计全库正文的口径已被修正，验证记录仅作历史基线保留在计划中。harness 调查、窗口驱动的历史预算与压缩仍规划在 [v0.8.3](../../state/v0.8.3-features.md)，当前仍为 v0.8.2。真实供应商 Token 对账、Electron 实机和完整发行验收未执行。

@@ -42,6 +42,27 @@ public final class ChatContextWiring {
                         MemoryItemService items, MemorySuppressionRepository suppressions) {
     }
 
+    /** Same injected continuation stack as production; old fixtures can still exercise vault summaries. */
+    public record Managed(Stack stack, ChatContextEntryService entries, com.drillnotebook.app.repository.ChatContextEntryRepository entryRepository,
+                          ContextCoordinator coordinator, com.drillnotebook.app.repository.ChatContextCheckpointRepository checkpoints) {
+        public AiService attach(AiService ai) {
+            ai.setContextEntries(entries); ai.setContextCoordinator(coordinator); return ai;
+        }
+    }
+
+    public static Managed wireManaged(DataSource dataSource, JdbcTemplate jdbc, ChatLegacyWiring.Wiring wiring) {
+        var stack = wire(dataSource, jdbc, wiring);
+        var mapper = new ObjectMapper();
+        var entries = new com.drillnotebook.app.repository.ChatContextEntryRepository(dataSource, wiring.immediate(), wiring.ledger());
+        var service = new ChatContextEntryService(entries, wiring.cipher(), mapper, stack.estimator());
+        var checkpoints = new com.drillnotebook.app.repository.ChatContextCheckpointRepository(dataSource, wiring.immediate(), wiring.ledger());
+        var coordinator = new ContextCoordinator(checkpoints, wiring.cipher(), mapper, stack.estimator());
+        stack.projection().setContextEntries(service); stack.projection().setContextCoordinator(coordinator);
+        stack.contexts().setContextCoordinator(coordinator);
+        stack.inspector().setContextEntries(service); stack.inspector().setContextCoordinator(coordinator); stack.inspector().setMemoryPolicy(stack.policy());
+        return new Managed(stack, service, entries, coordinator, checkpoints);
+    }
+
     public static Stack wire(DataSource dataSource, JdbcTemplate jdbc, ChatLegacyWiring.Wiring wiring) {
         ObjectMapper mapper = new ObjectMapper();
         TokenEstimator estimator = new TokenEstimator(mapper);

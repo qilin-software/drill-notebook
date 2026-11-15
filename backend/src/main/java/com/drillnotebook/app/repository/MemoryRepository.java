@@ -247,6 +247,7 @@ public class MemoryRepository {
             int suppressions = execute(connection, "DELETE FROM ai_memory_suppression WHERE vault_id = ?", oldVaultId);
             int jobs = execute(connection, "DELETE FROM ai_memory_job");
             int contexts = execute(connection, "DELETE FROM ai_session_context");
+            ChatContextCheckpointRepository.invalidateAllIn(connection);
             if (execute(connection, "DELETE FROM ai_memory_vault WHERE id = ?", oldVaultId) != 1) {
                 throw new SQLException("待重置的记忆库行不存在: " + oldVaultId);
             }
@@ -1134,6 +1135,7 @@ public class MemoryRepository {
         if (execute(connection, sql, vaultId) != 1) {
             throw new SQLException("记忆库计数更新未命中单行: " + vaultId);
         }
+        if (advanceEpoch) ChatContextCheckpointRepository.invalidateAllIn(connection);
         try (PreparedStatement statement = connection.prepareStatement(
                 "SELECT id, epoch, revision FROM ai_memory_vault WHERE id = ?")) {
             statement.setString(1, vaultId);

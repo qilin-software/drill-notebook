@@ -298,6 +298,7 @@ public class ChatSessionMetadataRepository {
             }
             advanceScanWatermark(connection, sessionId, ScanKind.MEMORY, restartThroughTurnId);
             advanceScanWatermark(connection, sessionId, ScanKind.SUMMARY, restartThroughTurnId);
+            ChatContextCheckpointRepository.invalidateIn(connection, sessionId);
             // 历史作用域不能被悄悄改回 GLOBAL：切走后仍记录原 notebook id 的归属由服务层的删除钩子负责
             return read(connection, sessionId).orElseThrow().contextGeneration();
         });
@@ -336,6 +337,7 @@ public class ChatSessionMetadataRepository {
         return immediate.execute(connection -> {
             update(connection, "UPDATE ai_chat_session SET context_generation = context_generation + 1 WHERE id = ?",
                     sessionId);
+            ChatContextCheckpointRepository.invalidateIn(connection, sessionId);
             return read(connection, sessionId).orElseThrow().contextGeneration();
         });
     }
