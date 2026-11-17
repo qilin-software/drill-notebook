@@ -97,6 +97,36 @@ class AiUpstreamClientCacheTest {
     }
 
     @Test
+    void cacheFallbackRevalidatesBeforeSendingTheSecondRequest() throws Exception {
+        AtomicInteger requests = new AtomicInteger();
+        AtomicInteger validations = new AtomicInteger();
+        AtomicInteger observedSends = new AtomicInteger();
+        HttpServer server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        server.createContext("/v1/messages", exchange -> {
+            requests.incrementAndGet();
+            exchange.getRequestBody().readAllBytes();
+            respond(exchange, 400, "{\"error\":{\"message\":\"cache_control unsupported\"}}");
+        });
+        server.start();
+        try {
+            String baseUrl = "http://127.0.0.1:" + server.getAddress().getPort();
+            var target = anthropic(baseUrl, true);
+            var prepared = client.prepare(target, messages("问题"), List.of(), false, 8000, "CHAT");
+            var changed = new IllegalStateException("context changed during cache fallback");
+            assertEquals(changed, assertThrows(IllegalStateException.class,
+                    () -> client.callPrepared(target, prepared, null, 10, null, request -> {
+                        if (validations.incrementAndGet() == 2) throw changed;
+                    }, request -> observedSends.incrementAndGet())));
+
+            assertEquals(2, validations.get());
+            assertEquals(1, requests.get(), "版本已变化时不能发送兼容性重试");
+            assertEquals(1, observedSends.get(), "被拦截的重试不能记成已发送");
+        } finally {
+            server.stop(0);
+        }
+    }
+
+    @Test
     void cacheField400DisablesBreakpointForLaterCalls() throws Exception {
         AtomicInteger requests = new AtomicInteger();
         AtomicReference<String> firstBody = new AtomicReference<>();

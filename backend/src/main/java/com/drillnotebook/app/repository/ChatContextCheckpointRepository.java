@@ -28,6 +28,14 @@ public class ChatContextCheckpointRepository {
         try (var connection = dataSource.getConnection()) { return readIn(connection, sessionId); }
     }
 
+    public Long revision(long sessionId) throws SQLException {
+        try (var connection = dataSource.getConnection(); var statement = connection.prepareStatement(
+                "SELECT revision FROM ai_context_checkpoint WHERE session_id = ?")) {
+            statement.setLong(1, sessionId);
+            try (var row = statement.executeQuery()) { return row.next() ? row.getLong(1) : null; }
+        }
+    }
+
     private static Optional<Checkpoint> readIn(Connection connection, long sessionId) throws SQLException {
         try (var statement = connection.prepareStatement("SELECT * FROM ai_context_checkpoint WHERE session_id = ?")) {
             statement.setLong(1, sessionId);
@@ -126,38 +134,60 @@ public class ChatContextCheckpointRepository {
         try (var statement = connection.prepareStatement("SELECT revision FROM ai_memory_settings WHERE id = 1")) {
             try (var row = statement.executeQuery()) { if (row.next() && row.getLong(1) != policyRevision) return false; }
         }
+        if (sources.size() > 65536 || sources.stream().anyMatch(source -> source.turnId() > beforeTurnId)) return false;
+        var turns = sources.stream().filter(source -> "TURN".equals(source.kind())).toList();
+        for (int from = 0; from < turns.size(); from += 256) {
+            var batch = turns.subList(from, Math.min(turns.size(), from + 256));
+            var expected = new java.util.HashMap<Long, ContextSource>();
+            for (var source : batch) {
+                if (source.turnId() >= beforeTurnId || !source.id().equals(String.valueOf(source.turnId()))
+                        || expected.put(source.turnId(), source) != null) return false;
+            }
+            try (var statement = connection.prepareStatement("SELECT id, request_id, context_generation, source_revision, status, content_deleted_at"
+                    + " FROM ai_chat_turn WHERE session_id = ? AND id IN (" + placeholders(batch.size()) + ")")) {
+                statement.setLong(1, sessionId);
+                for (int i = 0; i < batch.size(); i++) statement.setLong(i + 2, batch.get(i).turnId());
+                try (var rows = statement.executeQuery()) { while (rows.next()) {
+                    var source = expected.remove(rows.getLong(1));
+                    if (source == null || !source.requestId().equals(rows.getString(2)) || generation != rows.getLong(3)
+                            || source.revision() != rows.getLong(4) || !"COMPLETED".equals(rows.getString(5)) || rows.getString(6) != null
+                            || !source.fingerprint().equals(com.drillnotebook.app.service.ChatContextEntryService.fingerprint(rows.getString(2) + ":" + rows.getLong(4)))) return false;
+                } }
+                if (!expected.isEmpty()) return false;
+            }
+        }
+        var steps = sources.stream().filter(source -> "STEP".equals(source.kind())).toList();
+        for (int from = 0; from < steps.size(); from += 256) {
+            var batch = steps.subList(from, Math.min(steps.size(), from + 256));
+            var expected = new java.util.HashMap<String, ContextSource>();
+            for (var source : batch) if (expected.put(source.id(), source) != null) return false;
+            try (var statement = connection.prepareStatement("SELECT e.id, e.turn_id, e.request_id, e.context_generation, e.revision, e.fingerprint, e.state,"
+                    + " t.request_id, t.content_deleted_at, t.context_generation FROM ai_context_entry e JOIN ai_chat_turn t ON t.id=e.turn_id AND t.session_id=e.session_id"
+                    + " WHERE e.session_id = ? AND e.id IN (" + placeholders(batch.size()) + ")")) {
+                statement.setLong(1, sessionId);
+                for (int i = 0; i < batch.size(); i++) statement.setString(i + 2, batch.get(i).id());
+                try (var rows = statement.executeQuery()) { while (rows.next()) {
+                    var source = expected.remove(rows.getString(1));
+                    if (source == null || source.turnId() != rows.getLong(2) || !source.requestId().equals(rows.getString(3))
+                            || generation != rows.getLong(4) || source.revision() != rows.getLong(5) || !source.fingerprint().equals(rows.getString(6))
+                            || !"CLOSED".equals(rows.getString(7)) || !source.requestId().equals(rows.getString(8))
+                            || rows.getString(9) != null || generation != rows.getLong(10)) return false;
+                } }
+                if (!expected.isEmpty()) return false;
+            }
+        }
         for (ContextSource source : sources) {
-            if (source.turnId() > beforeTurnId) return false;
-            if ("STEP".equals(source.kind())) {
-                var entry = ChatContextEntryRepository.find(connection, source.id());
-                if (entry.isEmpty() || entry.get().sessionId() != sessionId || entry.get().turnId() != source.turnId() || entry.get().generation() != generation
-                        || !entry.get().requestId().equals(source.requestId()) || entry.get().revision() != source.revision()
-                        || !entry.get().fingerprint().equals(source.fingerprint()) || !"CLOSED".equals(entry.get().state())) return false;
-                try (var statement = connection.prepareStatement("SELECT request_id, content_deleted_at FROM ai_chat_turn WHERE id = ?")) {
-                    statement.setLong(1, source.turnId()); try (var row = statement.executeQuery()) {
-                        if (!row.next() || row.getString(2) != null || !source.requestId().equals(row.getString(1))) return false;
-                    }
-                }
-            } else if ("ANCHOR".equals(source.kind())) {
+            if ("ANCHOR".equals(source.kind())) {
                 var current = anchorIn(connection, sessionId, source.turnId());
                 if (current.isEmpty() || !current.get().equals(source)) return false;
             } else if ("LEGACY".equals(source.kind())) {
                 if (generation != 1 || !ChatHistoryRepository.legacySourceMatchesIn(connection, sessionId, source)) return false;
-            } else if ("TURN".equals(source.kind())) {
-                if (source.turnId() >= beforeTurnId) return false;
-                try (var statement = connection.prepareStatement("SELECT request_id, context_generation, source_revision, status, content_deleted_at FROM ai_chat_turn WHERE id = ? AND session_id = ?")) {
-                    statement.setLong(1, source.turnId()); statement.setLong(2, sessionId);
-                    try (var row = statement.executeQuery()) {
-                        if (!row.next() || !source.requestId().equals(row.getString(1)) || generation != row.getLong(2)
-                                || source.revision() != row.getLong(3) || !"COMPLETED".equals(row.getString(4)) || row.getString(5) != null
-                                || !source.fingerprint().equals(com.drillnotebook.app.service.ChatContextEntryService.fingerprint(
-                                        row.getString(1) + ":" + row.getLong(3)))) return false;
-                    }
-                }
-            } else return false;
+            } else if (!"TURN".equals(source.kind()) && !"STEP".equals(source.kind())) return false;
         }
         return true;
     }
+
+    private static String placeholders(int count) { return String.join(",", java.util.Collections.nCopies(count, "?")); }
 
     public boolean publish(Checkpoint next, Long expectedRevision, String lease, List<ContextSource> sources, long beforeTurnId, long now) throws SQLException {
         return publish(next, expectedRevision, lease, sources, beforeTurnId, now, () -> false);

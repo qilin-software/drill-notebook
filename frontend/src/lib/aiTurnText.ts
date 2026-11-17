@@ -6,6 +6,7 @@
 import type { ChatResultView } from './aiStream';
 
 interface TurnStatusLike {
+  failure?: ChatResultView['failure'];
   status?: string;
   active?: boolean;
   finishReason?: string;
@@ -91,6 +92,7 @@ export function outcomeNotice(view: ChatResultView): TurnNotice | undefined {
   if (view.stateDurable === false) {
     return { code: 'PERSISTENCE_FAILED', message: NOTICE_TEXT.PERSISTENCE_FAILED };
   }
+  if (view.failure && view.status !== 'COMPLETED') return view.failure;
   const stopped = executionStopNotice(view.finishReason);
   if (stopped) return stopped;
   if (view.status && view.status !== 'COMPLETED') {
@@ -107,6 +109,7 @@ export function outcomeNotice(view: ChatResultView): TurnNotice | undefined {
 
 /** 查状态查出来的终态也要有话可说。 */
 export function statusNotice(status: TurnStatusLike): TurnNotice {
+  if (status.failure && status.status !== 'COMPLETED' && status.status !== 'RUNNING') return status.failure;
   const stopped = executionStopNotice(status.finishReason);
   if (stopped) return stopped;
   const text = turnStatusText(status.status);
@@ -251,10 +254,11 @@ const HISTORY_TEXT = {
 };
 
 /** 历史行自带的如实标注：清理过的原文与失败/中断终态各说各的，不许伪装成一次正常回答（§7.4、§4.5）。 */
-export function historyNotice(row: { role?: string; turnStatus?: string | null; contentDeleted?: boolean; finishReason?: string }): TurnNotice | undefined {
+export function historyNotice(row: { role?: string; turnStatus?: string | null; contentDeleted?: boolean; finishReason?: string; failure?: ChatResultView['failure'] }): TurnNotice | undefined {
   if (row.contentDeleted) return { code: 'CONTENT_DELETED', message: HISTORY_TEXT.CONTENT_DELETED };
   // 轮次状态描述的是助手生成结果，不能把用户已保存的提问也标成生成失败。
   if (row.role && row.role !== 'assistant') return undefined;
+  if (row.failure && row.turnStatus !== 'COMPLETED') return row.failure;
   const stopped = executionStopNotice(row.finishReason);
   if (stopped) return stopped;
   if (row.turnStatus && row.turnStatus !== 'COMPLETED') {

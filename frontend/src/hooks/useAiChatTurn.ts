@@ -55,6 +55,8 @@ export interface OriginalTurnInput {
 
 /** GET /turns/{requestId} 的可见事实（§4.5）：界面只能拿这些字段描述这一轮。 */
 export interface TurnStatusView {
+  failure?: ChatResultView['failure'];
+  contextCompaction?: import('../lib/aiStream').ContextCompaction;
   retryOf?: string | null;
   recovery?: AiRecovery | null;
   supplements?: ChatSupplement[];
@@ -74,7 +76,7 @@ export interface TurnStatusView {
 }
 
 export type TurnEvent =
-  | { type: 'compaction'; requestId: string; running: boolean }
+  | { type: 'compaction'; requestId: string; running: boolean; completed?: boolean }
   | { type: 'recovery'; requestId: string; recovery: AiRecovery | null }
   | { type: 'supplements'; requestId: string; supplements: ChatSupplement[] }
   | { type: 'snapshot'; requestId: string; status: TurnStatusView }
@@ -84,7 +86,7 @@ export type TurnEvent =
   | { type: 'text'; requestId: string; delta: string }
   | { type: 'reasoning'; requestId: string; delta: string }
   | { type: 'result'; requestId: string; reply: string; reasoning: string; view: ChatResultView }
-  | { type: 'failure'; requestId: string; message: string; view: ChatResultView }
+  | { type: 'failure'; requestId: string; message: string; view: ChatResultView; notStarted?: boolean }
   // 连接没了但后端有这一轮：界面按服务端终态如实显示，不许当完成
   | { type: 'status'; requestId: string; status: TurnStatusView; message?: string }
   // 连状态都读不到（存储降级到底）：只能说"这一轮结果未知"
@@ -271,13 +273,8 @@ export function useAiChatTurn({ sessionId, onEvent }: UseAiChatTurnOptions): {
         return;
       }
       const message = friendlyMessage(error, 'AI 对话失败，请稍后重试');
-      emit(turn, {
-        type: 'failure',
-        requestId: turn.requestId,
-        message: note ? `${note}；备用通道也不通：${message}` : message,
-        view: {}
-      });
-      finish(turn);
+      // HTTP 错误也可能发生在受理之后；核对原身份，不能把已保存的失败当作未开始。
+      await lookupStatus(turn, note ? `${note}；备用通道也不通：${message}` : message);
     }
   };
 
@@ -310,7 +307,8 @@ export function useAiChatTurn({ sessionId, onEvent }: UseAiChatTurnOptions): {
         if (error instanceof ApiError && error.code === 'TURN_NOT_FOUND') {
           if (turn.fallbackTried || turn.begun || turn.produced) {
             // 回退额度用完了还是"查无此轮 + 会话忙"：那就是别人占着这个会话，如实报，绝不再试第二次
-            emit(turn, { type: 'failure', requestId: turn.requestId, message: message || '该会话已有一轮正在进行，请稍后再试', view: {} });
+            emit(turn, { type: 'failure', requestId: turn.requestId, message: message || '该会话已有一轮正在进行，请稍后再试', view: {},
+              notStarted: !turn.begun && !turn.produced });
             finish(turn);
             return;
           }
@@ -341,7 +339,7 @@ export function useAiChatTurn({ sessionId, onEvent }: UseAiChatTurnOptions): {
         turn.begun = true;
         emit(turn, { type: 'begun', requestId: turn.requestId });
         if (metadata.supplements) emit(turn, { type: 'supplements', requestId: turn.requestId, supplements: metadata.supplements });
-        if (metadata.contextCompaction) emit(turn, { type: 'compaction', requestId: turn.requestId, running: metadata.contextCompaction.running });
+        if (metadata.contextCompaction) emit(turn, { type: 'compaction', requestId: turn.requestId, ...metadata.contextCompaction });
         const recovery = readRecovery(metadata.recovery);
         if (recovery !== undefined) emit(turn, { type: 'recovery', requestId: turn.requestId, recovery });
       },
@@ -372,10 +370,13 @@ export function useAiChatTurn({ sessionId, onEvent }: UseAiChatTurnOptions): {
             view: {
               requestId: failure.requestId,
               sessionId: failure.sessionId,
+              status: 'FAILED',
+              failure: failure.failure ?? { code: failure.code ?? 'REQUEST_FAILED', message: failure.message },
               stateDurable: failure.stateDurable,
               persistenceStatus: failure.persistenceStatus,
               toolActivities: failure.toolActivities,
-              recovery: failure.recovery
+              recovery: failure.recovery,
+              contextCompaction: failure.contextCompaction
             }
           });
           finish(turn);

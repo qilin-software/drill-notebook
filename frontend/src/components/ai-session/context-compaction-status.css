@@ -1,0 +1,13 @@
+.context-compaction-status {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: 2px 0 8px;
+  color: var(--color-text-3);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.context-compaction-status > svg {
+  flex: none;
+}

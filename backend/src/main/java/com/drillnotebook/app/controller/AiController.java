@@ -188,6 +188,8 @@ public class AiController {
                         frame.put("stateDurable", failure.stateDurable());
                         frame.put("toolActivities", failure.toolActivities());
                         frame.put("recovery", failure.recovery());
+                        frame.put("contextCompaction", failure.contextCompaction());
+                        frame.put("failure", failure.failure());
                     } else if (error instanceof ChatTurnRejectException reject) {
                         // begin() 之前就被拒（请求形状不对）：这一轮还不存在，只有 code
                         frame.put("code", reject.code());

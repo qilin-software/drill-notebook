@@ -45,8 +45,26 @@ export interface UsageSnapshot {
   cacheWriteTokens?: number | null;
 }
 
+export interface ContextCompaction {
+  running: boolean;
+  /** Proven checkpoint publication; ending a running indicator alone does not imply success. */
+  completed?: boolean;
+}
+
+export interface ChatFailure {
+  code: string;
+  message: string;
+  /** Transport attempts do not confirm receipt by a provider; old errors may have no diagnostics. */
+  diagnostics?: {
+    stage: 'PREPARING' | 'COMPACTING' | 'SENDING' | 'TOOLS' | 'FINALIZING';
+    mainRequestAttempted: boolean;
+    compactionRequestAttempted: boolean;
+  };
+}
+
 export interface ChatResultView {
-  contextCompaction?: { running: boolean };
+  failure?: ChatFailure | null;
+  contextCompaction?: ContextCompaction;
   recovery?: AiRecovery | null;
   supplements?: import('./chatQueue').ChatSupplement[];
   finishReason?: string;
@@ -80,6 +98,8 @@ export interface StreamMetadata extends ChatResultView {
 }
 
 export interface StreamErrorInfo {
+  failure?: ChatFailure | null;
+  contextCompaction?: ContextCompaction;
   recovery?: AiRecovery | null;
   toolActivities?: ToolActivity[];
   message: string;
@@ -124,10 +144,27 @@ function resultView(payload: Record<string, unknown> | null): ChatResultView {
       if (payload[key] !== undefined) view[key] = payload[key];
     }
     if (Array.isArray(payload.toolActivities)) view.toolActivities = readToolActivities(payload.toolActivities);
+    const failure = asRecord(payload.failure);
+    if (payload.failure === null) view.failure = null;
+    else if (typeof failure?.code === 'string' && typeof failure.message === 'string') {
+      view.failure = { code: failure.code, message: failure.message };
+      const diagnostics = asRecord(failure.diagnostics);
+      if (typeof diagnostics?.stage === 'string' && ['PREPARING', 'COMPACTING', 'SENDING', 'TOOLS', 'FINALIZING'].includes(diagnostics.stage)
+        && typeof diagnostics.mainRequestAttempted === 'boolean' && typeof diagnostics.compactionRequestAttempted === 'boolean') {
+        (view.failure as ChatFailure).diagnostics = {
+          stage: diagnostics.stage as NonNullable<ChatFailure['diagnostics']>['stage'],
+          mainRequestAttempted: diagnostics.mainRequestAttempted,
+          compactionRequestAttempted: diagnostics.compactionRequestAttempted
+        };
+      }
+    }
     const recovery = readRecovery(payload.recovery);
     if (recovery !== undefined) view.recovery = recovery;
     const compaction = asRecord(payload.contextCompaction);
-    if (typeof compaction?.running === 'boolean') view.contextCompaction = { running: compaction.running };
+    if (typeof compaction?.running === 'boolean') view.contextCompaction = {
+      running: compaction.running,
+      ...(typeof compaction.completed === 'boolean' ? { completed: compaction.completed } : {})
+    };
   }
   return view as ChatResultView;
 }
@@ -220,6 +257,7 @@ export async function streamChat(path: string, body: unknown, callbacks: StreamC
         const view = resultView(payload);
         const code = textField(payload, 'code');
         callbacks.onError({
+          ...(view.failure !== undefined ? { failure: view.failure } : {}),
           message: textField(payload, 'message') || '流式请求失败',
           requestId: view.requestId,
           sessionId: view.sessionId,
@@ -228,7 +266,8 @@ export async function streamChat(path: string, body: unknown, callbacks: StreamC
           persistenceStatus: view.persistenceStatus,
           stateDurable: view.stateDurable,
           toolActivities: view.toolActivities,
-          recovery: view.recovery
+          recovery: view.recovery,
+          contextCompaction: view.contextCompaction
         });
       }
     };

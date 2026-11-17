@@ -22,6 +22,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
@@ -47,6 +48,7 @@ public class ConversationProjection {
     public static final int BATCH_TURNS = 16;
     /** Resource guard, not a model retention policy. Hitting it produces an explicit gap error. */
     public static final int MAX_SCANNED_TURNS = 16384;
+    private static final int MAX_SCANNED_IDENTITIES = 262144;
     private static final long MAX_SCAN_BYTES = 32L * 1024 * 1024;
     private static final long MAX_SCAN_NANOS = java.util.concurrent.TimeUnit.SECONDS.toNanos(30);
     /** 摘要加密 payload 明文上限（§2.5）：超过就不信任这份检查点。 */
@@ -116,6 +118,7 @@ public class ConversationProjection {
         private int covered;
         private int completeSeen;
         private int rowsRead;
+        private int contentRows;
         private Long oldestScannedTurn;
         private long bytes;
         private final long deadline = System.nanoTime() + MAX_SCAN_NANOS;
@@ -219,71 +222,72 @@ public class ConversationProjection {
     private Scan scanTurns(Request request, ContextAudit.Summary summary, ContextCoordinator.Loaded continuation) throws SQLException {
         Scan scan = new Scan();
         long cursor = request.currentTurnId();
-        int remaining = MAX_SCANNED_TURNS;
-        while (remaining > 0) {
-            int limit = Math.min(BATCH_TURNS, remaining);
-            List<TurnHistory> batch = history.turnBatch(request.sessionId(), cursor, limit);
-            if (batch.isEmpty()) break;
-            remaining -= batch.size();
-            scan.rowsRead += batch.size();
-            cursor = batch.get(batch.size() - 1).turnId();
+        Set<String> coveredKeys = continuation == null ? Set.of() : continuation.keys();
+        while (true) {
+            var identities = history.turnIdentities(request.sessionId(), cursor, 256);
+            if (identities.isEmpty()) break;
+            scan.rowsRead += identities.size();
+            if (scan.rowsRead > MAX_SCANNED_IDENTITIES || System.nanoTime() > scan.deadline) throw scanLimit();
+            cursor = identities.get(identities.size() - 1).turnId();
             scan.oldestScannedTurn = cursor;
-            for (int index = 0; index < batch.size(); index++) {
-                TurnHistory row = batch.get(index);
-                scan.bytes += com.drillnotebook.app.repository.ChatStorageSizer.storedBytes(row.userContent(), row.userContentCipher(), row.userContentMeta(),
-                        row.assistantContent(), row.assistantContentCipher(), row.assistantContentMeta());
-                if (scan.bytes > MAX_SCAN_BYTES || System.nanoTime() > scan.deadline)
-                    throw scanLimit();
-                if (row.contextGeneration() != request.contextGeneration()) {
-                    // 切过作用域的旧正文永远不再进新代次的上下文（§2.2）
-                    scan.wrongGeneration++;
-                    continue;
-                }
-                if (row.contentDeletedAt() != null) {
-                    // 原话已被用户清理：展示还有墓碑，但没有可注入的正文
-                    scan.tombstoned++;
-                    continue;
-                }
-                if (!ChatTurnRepository.STATUS_COMPLETED.equals(row.status())) {
-                    // 只有 COMPLETED 才是合法上下文来源；RUNNING 是本轮自己
-                    scan.unfinished++;
-                    continue;
-                }
-                if (continuation != null && continuation.coversTurn(row.turnId())) { scan.covered++; continue; }
-                // 先解密再判去留：坏行要如实计入 SOURCE_CHANGED，不能因为"反正被摘要替了"就当它不存在
-                String userText;
-                String assistantText;
-                try {
-                    userText = read(row.userContent(), row.userContentCipher(), row.userContentMeta(), request);
-                    assistantText = read(row.assistantContent(), row.assistantContentCipher(),
-                            row.assistantContentMeta(), request);
-                } catch (ChatCryptoException error) {
-                    scan.unreadable++;                    continue;
-                }
-                if (userText == null || userText.isBlank() || assistantText == null || assistantText.isBlank()) {
-                    scan.unfinished++;
-                    continue;
-                }
-                Item item;
-                try { item=itemOf(row,userText,assistantText,request, continuation); }
-                catch(ChatCryptoException error){scan.unreadable++;continue;}
-                scan.bytes += item.steps().stream().mapToLong(s -> s.entry().bytes()).sum()
-                        + item.supplements().stream().mapToLong(s -> s.contextText().getBytes(StandardCharsets.UTF_8).length).sum();
-                if (scan.bytes > MAX_SCAN_BYTES || System.nanoTime() > scan.deadline) throw scanLimit();
-                scan.completeSeen++;
-                // 最近两条完整轮次永远留原文：摘要替掉它们会让近期区凭空消失（T02）
-                if (isCovered(summary, row.turnId()) && scan.completeSeen > MIN_RECENT_TURNS) {
-                    // 先留一份原文：摘要被预算舍弃时 coverage 不再成立，要用它做有界回补（§9.4）
-                    scan.coveredFirst.add(item);
-                    scan.covered++;
-                    continue;
-                }
-                scan.newestFirst.add(item);
+            var needed = new LinkedHashMap<Long, ChatHistoryRepository.TurnIdentity>();
+            for (var identity : identities) {
+                if (identity.generation() != request.contextGeneration()) { scan.wrongGeneration++; continue; }
+                if (identity.deletedAt() != null) { scan.tombstoned++; continue; }
+                if (!ChatTurnRepository.STATUS_COMPLETED.equals(identity.status())) { scan.unfinished++; continue; }
+                if (coveredKeys.contains("TURN:" + identity.turnId())) { scan.covered++; continue; }
+                needed.put(identity.turnId(), identity);
             }
-            if (batch.size() < limit) break;
+            scan.contentRows += needed.size();
+            if (scan.contentRows > MAX_SCANNED_TURNS) throw scanLimit();
+            var ids = new ArrayList<>(needed.keySet());
+            for (int start = 0; start < ids.size(); start += BATCH_TURNS) {
+                var part = ids.subList(start, Math.min(ids.size(), start + BATCH_TURNS));
+                var batch = history.turnContents(request.sessionId(), part);
+                if (batch.size() != part.size()) throw changedHistory();
+                for (TurnHistory row : batch) {
+                    if (!needed.get(row.turnId()).matches(row)) throw changedHistory();
+                    scan.bytes += com.drillnotebook.app.repository.ChatStorageSizer.storedBytes(row.userContent(), row.userContentCipher(), row.userContentMeta(),
+                            row.assistantContent(), row.assistantContentCipher(), row.assistantContentMeta());
+                    if (scan.bytes > MAX_SCAN_BYTES || System.nanoTime() > scan.deadline) throw scanLimit();
+                    // 先解密再判去留：坏行要如实计入 SOURCE_CHANGED，不能因为"反正被摘要替了"就当它不存在
+                    String userText;
+                    String assistantText;
+                    try {
+                        userText = read(row.userContent(), row.userContentCipher(), row.userContentMeta(), request);
+                        assistantText = read(row.assistantContent(), row.assistantContentCipher(),
+                                row.assistantContentMeta(), request);
+                    } catch (ChatCryptoException error) {
+                        scan.unreadable++;                    continue;
+                    }
+                    if (userText == null || userText.isBlank() || assistantText == null || assistantText.isBlank()) {
+                        scan.unfinished++;
+                        continue;
+                    }
+                    Item item;
+                    try { item=itemOf(row,userText,assistantText,request, continuation); }
+                    catch(ChatCryptoException error){scan.unreadable++;continue;}
+                    scan.bytes += item.steps().stream().mapToLong(s -> s.entry().bytes()).sum()
+                            + item.supplements().stream().mapToLong(s -> s.contextText().getBytes(StandardCharsets.UTF_8).length).sum();
+                    if (scan.bytes > MAX_SCAN_BYTES || System.nanoTime() > scan.deadline) throw scanLimit();
+                    scan.completeSeen++;
+                    // 最近两条完整轮次永远留原文：摘要替掉它们会让近期区凭空消失（T02）
+                    if (isCovered(summary, row.turnId()) && scan.completeSeen > MIN_RECENT_TURNS) {
+                        // 先留一份原文：摘要被预算舍弃时 coverage 不再成立，要用它做有界回补（§9.4）
+                        scan.coveredFirst.add(item);
+                        scan.covered++;
+                        continue;
+                    }
+                    scan.newestFirst.add(item);
+                }
+            }
+            if (identities.size() < 256) break;
         }
-        if (remaining == 0 && history.hasOlderTurn(request.sessionId(), cursor)) throw scanLimit();
         return scan;
+    }
+
+    private static ChatTurnRejectException changedHistory() {
+        return new ChatTurnRejectException(409, "CONTEXT_CHANGED", "读取历史时来源已变化，请重试本轮", Map.of());
     }
 
     private Item itemOf(TurnHistory row, String userText, String assistantText,Request request, ContextCoordinator.Loaded continuation) throws SQLException {
@@ -302,14 +306,14 @@ public class ConversationProjection {
         long cursor = history.messageCutoffOfTurn(request.sessionId(), request.currentTurnId());
         LegacyMessage reply = null;
         int inspected = 0;
-        while (inspected < MAX_SCANNED_TURNS * 2 - scan.rowsRead * 2) {
-            List<LegacyMessage> rows = history.legacyBatch(request.sessionId(), cursor, BATCH_TURNS * 2);
+        Set<String> coveredKeys = continuation == null ? Set.of() : continuation.keys();
+        while (inspected < MAX_SCANNED_IDENTITIES * 2 - scan.rowsRead * 2) {
+            List<LegacyMessage> rows = history.legacyIdentities(request.sessionId(), cursor, 256);
             if (rows.isEmpty()) { scan.legacyExhausted = true; break; }
             inspected += rows.size();
             cursor = rows.get(rows.size() - 1).messageId();
             for (LegacyMessage message : rows) {
-                scan.bytes += com.drillnotebook.app.repository.ChatStorageSizer.storedBytes(message.content(), message.contentCipher(), message.contentMeta());
-                if (scan.bytes > MAX_SCAN_BYTES || System.nanoTime() > scan.deadline) throw scanLimit();
+                if (System.nanoTime() > scan.deadline) throw scanLimit();
                 if ("assistant".equals(message.role())) {
                     if (reply != null) scan.legacyIncomplete++;
                     reply = message;
@@ -318,8 +322,15 @@ public class ConversationProjection {
                 if (!"user".equals(message.role()) || reply == null) { scan.legacyIncomplete++; reply = null; continue; }
                 var pairReply = reply;
                 reply = null;
+                if (coveredKeys.contains("LEGACY:" + message.messageId() + ":" + pairReply.messageId())) { scan.covered++; continue; }
+                var contents = history.legacyContents(request.sessionId(), message.messageId(), pairReply.messageId());
+                if (contents.size() != 2 || !sameLegacyIdentity(message, contents.get(0)) || !sameLegacyIdentity(pairReply, contents.get(1))) throw changedHistory();
+                message = contents.get(0); pairReply = contents.get(1);
                 var source = ChatHistoryRepository.legacySource(message, pairReply);
-                if (continuation != null && continuation.keys().contains(source.key())) { scan.covered++; continue; }
+                scan.contentRows++;
+                scan.bytes += com.drillnotebook.app.repository.ChatStorageSizer.storedBytes(message.content(), message.contentCipher(), message.contentMeta(),
+                        pairReply.content(), pairReply.contentCipher(), pairReply.contentMeta());
+                if (scan.contentRows > MAX_SCANNED_TURNS || scan.bytes > MAX_SCAN_BYTES) throw scanLimit();
                 String userText, assistantText;
                 try { userText = readLegacy(message, request); assistantText = readLegacy(pairReply, request); }
                 catch (ChatCryptoException error) { scan.unreadable++; continue; }
@@ -327,12 +338,17 @@ public class ConversationProjection {
                 scan.newestFirst.add(new Item(0, source.fingerprint(), true, message.messageId(), pairReply.messageId(), userText, assistantText,
                         List.of(), pairReply.createdAt(), estimator.estimateText(userText) + estimator.estimateText(assistantText)));
             }
-            if (rows.size() < BATCH_TURNS * 2) { scan.legacyExhausted = true; break; }
+            if (rows.size() < 256) { scan.legacyExhausted = true; break; }
         }
-        if (!scan.legacyExhausted && !history.legacyBatch(request.sessionId(), cursor, 1).isEmpty()) throw scanLimit();
+        if (!scan.legacyExhausted && !history.legacyIdentities(request.sessionId(), cursor, 1).isEmpty()) throw scanLimit();
         scan.legacyExhausted = true;
         if (reply != null) scan.legacyIncomplete++;
         scan.rowsRead += inspected;
+    }
+
+    private static boolean sameLegacyIdentity(LegacyMessage expected, LegacyMessage actual) {
+        return expected.messageId() == actual.messageId() && expected.role().equals(actual.role())
+                && java.util.Objects.equals(expected.createdAt(), actual.createdAt());
     }
 
     private List<Item> withAttachmentIdentities(List<Item> newestFirst) {

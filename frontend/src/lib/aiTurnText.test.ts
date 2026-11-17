@@ -33,6 +33,16 @@ const CONTRACT_CODES = [
 const withNotices = (notices?: string[]): ChatResultView => ({ contextUsage: { notices } });
 
 describe('aiTurnText 统一结果的提示', () => {
+  it('发送前的具体失败通过结果、状态与助手历史保留，用户消息不重复报错', () => {
+    const failure = { code: 'CONTEXT_SUMMARY_INVALID', message: '上下文摘要格式无效，原历史已保留' };
+    expect(outcomeNotice({ status: 'FAILED', stateDurable: true, failure })).toEqual(failure);
+    expect(statusNotice({ status: 'FAILED', active: false, failure })).toEqual(failure);
+    expect(historyNotice({ role: 'assistant', turnStatus: 'FAILED', failure })).toEqual(failure);
+    expect(historyNotice({ role: 'user', turnStatus: 'FAILED', failure })).toBeUndefined();
+    expect(historyNotice({ role: 'assistant', turnStatus: 'FAILED', contentDeleted: true, failure })?.code).toBe('CONTENT_DELETED');
+    expect(outcomeNotice({ status: 'FAILED', stateDurable: false, failure })?.code).toBe('PERSISTENCE_FAILED');
+    expect(outcomeNotice({ status: 'COMPLETED', failure })).toBeUndefined();
+  });
   it('契约里的码都有话说，不会静默丢提示', () => {
     for (const code of CONTRACT_CODES) {
       expect(outcomeNotice(withNotices([code])), code)?.toMatchObject({ code });

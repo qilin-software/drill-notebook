@@ -113,6 +113,74 @@ class ContextManagementTest {
         assertEquals(1, view.messages().stream().filter(m -> m.containsKey(ContextCoordinator.CHECKPOINT_TAG)).count());
     }
 
+    @Test void aSingleOversizedHistoricalSourceIsSummarizedLosslesslyInOrderBeforeItBecomesCoverage() throws Exception {
+        String huge = "先只整理、不能保存。" + "资料🚀".repeat(3000) + "最后决定：不要归档。";
+        var old = complete(huge, "保留用户最后决定");
+        complete("近期提问一", "近期回答一");
+        complete("近期提问二", "近期回答二");
+        var current = begin("继续，仅整理计划");
+        var plan = plan(current, 8000);
+        var fragments = new ArrayList<JsonNode>();
+        var calls = new AtomicInteger();
+        var view = prepare(plan, current, plan.messages(), 8000, (t, p) -> {
+            calls.incrementAndGet();
+            assertTrue(p.context().estimatedInputTokens() <= ContextWindowBudget.of(8000, t.maxTokens(), AiContextSettings.DEFAULTS).hardInput());
+            try {
+                var messages = json.readTree(p.serialized()).path("messages");
+                var data = json.readTree(text(messages.get(messages.size() - 1).path("content")));
+                for (var item : data.path("conversation")) for (var fragment : item.path("fragments")) fragments.add(fragment);
+            } catch (Exception error) { throw new RuntimeException(error); }
+            return summary(t, p);
+        });
+        assertTrue(view.compressed());
+        assertTrue(calls.get() > 1);
+        var reconstructed = new StringBuilder();
+        for (var fragment : fragments) if (fragment.path("messageIndex").asInt() == 0) {
+            assertEquals("user", fragment.path("originalRole").asText());
+            assertEquals(reconstructed.length(), fragment.path("offset").asInt());
+            reconstructed.append(fragment.path("text").asText());
+        }
+        assertTrue(huge.equals(text(json.readTree(reconstructed.toString()).path("content"))), "按顺序重组的分片必须与完整原文一致");
+        assertTrue(view.checkpoint().coversTurn(old.turnId()));
+        assertTrue(view.prepared().serialized().contains("近期提问二"));
+        assertTrue(view.prepared().serialized().contains("继续，仅整理计划"));
+        assertEquals(1, managed.checkpoints().read(session).orElseThrow().revision());
+        assertEquals(3, jdbc.queryForObject("SELECT COUNT(*) FROM ai_chat_turn WHERE status='COMPLETED'", Integer.class));
+    }
+
+    @Test void failureHalfwayThroughAnOversizedSourceDoesNotCoverOrPublishThatSource() throws Exception {
+        complete("原始资料".repeat(4000), "原始结论");
+        var current = begin("继续");
+        var plan = plan(current, 8000);
+        var calls = new AtomicInteger();
+        assertThrows(RuntimeException.class, () -> prepare(plan, current, plan.messages(), 8000, (t, p) -> {
+            if (calls.incrementAndGet() == 2) throw new IllegalStateException("fixture interrupted chunk");
+            return summary(t, p);
+        }));
+        assertEquals(2, calls.get());
+        assertTrue(managed.checkpoints().read(session).isEmpty());
+        assertEquals("FAILED", jdbc.queryForObject("SELECT state FROM ai_context_compaction_lease WHERE session_id=?", String.class, session));
+        assertEquals(1, jdbc.queryForObject("SELECT COUNT(*) FROM ai_chat_turn WHERE status='COMPLETED'", Integer.class));
+    }
+
+    @Test void aFailedOptionalPassPublishesTheAlreadyCompleteCandidateIfItFitsTheHardBudget() throws Exception {
+        history(4, 425);
+        var current = begin("继续");
+        var plan = plan(current, 8000);
+        var calls = new AtomicInteger();
+        var view = prepare(plan, current, plan.messages(), 8000, (t, p) -> {
+            if (calls.incrementAndGet() == 2) throw new IllegalStateException("fixture optional pass failed");
+            return summary(t, p);
+        });
+        assertEquals(2, calls.get());
+        assertTrue(view.compressed());
+        assertTrue(view.prepared().context().estimatedInputTokens() <= ContextWindowBudget.of(8000, 512, AiContextSettings.DEFAULTS).hardInput());
+        assertTrue(view.notices().contains("CONTEXT_COMPACTION_TARGET_NOT_REACHED"));
+        assertTrue(view.notices().contains("CONTEXT_COMPACTED"));
+        assertTrue(view.prepared().serialized().contains("历史问题4"));
+        assertEquals(1, managed.checkpoints().read(session).orElseThrow().revision());
+    }
+
     @Test void oversizedRecentRoundsCanBeCompactedWithoutDroppingTheirSources() throws Exception {
         var turns = history(8, 800);
         var current = begin("保留已确认结论并继续");
@@ -148,11 +216,59 @@ class ContextManagementTest {
         jdbc.execute("CREATE TRIGGER fixture_refuse_checkpoint BEFORE INSERT ON ai_context_checkpoint "
                 + "BEGIN SELECT RAISE(ABORT, 'fixture checkpoint write failure'); END");
 
-        assertThrows(IllegalStateException.class, () -> prepare(plan, current, plan.messages(), 8000, this::summary));
+        var error = assertThrows(ChatTurnRejectException.class, () -> prepare(plan, current, plan.messages(), 8000, this::summary));
+        assertEquals("CONTEXT_STORAGE_FAILED", error.code());
         assertTrue(managed.checkpoints().read(session).isEmpty());
         assertEquals("FAILED", jdbc.queryForObject("SELECT state FROM ai_context_compaction_lease WHERE session_id = ?", String.class, session));
         assertEquals(bytes, wiring.ledger().read().historyBytes());
         assertEquals(8, jdbc.queryForObject("SELECT COUNT(*) FROM ai_chat_turn WHERE status = 'COMPLETED'", Integer.class));
+    }
+
+    @ParameterizedTest @ValueSource(booleans = {false, true})
+    void fittingRequestsDoNotReadOptionalCompactionMetadata(boolean autoCompact) throws Exception {
+        complete("已保存的问题", "已保存的回答");
+        var current = begin("继续当前任务");
+        var plan = plan(current, 8000);
+        var repository = org.mockito.Mockito.spy(managed.checkpoints());
+        org.mockito.Mockito.doThrow(new java.sql.SQLException("fixture optional metadata unavailable")).when(repository).memoryBoundary();
+        org.mockito.Mockito.doThrow(new java.sql.SQLException("fixture optional metadata unavailable")).when(repository).anchor(session, current.turnId());
+        var coordinator = new ContextCoordinator(repository, wiring.cipher(), json, new TokenEstimator(json));
+        var view = coordinator.prepare(plan, current, plan.messages(), target, List.of(), false, 8000,
+                new AiContextSettings(autoCompact, 80), upstream, (t, p) -> { fail("Fitting requests must proceed without a summary"); return null; },
+                () -> managed.stack().contexts().matches(plan));
+        assertFalse(view.compressed());
+        assertTrue(view.prepared().serialized().contains("已保存的问题"));
+        org.mockito.Mockito.verify(repository, org.mockito.Mockito.never()).memoryBoundary();
+        org.mockito.Mockito.verify(repository, org.mockito.Mockito.never()).anchor(session, current.turnId());
+    }
+
+    @ParameterizedTest @ValueSource(strings = {"ai_context_compaction_lease", "ai_context_checkpoint"})
+    void optionalCompactionStorageFailureResumesOnlyTheUnchangedOriginalView(String table) throws Exception {
+        history(4, 235);
+        var current = begin("继续，保留全部原资料");
+        var plan = plan(current, 8000);
+        var settings = new AiContextSettings(true, 65);
+        var original = upstream.prepare(target, plan.messages(), List.of(), false, 8000, "CHAT");
+        var budget = ContextWindowBudget.of(8000, target.maxTokens(), settings);
+        assertTrue(original.context().estimatedInputTokens() > budget.softInput());
+        assertTrue(original.context().estimatedInputTokens() <= budget.hardInput());
+        long bytes = wiring.ledger().read().historyBytes();
+        jdbc.execute("CREATE TRIGGER fixture_refuse_optional BEFORE INSERT ON " + table
+                + " BEGIN SELECT RAISE(ABORT, 'fixture optional checkpoint failure'); END");
+        var calls = new AtomicInteger();
+        var view = managed.coordinator().prepare(plan, current, plan.messages(), target, List.of(), false, 8000, settings,
+                upstream, (t, p) -> { calls.incrementAndGet(); return summary(t, p); }, () -> managed.stack().contexts().matches(plan));
+        assertFalse(view.compressed());
+        assertNull(view.checkpoint());
+        assertEquals(original.serialized(), view.prepared().serialized(), "A failed local publication must not send an unpublished summary or discard history");
+        assertTrue(view.notices().contains("CONTEXT_COMPACTION_FAILED"));
+        assertTrue(managed.checkpoints().read(session).isEmpty());
+        assertEquals(bytes, wiring.ledger().read().historyBytes());
+        if ("ai_context_compaction_lease".equals(table)) assertEquals(0, calls.get());
+        else {
+            assertTrue(calls.get() > 0);
+            assertEquals("FAILED", jdbc.queryForObject("SELECT state FROM ai_context_compaction_lease WHERE session_id=?", String.class, session));
+        }
     }
 
     @Test void stopDuringSummaryPreservesSourcesAndReleasesTheLease() throws Exception {
@@ -302,10 +418,10 @@ class ContextManagementTest {
         var view = prepare(plan, current, raw, 8000, this::summary);
         assertTrue(view.compressed());
         assertTrue(view.checkpoint().sources().stream().anyMatch(s -> s.kind().equals("STEP")));
-        assertFalse(view.checkpoint().summary().receipts().isEmpty());
+        assertFalse(view.checkpoint().retained().receipts().isEmpty());
         assertTrue(view.prepared().serialized().contains("先保存结论，再整理未完成工作"));
         assertTrue(view.prepared().serialized().contains("write9"));
-        assertTrue(view.prepared().serialized().contains("write8") || view.checkpoint().summary().receipts().contains("CALL:" + current.requestId() + ":write8:CREATED"));
+        assertTrue(view.prepared().serialized().contains("write8") || view.checkpoint().retained().receipts().stream().anyMatch(r -> r.id().equals("CALL:" + current.requestId() + ":write8:CREATED")));
         ChatContextEntryService.validateClosed(view.messages().stream().filter(m -> !"system".equals(m.get("role"))).toList());
     }
 
@@ -340,7 +456,7 @@ class ContextManagementTest {
             var complete = summary(t, p);
             return new AiUpstreamClient.Result(complete.text(), "", finishReason);
         }));
-        assertEquals("CONTEXT_SUMMARY_INCOMPLETE", error.code());
+        assertEquals("CONTEXT_SUMMARY_TRUNCATED", error.code());
         assertTrue(managed.checkpoints().read(session).isEmpty());
         assertEquals(8, jdbc.queryForObject("SELECT COUNT(*) FROM ai_chat_turn WHERE status='COMPLETED'", Integer.class));
     }
@@ -383,23 +499,24 @@ class ContextManagementTest {
         assertTrue(managed.checkpoints().read(session).isEmpty());
     }
 
-    @Test void summariesMustKeepEveryConfirmedWriteReceipt() throws Exception {
+    @Test void receiptsAreKeptByTheApplicationWithoutMakingTheModelCopyThem() throws Exception {
         var current = begin("继续已经保存的工作");
         var plan = plan(current, 8000);
         var raw = new ArrayList<>(plan.messages());
         for (int i = 1; i <= 7; i++) raw.addAll(managed.entries().save(current, target, 1, "TOOL_STEP",
                 stepMessages("save" + i, "create_material", jsonString(Map.of("status", "CREATED", "text", "资料".repeat(700)))), true, null).forCurrent());
-        var error = assertThrows(ChatTurnRejectException.class, () -> prepare(plan, current, raw, 8000, (t, p) -> {
-            try {
-                var value = (com.fasterxml.jackson.databind.node.ObjectNode) json.readTree(summary(t, p).text());
-                assertTrue(value.path("receipts").size() > 0);
-                value.set("receipts", json.createArrayNode());
-                return new AiUpstreamClient.Result(jsonString(value), "", "stop");
-            } catch (Exception e) { throw new RuntimeException(e); }
-        }));
-        assertEquals("CONTEXT_SUMMARY_INVALID", error.code());
-        assertTrue(managed.checkpoints().read(session).isEmpty());
+        var view = prepare(plan, current, raw, 8000, (t, p) -> {
+            var response = summary(t, p);
+            try { assertEquals(0, json.readTree(response.text()).path("receipts").size()); }
+            catch (Exception error) { throw new RuntimeException(error); }
+            return response;
+        });
+        assertTrue(view.compressed());
+        assertTrue(view.checkpoint().retained().receipts().size() >= 5);
+        assertTrue(view.prepared().serialized().contains("writeOutcomes"));
         assertEquals(7, managed.entries().read(current.turnId(), PASSWORD).size());
+        var reloaded = managed.coordinator().load(session, 1, plan.policyRevision(), current.turnId(), PASSWORD).orElseThrow();
+        assertEquals(view.checkpoint().retained(), reloaded.retained());
     }
 
     @Test void aContextResetReleasesCheckpointCapacityAndRestartsWithoutOldSources() throws Exception {
@@ -417,6 +534,110 @@ class ContextManagementTest {
         var nextPlan = plan(next, 32000);
         assertFalse(nextPlan.messages().toString().contains("历史问题"));
         assertEquals(2, nextPlan.contextGeneration());
+    }
+
+    @Test void anEmptyModelConstraintListCannotEraseTheOriginalUserRestrictionAcrossCompactions() throws Exception {
+        String restriction = "禁止自动写入笔记，只允许列出建议。";
+        var old = complete(restriction, "资料".repeat(1400));
+        history(6, 500);
+        var current = begin("继续整理");
+        ContextCoordinator.SummaryCaller forgetful = (t, p) -> new AiUpstreamClient.Result(
+                "{\"goal\":\"继续\",\"constraints\":[],\"decisions\":[],\"completed\":[],\"pending\":[],\"unknown\":[],\"sources\":[],\"receipts\":[]}", "", "stop");
+        var plan = plan(current, 8000);
+        var first = prepare(plan, current, plan.messages(), 8000, forgetful);
+        assertTrue(first.compressed());
+        assertTrue(first.checkpoint().coversTurn(old.turnId()));
+        assertTrue(first.prepared().serialized().contains(restriction));
+        assertTrue(first.checkpoint().summary().constraints().isEmpty());
+        finish(current, "继续");
+        String correction = "改为允许保存；重试上限 7 次，等待 400ms；待办：核对 v0.8.3。";
+        complete(correction, "资料".repeat(1400));
+        history(6, 500);
+        var next = begin("继续"); var nextPlan = plan(next, 8000);
+        var second = prepare(nextPlan, next, nextPlan.messages(), 8000, forgetful);
+        assertTrue(second.compressed());
+        String actual = second.prepared().serialized();
+        assertTrue(actual.contains(restriction)); assertTrue(actual.contains(correction));
+        assertTrue(actual.indexOf(restriction) < actual.indexOf(correction));
+        assertEquals(second.checkpoint().retained(), managed.coordinator().load(session, 1, nextPlan.policyRevision(), next.turnId(), PASSWORD).orElseThrow().retained());
+        jdbc.update("UPDATE ai_chat_turn SET source_revision=source_revision+1 WHERE id=?", old.turnId());
+        assertTrue(managed.coordinator().load(session, 1, nextPlan.policyRevision(), next.turnId(), PASSWORD).isEmpty());
+    }
+
+    @Test void coveredHistoryBeyondTheOldRowAndByteLimitsLoadsOnlyMetadataAndStillValidatesRevisions() throws Exception {
+        var seed = complete("资料".repeat(2000), "结论".repeat(2000));
+        try (var connection = source.getConnection(); var statement = connection.prepareStatement("""
+                INSERT INTO ai_chat_turn(request_id, session_id, status, request_meta_cipher, request_meta_crypto,
+                  user_message_id, assistant_message_id, context_generation, source_scope_type, source_scope_id,
+                  source_timezone, runtime_generation, source_revision, started_at, finished_at)
+                SELECT ?, session_id, status, request_meta_cipher, request_meta_crypto, user_message_id, assistant_message_id,
+                  context_generation, source_scope_type, source_scope_id, source_timezone, runtime_generation, source_revision,
+                  started_at, finished_at FROM ai_chat_turn WHERE id=?
+                """)) {
+            connection.setAutoCommit(false);
+            for (int n = 0; n < 18000; n++) {
+                statement.setString(1, "scale-fixture-" + n); statement.setLong(2, seed.turnId()); statement.addBatch();
+            }
+            statement.executeBatch(); connection.commit();
+        }
+        var current = begin("继续");
+        var state = wiring.metadata().read(session).orElseThrow();
+        var policy = managed.stack().policy().current();
+        var coverage = jdbc.query("SELECT id, request_id, source_revision FROM ai_chat_turn WHERE session_id=? AND status='COMPLETED' ORDER BY id",
+                (rs, n) -> new ContextSource("TURN", String.valueOf(rs.getLong(1)), rs.getLong(1), rs.getString(2), rs.getLong(3),
+                        ChatContextEntryService.fingerprint(rs.getString(2) + ":" + rs.getLong(3))), session);
+        String payload = jsonString(Map.of("schemaVersion", 2, "sessionId", session, "generation", 1, "revision", 1,
+                "summary", new com.drillnotebook.app.model.ContextSummary("继续任务", List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of()),
+                "coverage", coverage, "retained", com.drillnotebook.app.model.ContextRetainedState.EMPTY, "memorySensitive", false));
+        var encrypted = wiring.cipher().encrypt(payload, PASSWORD);
+        var checkpoint = new com.drillnotebook.app.repository.ChatContextCheckpointRepository.Checkpoint(session, 1, 1,
+                state.historyRevision(), policy.revision(), managed.checkpoints().memoryBoundary(), null, fingerprint(), target.apiFormat(), target.model(),
+                ContextCoordinator.STRATEGY_VERSION, encrypted.cipher(), encrypted.meta(),
+                com.drillnotebook.app.repository.ChatStorageSizer.storedBytes(encrypted.cipher(), encrypted.meta()), java.time.Instant.now().toString());
+        assertTrue(managed.checkpoints().acquire(session, "scale-lease", "scale-input", System.currentTimeMillis(), System.currentTimeMillis() + 60000));
+        assertTrue(managed.checkpoints().publish(checkpoint, null, "scale-lease", coverage, current.turnId(), System.currentTimeMillis()));
+        var contentReads = new AtomicInteger();
+        var observer = new com.drillnotebook.app.repository.ChatHistoryRepository(source) {
+            @Override public List<TurnHistory> turnContents(long id, List<Long> ids) throws java.sql.SQLException {
+                contentReads.addAndGet(ids.size()); return super.turnContents(id, ids);
+            }
+        };
+        org.springframework.test.util.ReflectionTestUtils.setField(managed.stack().projection(), "history", observer);
+        var projected = managed.stack().projection().project(new ConversationProjection.Request(session, current.turnId(), 1, PASSWORD, 8000, false),
+                new com.drillnotebook.app.model.ContextAudit.Builder("scale-test", "fixture"));
+        assertTrue(projected.candidates().isEmpty());
+        assertEquals(18001, projected.scan().scannedTurns()); assertEquals(0, contentReads.get());
+        assertTrue(managed.coordinator().load(session, 1, policy.revision(), current.turnId(), PASSWORD).isPresent());
+        jdbc.update("UPDATE ai_chat_turn SET source_revision=source_revision+1 WHERE request_id='scale-fixture-9000'");
+        assertTrue(managed.coordinator().load(session, 1, policy.revision(), current.turnId(), PASSWORD).isEmpty());
+        assertThrows(ChatTurnRejectException.class, () -> managed.stack().projection().project(
+                new ConversationProjection.Request(session, current.turnId(), 1, PASSWORD, 8000, false),
+                new com.drillnotebook.app.model.ContextAudit.Builder("scale-invalid", "fixture")));
+    }
+
+    @Test void aSourceChangedBetweenMetadataAndBodyReadCannotBeSentAsTheOldVersion() throws Exception {
+        var old = complete("原问题", "原回答"); var current = begin("继续");
+        var changing = new com.drillnotebook.app.repository.ChatHistoryRepository(source) {
+            @Override public List<TurnHistory> turnContents(long id, List<Long> ids) throws java.sql.SQLException {
+                jdbc.update("UPDATE ai_chat_turn SET source_revision=source_revision+1 WHERE id=?", old.turnId());
+                return super.turnContents(id, ids);
+            }
+        };
+        org.springframework.test.util.ReflectionTestUtils.setField(managed.stack().projection(), "history", changing);
+        var error = assertThrows(ChatTurnRejectException.class, () -> plan(current, 8000));
+        assertEquals("CONTEXT_CHANGED", error.code());
+    }
+
+    @Test void checkpointsWithoutDeterministicEvidenceRebuildFromTheOriginalHistory() throws Exception {
+        history(8, 500); var current = begin("继续"); var plan = plan(current, 8000);
+        prepare(plan, current, plan.messages(), 8000, this::summary); finish(current, "已完成");
+        jdbc.update("UPDATE ai_context_checkpoint SET strategy_version='continuation-v1' WHERE session_id=?", session);
+        var next = begin("继续整理"); var nextPlan = plan(next, 8000);
+        assertTrue(nextPlan.messages().toString().contains("历史问题1"));
+        var rebuilt = prepare(nextPlan, next, nextPlan.messages(), 8000, this::summary);
+        assertTrue(rebuilt.compressed());
+        assertEquals("continuation-v2", rebuilt.checkpoint().row().strategyVersion());
+        assertEquals(2, rebuilt.checkpoint().row().revision());
     }
 
     private List<ChatTurnService.Lease> history(int count, int repeat) {

@@ -91,6 +91,34 @@ public class ChatContextEntryRepository {
         }
     }
 
+    /** Covered steps are checked by identity; their encrypted payloads do not consume the live-view read budget. */
+    public List<Entry> readUncoveredTurn(long turnId, java.util.Set<String> covered) throws SQLException {
+        try (var connection = dataSource.getConnection(); var statement = connection.prepareStatement(
+                "SELECT id, byte_length FROM ai_context_entry WHERE turn_id = ? AND state = 'CLOSED' ORDER BY sequence")) {
+            statement.setLong(1, turnId);
+            var ids = new ArrayList<String>(); long bytes = 0; int inspected = 0;
+            try (var rows = statement.executeQuery()) { while (rows.next()) {
+                if (++inspected > 65536) throw scanLimit();
+                if (covered.contains(rows.getString(1))) continue;
+                bytes = Math.addExact(bytes, rows.getLong(2));
+                if (bytes > 32L * 1024 * 1024 || ids.size() >= 4096) throw scanLimit();
+                ids.add(rows.getString(1));
+            } }
+            var result = new ArrayList<Entry>();
+            for (String id : ids) {
+                var row = find(connection, id);
+                if (row.isEmpty() || row.get().turnId() != turnId || !"CLOSED".equals(row.get().state()))
+                    throw new ChatTurnRejectException(409, "CONTEXT_CHANGED", "读取工具步骤时来源已变化", java.util.Map.of());
+                result.add(row.get());
+            }
+            return List.copyOf(result);
+        }
+    }
+
+    private static ChatTurnRejectException scanLimit() {
+        return new ChatTurnRejectException(413, "CONTEXT_HISTORY_SCAN_LIMIT", "本轮工具记录超过安全读取范围，未省略历史外发", java.util.Map.of());
+    }
+
     public Optional<Entry> find(String id) throws SQLException {
         try (var connection = dataSource.getConnection()) { return find(connection, id); }
     }

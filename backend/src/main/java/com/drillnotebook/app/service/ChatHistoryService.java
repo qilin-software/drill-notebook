@@ -152,6 +152,10 @@ public class ChatHistoryService {
                     if (reason.matches("[a-z_]{1,40}")) item.put("finishReason", reason);
                     if (decoded.path("recovery").isObject()) item.put("recovery", new com.fasterxml.jackson.databind.ObjectMapper()
                             .treeToValue(decoded.path("recovery"), com.drillnotebook.app.model.AiRecovery.class));
+                    if (decoded.path("contextCompaction").isObject()) item.put("contextCompaction",
+                            com.drillnotebook.app.model.ContextCompaction.read(decoded.path("contextCompaction")));
+                    var failure = ChatTurnService.Failure.read(decoded.path("failure"));
+                    if (failure != null) item.put("failure", failure);
                 } catch (com.fasterxml.jackson.core.JsonProcessingException ignored) { /* 旧或损坏元数据不补造原因。 */ }
             }
         }

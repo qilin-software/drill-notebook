@@ -25,27 +25,44 @@ public class SessionContextOccupancyService {
         try (Connection connection = source.getConnection()) {
             connection.setAutoCommit(false);
             var state = ChatSessionMetadataRepository.read(connection, sessionId).orElseThrow();
-            String requestId = null, status = null, crypto = null;
+            ModelContextSnapshot snapshot = null;
+            String requestId = null;
+            boolean active = false;
             try (var statement = connection.prepareStatement("""
-                    SELECT request_id, status, result_meta_crypto FROM ai_chat_turn
-                    WHERE session_id = ? AND context_generation = ? AND content_deleted_at IS NULL
-                    ORDER BY CASE WHEN status = 'RUNNING' THEN 0 ELSE 1 END,
-                      julianday(COALESCE(finished_at, started_at)) DESC, request_id DESC, id DESC LIMIT 1
+                    SELECT t.id, t.request_id, t.status, t.result_meta_crypto,
+                      EXISTS (SELECT 1 FROM ai_usage_attempt u WHERE u.operation_id = t.request_id
+                        AND u.purpose = 'CHAT' AND u.state IN ('SENT', 'SETTLED', 'UNKNOWN')) AS has_main_request
+                    FROM ai_chat_turn t
+                    WHERE t.session_id = ? AND t.context_generation = ? AND t.content_deleted_at IS NULL
+                    ORDER BY CASE WHEN t.status = 'RUNNING' THEN 0 ELSE 1 END,
+                      julianday(COALESCE(t.finished_at, t.started_at)) DESC, t.request_id DESC, t.id DESC
                     """)) {
                 statement.setLong(1, sessionId); statement.setLong(2, state.contextGeneration());
-                try (var row = statement.executeQuery()) {
-                    if (row.next()) { requestId = row.getString(1); status = row.getString(2); crypto = row.getString(3); }
+                try (var rows = statement.executeQuery()) {
+                    while (rows.next()) {
+                        String candidate = rows.getString("request_id");
+                        boolean running = "RUNNING".equals(rows.getString("status"));
+                        String crypto = rows.getString("result_meta_crypto");
+                        boolean blocksLegacy = blocksLegacyFallback(crypto);
+                        var frame = running ? turns.currentModelContext(candidate) : stored(crypto);
+                        // A modern snapshot that failed validation is unavailable, never a legacy record.
+                        if (frame == null && !blocksLegacy) frame = legacy(connection, candidate, state.contextGeneration(), state.historyRevision());
+                        if (frame == null) {
+                            // Preparation and summary calls do not replace the main model's last actual window.
+                            // An uninspectable actual request is a barrier: do not mislabel an older frame as current.
+                            if (rows.getBoolean("has_main_request") || blocksLegacy) {
+                                connection.commit(); return null;
+                            }
+                            continue;
+                        }
+                        if (frame.contextGeneration() != state.contextGeneration()
+                                || !running && !validAfterUnsentAppends(connection, sessionId, rows.getLong("id"), frame, state)) {
+                            connection.commit(); return null;
+                        }
+                        requestId = candidate; snapshot = frame; active = running; break;
+                    }
                 }
             }
-            if (requestId == null) { connection.commit(); return null; }
-            boolean active = "RUNNING".equals(status);
-            ModelContextSnapshot snapshot = active ? turns.currentModelContext(requestId) : stored(crypto);
-            if (snapshot != null && (snapshot.contextGeneration() != state.contextGeneration()
-                    || !active && snapshot.historyRevision() != state.historyRevision())) {
-                // 清理或编辑后，旧实际请求已不代表新的会话状态；等下次真实请求，不编造预览输入。
-                connection.commit(); return null;
-            }
-            if (snapshot == null) snapshot = legacy(connection, requestId, state.contextGeneration(), state.historyRevision());
             connection.commit();
             if (snapshot == null) return null;
             var breakdown = snapshot.breakdown();
@@ -60,6 +77,35 @@ public class SessionContextOccupancyService {
             result.put("requestId", requestId); result.put("active", active); result.put("summaryRevision", null);
             return result;
         } catch (SQLException error) { throw new IllegalStateException("当前模型上下文暂时无法统计", error); }
+    }
+
+    /** Only untouched begin/end appends may account for a revision change; edits, cleanup and retries remain invalidations. */
+    private boolean validAfterUnsentAppends(Connection connection, long sessionId, long turnId, ModelContextSnapshot frame,
+                                           ChatSessionMetadataRepository.State state) throws SQLException {
+        if (frame.historyRevision() == state.historyRevision()) return true;
+        if (frame.historyRevision() > state.historyRevision()) return false;
+        try (var statement = connection.prepareStatement("""
+                SELECT COALESCE(SUM(CASE WHEN status = 'RUNNING' AND source_revision = 1 THEN 1
+                       WHEN status <> 'RUNNING' AND source_revision = 2 THEN 2 ELSE 0 END), 0),
+                  COALESCE(SUM(CASE WHEN content_deleted_at IS NOT NULL
+                       OR source_revision <> CASE WHEN status = 'RUNNING' THEN 1 ELSE 2 END THEN 1 ELSE 0 END), 0)
+                FROM ai_chat_turn WHERE session_id = ? AND context_generation = ? AND id > ?
+                """)) {
+            statement.setLong(1, sessionId); statement.setLong(2, state.contextGeneration()); statement.setLong(3, turnId);
+            try (var rows = statement.executeQuery()) {
+                return rows.next() && rows.getLong(2) == 0
+                        && state.historyRevision() - frame.historyRevision() == rows.getLong(1);
+            }
+        }
+    }
+
+    private boolean blocksLegacyFallback(String crypto) {
+        if (crypto == null || crypto.isBlank()) return false;
+        if (crypto.getBytes(java.nio.charset.StandardCharsets.UTF_8).length > RequestContextAudit.MAX_BYTES) return true;
+        try {
+            var metadata = mapper.readTree(crypto);
+            return !metadata.isObject() || metadata.has("modelContext");
+        } catch (Exception ignored) { return true; }
     }
 
     private ModelContextSnapshot stored(String crypto) {

@@ -102,7 +102,7 @@ public class ChatContextEntryService {
 
     public List<Step> read(long turnId, String password, java.util.Set<String> excludedEntries) throws SQLException {
         var result = new ArrayList<Step>();
-        for (Entry entry : repository.readTurn(turnId)) {
+        for (Entry entry : repository.readUncoveredTurn(turnId, excludedEntries)) {
             if (!"CLOSED".equals(entry.state()) || excludedEntries.contains(entry.id())) continue;
             result.add(decode(entry, password));
         }

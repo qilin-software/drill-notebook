@@ -120,6 +120,67 @@ describe('AiAssistant 流式会话状态', () => {
   const activity: ToolActivity = { sequence: 1, toolName: 'create_memory', state: 'FINISHED', outcome: 'CREATED',
     count: 1, startedAt: '2026-11-08T01:00:00.000Z', elapsedMs: 30, availability: null, incomplete: false };
 
+  it('发送前压缩失败且没有任何输出时保留原回答报错和重新生成入口', async () => {
+    renderAssistant(); await send('继续长会话');
+    await waitFor(() => expect(streamCallbacks).toBeTruthy());
+    act(() => streamCallbacks!.onMetadata?.({ requestId: turnRequestId(), sessionId: 10,
+      contextCompaction: { running: true, completed: false } }));
+    expect(screen.getByText('正在压缩上下文…')).toBeVisible();
+    act(() => streamCallbacks!.onError({ requestId: turnRequestId(), sessionId: 10, partial: true,
+      code: 'CONTEXT_SUMMARY_INVALID', message: '上下文摘要格式无效，原历史已保留', stateDurable: true,
+      persistenceStatus: 'saved', contextCompaction: { running: false, completed: false } }));
+    await waitFor(() => expect(messageNodes()).toHaveLength(2));
+    const answer = document.querySelector('.chat-message.assistant');
+    expect(answer).toHaveTextContent('上下文摘要格式无效，原历史已保留');
+    expect(screen.getByRole('button', { name: '重新生成' })).toBeEnabled();
+    expect(screen.queryByText('正在压缩上下文…')).toBeNull();
+    expect(screen.queryByText('上下文已自动压缩')).toBeNull();
+    expect(streamChatMock).toHaveBeenCalledTimes(1);
+    expect(apiPost.mock.calls.filter(([url]) => url === '/api/ai/chat')).toHaveLength(0);
+  });
+
+  it('重试期间发生本地失败时显示最终具体原因，不被此前上游报错覆盖', async () => {
+    renderAssistant(); await send('等待恢复后继续');
+    await waitFor(() => expect(streamCallbacks).toBeTruthy());
+    const recovery: AiRecovery = { kind: 'request', state: 'failed', attempt: 1, limit: 4,
+      error: 'HTTP 503 · 旧的上游报错', nextRetryAt: null };
+    const failure = { code: 'CONTEXT_STORAGE_FAILED', message: '发送前的本地上下文复核失败，原历史已保留。' };
+    act(() => streamCallbacks!.onMetadata?.({ requestId: turnRequestId(), recovery }));
+    act(() => streamCallbacks!.onError({ requestId: turnRequestId(), partial: true, message: failure.message,
+      failure, recovery, stateDurable: true, persistenceStatus: 'saved' }));
+    expect(screen.getAllByText(failure.message)).toHaveLength(1);
+    expect(screen.queryByText(recovery.error)).toBeNull();
+    expect(screen.getByRole('button', { name: '重新生成' })).toBeEnabled();
+  });
+
+  it('历史恢复优先显示已保存的最终失败原因并保留重试次数', async () => {
+    const failure = { code: 'CONTEXT_STORAGE_FAILED', message: '本地复核失败，主请求尚未发出' };
+    serverMessages = [
+      { id: 101, role: 'user', content: '继续', requestId: 'failed-retry', turnStatus: 'FAILED' },
+      { id: 102, role: 'assistant', content: '', requestId: 'failed-retry', turnStatus: 'FAILED', failure,
+        recovery: { kind: 'request', state: 'failed', attempt: 1, limit: 4, error: 'HTTP 503 · 旧错误', nextRetryAt: null } }
+    ];
+    renderAssistant();
+    expect(await screen.findByText(failure.message)).toBeVisible();
+    expect(screen.queryByText('HTTP 503 · 旧错误')).toBeNull();
+    expect(document.querySelector('.ai-recovery')).toHaveTextContent('1/4');
+  });
+
+  it('重新打开没有正文的失败会话仍从历史显示具体报错和重新生成入口', async () => {
+    const failure = { code: 'PAGE_CONTEXT_INVALID', message: '当前页面参数无效，本轮未外发' };
+    serverMessages = [
+      { id: 101, role: 'user', content: '继续上一轮', requestId: 'failed-prepare', turnStatus: 'FAILED' },
+      { id: 102, role: 'assistant', content: '', requestId: 'failed-prepare', turnStatus: 'FAILED', failure }
+    ];
+    renderAssistant();
+    const notice = await screen.findByText(failure.message);
+    expect(notice.closest('.chat-message.assistant')).toBeTruthy();
+    expect(screen.getAllByText(failure.message)).toHaveLength(1);
+    expect(screen.getByRole('button', { name: '重新生成' })).toBeEnabled();
+    expect(screen.queryByText('这一轮失败，显示的内容可能不完整')).toBeNull();
+    expect(streamChatMock).not.toHaveBeenCalled();
+  });
+
   it('恢复状态在原回答显示一次，成功后清除且始终保留下一条草稿', async () => {
     renderAssistant(); await send('请求在原轮次恢复');
     await waitFor(() => expect(streamCallbacks).toBeTruthy());

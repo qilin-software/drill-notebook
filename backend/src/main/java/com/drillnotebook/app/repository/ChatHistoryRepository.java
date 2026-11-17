@@ -106,6 +106,45 @@ public class ChatHistoryRepository {
         }
     }
 
+    /** Metadata-only pass: covered, deleted and ineligible turns never load message blobs. */
+    public record TurnIdentity(long turnId, String requestId, String status, long generation, long revision, String deletedAt) {
+        public boolean matches(TurnHistory row) {
+            return turnId == row.turnId() && requestId.equals(row.requestId()) && status.equals(row.status())
+                    && generation == row.contextGeneration() && revision == row.sourceRevision()
+                    && java.util.Objects.equals(deletedAt, row.contentDeletedAt());
+        }
+    }
+
+    public List<TurnIdentity> turnIdentities(long sessionId, long beforeTurnId, int limit) throws SQLException {
+        try (var connection = dataSource.getConnection(); var statement = connection.prepareStatement(
+                "SELECT id, request_id, status, context_generation, source_revision, content_deleted_at FROM ai_chat_turn"
+                        + " WHERE session_id = ? AND id < ? ORDER BY id DESC LIMIT ?")) {
+            statement.setLong(1, sessionId); statement.setLong(2, beforeTurnId); statement.setInt(3, Math.min(256, limit));
+            var result = new ArrayList<TurnIdentity>();
+            try (var rows = statement.executeQuery()) { while (rows.next()) result.add(new TurnIdentity(rows.getLong(1),
+                    rows.getString(2), rows.getString(3), rows.getLong(4), rows.getLong(5), rows.getString(6))); }
+            return result;
+        }
+    }
+
+    public List<TurnHistory> turnContents(long sessionId, List<Long> ids) throws SQLException {
+        if (ids.isEmpty()) return List.of();
+        if (ids.size() > 16) throw new IllegalArgumentException("历史正文批次超过上限");
+        String placeholders = String.join(",", java.util.Collections.nCopies(ids.size(), "?"));
+        try (var connection = dataSource.getConnection(); var statement = connection.prepareStatement(TURN_COLUMNS
+                + " WHERE t.session_id = ? AND t.id IN (" + placeholders + ") ORDER BY t.id DESC")) {
+            statement.setLong(1, sessionId);
+            for (int i = 0; i < ids.size(); i++) statement.setLong(i + 2, ids.get(i));
+            var result = new ArrayList<TurnHistory>();
+            try (var rows = statement.executeQuery()) { while (rows.next()) result.add(new TurnHistory(rows.getLong("id"),
+                    rows.getString("request_id"), rows.getString("status"), rows.getLong("context_generation"), rows.getString("content_deleted_at"),
+                    rows.getString("started_at"), rows.getString("finished_at"), nullableLong(rows, "u_id"), rows.getString("u_content"),
+                    rows.getString("u_cipher"), rows.getString("u_meta"), nullableLong(rows, "a_id"), rows.getString("a_content"),
+                    rows.getString("a_cipher"), rows.getString("a_meta"), rows.getLong("source_revision"))); }
+            return result;
+        }
+    }
+
     /**
      * 维护扫描的一行：轮次身份、来源版本、正文列与请求元数据列（都不解密）。
      * 与 {@link TurnHistory} 分开，是因为后台装载必须额外看到 {@code source_revision}
@@ -391,6 +430,26 @@ public class ChatHistoryRepository {
         }
         return new com.drillnotebook.app.model.ContextSource("LEGACY", id, 0, id, 1,
                 com.drillnotebook.app.service.ChatContextEntryService.fingerprint(identity.toString()));
+    }
+
+    public List<LegacyMessage> legacyIdentities(long sessionId, long beforeMessageId, int limit) throws SQLException {
+        try (var connection = dataSource.getConnection(); var statement = connection.prepareStatement(
+                "SELECT id, role, created_at FROM ai_chat_message WHERE session_id=? AND turn_id IS NULL AND id < ? ORDER BY id DESC LIMIT ?")) {
+            statement.setLong(1, sessionId); statement.setLong(2, beforeMessageId); statement.setInt(3, Math.min(256, limit));
+            var rows = new ArrayList<LegacyMessage>();
+            try (var result = statement.executeQuery()) { while (result.next()) rows.add(new LegacyMessage(result.getLong(1), result.getString(2), null, null, null, result.getString(3))); }
+            return rows;
+        }
+    }
+
+    public List<LegacyMessage> legacyContents(long sessionId, long userId, long assistantId) throws SQLException {
+        try (var connection = dataSource.getConnection(); var statement = connection.prepareStatement(
+                "SELECT id, role, content, content_cipher, content_meta, created_at FROM ai_chat_message WHERE session_id=? AND turn_id IS NULL AND id IN (?,?) ORDER BY id")) {
+            statement.setLong(1, sessionId); statement.setLong(2, userId); statement.setLong(3, assistantId);
+            var rows = new ArrayList<LegacyMessage>();
+            try (var result = statement.executeQuery()) { while (result.next()) rows.add(new LegacyMessage(result.getLong(1), result.getString(2), result.getString(3), result.getString(4), result.getString(5), result.getString(6))); }
+            return rows;
+        }
     }
 
     static boolean legacySourceMatchesIn(Connection connection, long sessionId, com.drillnotebook.app.model.ContextSource source) throws SQLException {

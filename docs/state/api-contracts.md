@@ -216,6 +216,7 @@ v2 请求核心字段：
 - 同一会话同一时刻只允许一个 `RUNNING` 轮次；v2 同 requestId、同输入的重试复用原收据与结果，输入改变返回 `409 REQUEST_ID_CONFLICT`。直接向聊天接口提交忙碌会话的另一条请求仍返回 `409 SESSION_BUSY`；前端人工排队改走 §3.4.1 队列接口，与工具派发按序接续。尚无记录的请求 ID 仍须满足 UUIDv7 时效要求。
 - `retryOf` 是 v2 顶层可选字段，指向同一会话中要重新回答的当前 requestId。v0.8.2 起重新生成使用新 requestId，在同一事务中复用原 turnId / userMessageId / assistantMessageId，替换原回答，不追加问答；原提问与完整附件必须一致，可通过 §3.3 的只读接口取得。按受理时的目标会话模型与本次页面快照生成，以原轮次为上下文截止点，不带入其后问答。原消息时间与顺序保留，本次重新受理冻结新的运行配置；自动恢复仍共用正在运行的原请求与预算。
 - 原地重试将被替换 requestId 写入 `ai_chat_retry_receipt`，旧 ID 返回 `409 TURN_SUPERSEDED`，details 带 `replacementRequestId` 和 sessionId。同新 requestId 的重发仍复用本次收据；资料写入工具可沿当前轮次与旧回执的 retryOf 链查重，参数改变仍拒绝冲突。历史累计用量包含原轮次各次尝试的实测记录，不能把旧 ID 作为另一条新消息再次执行。
+- 已受理请求在没有正文时失败，也保存稳定助手消息身份；统一结果、SSE error、轮次状态与历史助手行额外返回 `failure?:{code,message,diagnostics?}`。code 只接受最多 80 字符的大写错误码，否则为 REQUEST_FAILED；message 复用上游脱敏及 4,000 字符限长（可追加省略号），随 result metadata 加密保存，已清理记录不返回。`diagnostics` 为 `{stage,mainRequestAttempted,compactionRequestAttempted}`，stage 仅接受 PREPARING / COMPACTING / SENDING / TOOLS / FINALIZING；两个布尔值记录本轮到达 HTTP 发送边界的事实，不能作为供应商接收确认。未尝试主请求时提示「主模型请求尚未发出」，摘要调用不等于主调用；旧记录缺诊断保持未知。前端在原回答内显示一次具体错误并保留重新生成入口，优先于通用中断说明。普通 / 非流式备用通道的 HTTP 错误也须核对同一请求状态；只有确认未受理的重试才恢复原回答，未知状态不自动重发。
 
 SSE 事件格式：`event:<name>` + `data:<json>`；事件名：
 
@@ -225,14 +226,16 @@ SSE 事件格式：`event:<name>` + `data:<json>`；事件名：
 | `reasoning` | `{ text }` | 思考增量 |
 | `metadata` | 含 `requestId`、`planId`、`recovery?`、`contextCompaction?` 等 | 本轮计划、恢复与压缩状态；前端据此登记请求 ID |
 | `tool_activity` | `{requestId, sessionId, toolActivities, phase}` | 有界活动快照；phase 为 tools / answer，精确读取等待期间可为 waiting |
-| `done` | 普通 chat 响应字段，额外含 reasoning | 顶层含 requestId/sessionId/status/persistenceStatus/stateDurable、finishReason、toolActivities、recovery? 及上下文/用量字段 |
-| `error` | `{message, partial, requestId?, sessionId?, code?, persistenceStatus?, stateDurable?, toolActivities?, recovery?}` | 如实保留身份、保存状态、恢复原因与已确认活动 |
+| `done` | 普通 chat 响应字段，额外含 reasoning | 顶层含 requestId/sessionId/status/persistenceStatus/stateDurable、finishReason、toolActivities、recovery?、contextCompaction? 及上下文/用量字段 |
+| `error` | `{message, partial, requestId?, sessionId?, code?, persistenceStatus?, stateDurable?, toolActivities?, recovery?, contextCompaction?}` | 如实保留身份、保存状态、恢复原因、已确认活动与压缩成功事实 |
 
 若流在没有 `done` / `error` 的情况下 EOF，客户端必须用 `requestId` 查询轮次状态，不能把占位内容当作完成。
 
 SSE 每 10 秒发送注释心跳，不再固定五分钟关闭。v2 任务由后端持有，断连只取消订阅，任务继续；客户端从运行快照或同 requestId 查询恢复，停止必须显式调用。旧 v1 保留断连取消的兼容行为。关闭模型正文流式不关闭活动事件。`finishReason` 包含 `budget_stages/executions/output/time/context/repeated`、`request_timeout`、`request_timeout_idle`、`stream_error` 等；达限后的「继续」使用新 requestId 和可见后续消息，不自动重放原工具。
 
-压缩执行的 metadata 为 `{sessionId,requestId,phase:"compacting",contextCompaction:{running:true}}`，结束发送 running=false / phase=answer。运行快照与轮次状态保留相同阶段，可用于切会话或断开订阅后恢复；现有取消接口同时取消压缩模型请求。
+压缩状态为 `contextCompaction:{running:boolean,completed:boolean}`。running 表示当前执行中，completed 表示本轮确实发布过合格检查点；2026-11-16 起不再把 running=false 当成成功。首份检查点生成时的 metadata 例为 `{sessionId,requestId,phase:"compacting",contextCompaction:{running:true,completed:false}}`，发布并保存完成进度后发送 `phase:"answer",contextCompaction:{running:false,completed:true}`。本轮此前已经成功、又开始压缩时两个字段可以同时为 true；停止或后续失败只清除 running，不抹去已有成功事实。
+
+运行快照、普通 / SSE 终态、轮次查询及历史助手消息保留 completed；进度随现有 result metadata 加密保存，服务重建后仍可恢复。旧记录缺少 completed 时按 false 处理。前端运行时显示「正在压缩上下文…」，成功后保留「上下文已自动压缩」；只有 running 结束且没有成功事实时不显示完成标识。现有取消接口同时取消摘要请求。
 
 #### 3.2.1 对话内记忆工具
 
@@ -468,11 +471,21 @@ v2 状态查询同时覆盖尚未建立轮次的派发收据。运行中返回 a
 
 管理路径在每次主请求、工具往返和断流续答前预检最终协议请求；HTTP 重试复用同一冻结正文。窗口 W、实际输出 R 与 `M=max(512,floor(W/10))` 得到 `H=W-R-M`，软门槛为 `min(floor(W×thresholdPercent/100),H)`，目标为 `min(floor(W×60%),H)`。自动压缩关闭时仍执行硬预算检查，不自动裁掉必需输入。
 
-历史投影不受前端 500 条驻留或旧 32 轮限制。读取达到 16,384 轮 / 32 MiB / 30 秒保护返回 `413 CONTEXT_SCAN_LIMIT`，单轮步骤超读取范围为 `CONTEXT_HISTORY_SCAN_LIMIT`；不把未读部分当作空历史继续发送。
+历史投影不受前端 500 条驻留或旧 32 轮限制。先按身份分页校验来源，再只读取未覆盖的合格正文；正文达到 16,384 轮 / 32 MiB、元数据超过 262,144 条或扫描超过 30 秒保护返回 `413 CONTEXT_SCAN_LIMIT`，单轮步骤超读取范围为 `CONTEXT_HISTORY_SCAN_LIMIT`；不把未读部分当作空历史继续发送。
 
-通用摘要保留 `goal / constraints / decisions / completed / pending / unknown / sources / receipts`。摘要请求关闭工具，只使用本轮同一聊天目标，共用停止、时间、并发和输出预算；校验终态、全部字段、来源和完整写回执，最终视图满足预算后原子发布。原始消息与附件不因压缩删除；软门槛下摘要失败仅在完整原视图仍合法且可容纳时允许继续，硬超限拒绝外发。
+通用摘要保留 `goal / constraints / decisions / completed / pending / unknown / sources / receipts`。摘要请求关闭工具，只使用本轮同一聊天目标，共用停止、时间、并发和输出预算；主输出在摘要结束后重新计算、预检并实际预留。摘要 HTTP 重试独立持有冻结请求与计数，沿用原重试配置，不进入主回答重试循环。一次准备的摘要总时长最多 120 秒、单请求最多 60 秒，并为最终回答保留输出及 5–60 秒时间，实际仍取整轮剩余额度内的值。
 
-主要拒绝码为 `CONTEXT_TOO_LARGE`、`CONTEXT_CHANGED`、`CONTEXT_COMPACTION_STOPPED / CONFLICT / BUDGET / INEFFECTIVE`、`CONTEXT_SUMMARY_INCOMPLETE / INVALID / TOO_LARGE`、`CONTEXT_COVERAGE_TOO_LARGE`、`CONTEXT_STEP_TOO_LARGE` 和 `HISTORY_STORAGE_FULL`；均保持原始历史。存储异常也不能发布半份检查点。已确认业务写入的成功活动先保留，后续步骤存储失败不改写已确认结果。
+大来源组按角色、消息序号、偏移与总长度完整有序分片，所有必要片段成功后才加入覆盖；窗口超限时缩小摘要批次，分片从未完成的位置重试，最多 3 次按约 2/3 减量。每段校验终态、全部字段、来源以及模型 receipts 为空；完整写回执由程序独立提取、保存和校验，最终视图满足预算、来源仍有效且未停止时原子发布。原始消息与附件不因压缩删除。
+
+主请求收到明确窗口拒绝且没有正文、思考或工具调用输出时，自动压缩开启才允许在同一轮最多两次收紧输入目标至上次估算的 75%，重新准备后发送；已成功工具结果继续保留，已有输出或未确认插话不走该恢复。普通网络重试仍使用冻结正文。摘要 length / max_tokens 截断时重做一次完整来源，持续截断再减小来源组或完整分片；所有请求仍受窗口、时间、输出和每次准备 32 次调用限制。
+
+检查点 continuation-v2 / payload schema 2 的 retained 保存完整回执及规则命中的关键用户原话。模型仅见操作计数和最近八条回执，摘要 receipts 为空数组；完整来源覆盖与用户原话不依赖模型照抄。来源改动共同失效，旧 continuation-v1 从原历史重建。受保护原话超过上限返回 CONTEXT_EVIDENCE_TOO_LARGE，不截句或静默丢弃；规则保护不等于语义无损。
+
+后续可选压缩失败时，可以发布已经完整生成且满足硬预算的有效候选，内部记录 `CONTEXT_COMPACTION_TARGET_NOT_REACHED` 后继续回答；未完成来源不加入覆盖。没有可用候选时，只有完整原视图仍合法且可容纳才允许回退，否则明确拒绝外发。合法回退清除过时摘要 recovery，硬失败保留具体错误；停止、来源冲突和存储异常不能发布候选。
+
+普通可用请求不依赖新压缩专用的锚点 / 边界读取。可选压缩的本地读取、租约获取或发布失败时，来源未变化且完整原视图仍可容纳则继续发送原视图，不使用未发布摘要，不标记完成；无法合法回退时保留本地原因并拒绝主请求。发送前复核 SQL 失败为 503 / CONTEXT_STORAGE_FAILED，实际版本 / 授权变化仍为 CONTEXT_CHANGED；复核不提前收尾，错误由请求所有者统一保存。
+
+主要拒绝码为 `CONTEXT_TOO_LARGE`、`CONTEXT_CHANGED`、`CONTEXT_STORAGE_FAILED`、`CONTEXT_COMPACTION_STOPPED / TIMEOUT / CONFLICT / BUDGET / INEFFECTIVE / FAILED`、`CONTEXT_SUMMARY_INCOMPLETE / INVALID / TOO_LARGE / TRUNCATED`、`CONTEXT_COVERAGE_TOO_LARGE`、`CONTEXT_EVIDENCE_TOO_LARGE`、`CONTEXT_STEP_TOO_LARGE` 和 `HISTORY_STORAGE_FULL`；均保持原始历史。存储异常也不能发布半份检查点。已确认业务写入的成功活动先保留，后续步骤存储失败不改写已确认结果。
 
 来源预览仍走既有 POST 接口，只接受该轮 selected 的来源键，最多 5 项、每项 160 码点。新增 CONTINUATION 为聊天加密的有效续接摘要，STEP 为有界加密步骤；旧 SUMMARY 仍指 vault 摘要。预览重新检查截止点、来源版本、generation、权限与记忆边界，变化后返回不可用，不读取任意会话或绕过解锁。
 
@@ -493,7 +506,7 @@ v2 状态查询同时覆盖尚未建立轮次的派发收据。运行中返回 a
 | POST | `/ai/history/cleanup/preview` / `cleanup` | 清理预览 / 执行 |
 | GET | `/ai/sessions/{id}/export` | 导出会话 |
 
-轮次状态和历史助手消息返回 `toolActivities` 与 `finishReason`，有失败 / 停止恢复事实时附 `recovery`；旧消息缺少活动时返回空列表。删除会话或清理历史仅断开相应来源证据，保留已保存长期记忆及原来源类型；删除笔记本的 NOTEBOOK scope 清理仍独立执行。
+轮次状态和历史助手消息返回 `toolActivities`、`finishReason` 与 `contextCompaction`，有失败 / 停止恢复事实时附 `recovery`；旧消息缺少活动时返回空列表，缺少压缩完成事实时 completed=false。删除会话或清理历史仅断开相应来源证据，保留已保存长期记忆及原来源类型；删除笔记本的 NOTEBOOK scope 清理仍独立执行。
 
 v0.8.1 历史与定位契约：
 
@@ -518,6 +531,8 @@ runtime 响应为 `{sessions:[{sessionId,requestId,status,phase?,paused?,queueCo
 - `current:{tokens,categories,estimated,complete,estimatorVersion,model,contextWindow,contextGeneration,historyRevision,requestId,active,summaryRevision}` 是最后一次主模型实际请求及其响应的数值快照。tokens 为 Long，等于最终请求输入组成估算加该次输出；输出优先用供应商回报，否则估算该次文字、思考与调用。estimated 当前为 true，complete=false 表示响应捕获 / 回报不完整的已知下界。summaryRevision 当前为 null。
 - `current.categories:[{kind,tokens}]` 只含正数分类，kind 沿用 SYSTEM / TOOL_DEFINITIONS / USER / INJECTED_CONTEXT / ASSISTANT / TOOL_CALLS / TOOL_RESULTS / IMAGE / OTHER，tokens 为 Long。分类与快照总量同源，合计等于 current.tokens；该次输出加入 ASSISTANT 分类。分类不来自全库正文、浏览器选择的旧请求或累计计费，不保存提示词 / 工具原始数据。
 - 每次主请求（含工具往返、断流续接、新轮次和原地重试）替换输入快照并重新计该次输出。历史、资料、工具结果与协议思考状态仅在实际外发时计入；前次响应若已进入续接输入不重复追加。NATIVE_WEB / CONTEXT_COMPACT 辅助请求只记账，不替换主快照；压缩后的下一次主请求实际发送时才更新占用。运行时读活跃数值，终态保存同一快照供重启读取；较小请求可降低占用。清理 / 编辑造成历史版本不匹配或上下文换代时旧快照失效；无实际快照返回 null。旧版本仅回退到同轮最后一份 CHAT 请求摘要及其输出，输出缺失为下界。
+- v0.8.3 起，后续轮次没有实际 CHAT 请求和快照时，current 可继续返回上一份有效主请求快照，requestId 仍指向该实际请求。版本差仅由之后未修改的 begin / end 追加解释时有效：RUNNING 且 source_revision=1 为一次，终态且 source_revision=2 为两次；清理、编辑、换代和原地替换不放宽。较新实际 CHAT 请求或已有损坏快照是阻断点，无法读取便返回 null，不越过它借用更早请求。
+- HTTP 客户端接受请求后才创建发送用量和主窗口；请求构建失败、最终复核失败及发送前取消不覆盖旧窗口。每次发送（含等待并发槽和缓存兼容重发）前复核来源 / 停止。快照版本取实际发送计划；终态只增加自身的一次追加，不把生成期间发生的历史修改并入旧快照。已存在但无效的新格式 modelContext 不走 legacy 用量回退。
 - `latest:{requestId,inputTokens,contextWindow,model,cacheReadTokens,outputTokens}` 保留当前代里最近一次回报输入的请求实测或 null，用于请求对账。圆环和顶部使用 `current.tokens / 该快照 contextWindow`，而非多次请求的累计；只有最后请求的输入而缺少该次输出也不是完整占用。图形封顶 100%，总量及实际百分比允许超过窗口。
 - `cumulative:{requests,inputTokens,outputTokens,cacheReadTokens,cacheMissTokens,totalTokens,inputComplete,outputComplete,cacheReadComplete,cacheMissComplete,totalComplete}` 来自持久化账本，包含该会话所有对应 CHAT / CONTEXT_COMPACT 的已结算 / UNKNOWN 请求及旧重试回执，排除标题、长期记忆维护、其它会话和未发送预留。输入归一化后包括缓存读写，total 为输入加输出；OpenAI 包含桶不再相加，Anthropic 独立桶加回。原始计费账本保持。
 - 缺失数字为 null，部分回报仍返回已知 subtotal 并令对应 Complete=false，前端显示 `≥`；没有请求也不造全零。只有累计输入与命中都完整且输入大于 0 才计算命中率。旧缓存口径无法从独立日账本核实时保持未知；上下文换代 / 正文清理不改变已发生的累计，500 条驻留限制不截断统计。聚合使用 Long。
