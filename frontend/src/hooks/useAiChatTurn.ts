@@ -7,6 +7,7 @@ import { generateUuidV7 } from '../lib/uuidV7';
 import type { RetrievalOptions } from '../lib/types';
 import { readToolActivities } from '../lib/toolActivity';
 import type { ToolActivity, ToolPhase } from '../lib/toolActivity';
+import type { ProcessSegment } from '../lib/processSegment';
 import type { ChatSupplement } from '../lib/chatQueue';
 import type { PageSnapshot } from '../lib/pageSnapshot';
 import { readRecovery } from '../lib/aiRecovery';
@@ -65,6 +66,7 @@ export interface TurnStatusView {
   userText?: string;
   phase?: string;
   toolActivities?: ToolActivity[];
+  processSegments?: ProcessSegment[];
   requestId?: string;
   sessionId?: number;
   status?: string;
@@ -81,6 +83,8 @@ export type TurnEvent =
   | { type: 'supplements'; requestId: string; supplements: ChatSupplement[] }
   | { type: 'snapshot'; requestId: string; status: TurnStatusView }
   | { type: 'activity'; requestId: string; activities: ToolActivity[]; phase: ToolPhase }
+  // 一次响应转去调用工具：步骤移入过程，回答 / 思考区回到给定前缀
+  | { type: 'process'; requestId: string; segments: ProcessSegment[]; reply: string; reasoning: string }
   | { type: 'reconciled'; requestId: string; status: TurnStatusView }
   | { type: 'begun'; requestId: string }
   | { type: 'text'; requestId: string; delta: string }
@@ -349,6 +353,12 @@ export function useAiChatTurn({ sessionId, onEvent }: UseAiChatTurnOptions): {
         turn.produced = true;
         turn.toolObserved = true;
         emit(turn, { type: 'activity', requestId: turn.requestId, activities: event.toolActivities, phase: event.phase });
+      },
+      onProcess: (event) => {
+        if (event.requestId !== turn.requestId) return;
+        turn.begun = true;
+        turn.produced = true;
+        emit(turn, { type: 'process', requestId: turn.requestId, segments: event.segments, reply: event.reply, reasoning: event.reasoning });
       },
       onDone: (payload) => {
         emit(turn, {

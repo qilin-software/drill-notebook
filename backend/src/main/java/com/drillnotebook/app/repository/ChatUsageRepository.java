@@ -38,6 +38,16 @@ public class ChatUsageRepository {
                     SELECT request_id AS operation_id, request_id FROM turns
                     UNION
                     SELECT r.request_id, t.request_id FROM ai_chat_retry_receipt r JOIN turns t ON t.id = r.turn_id
+                ), cache_targets AS (
+                    -- 回报过缓存命中字段的目标，零命中时省略该字段：缺失按 0 命中，而不是未回报。
+                    SELECT DISTINCT target_fingerprint FROM ai_usage_attempt
+                    WHERE usage_source = 'provider' AND cache_read_tokens >= 0
+                ), attempts AS (
+                    SELECT a.*, CASE WHEN a.cache_read_tokens IS NOT NULL THEN a.cache_read_tokens
+                            WHEN a.state = 'SETTLED' AND a.usage_source = 'provider' AND a.input_tokens >= 0
+                                AND a.target_fingerprint IN (SELECT target_fingerprint FROM cache_targets) THEN 0
+                        END AS cache_read_known
+                    FROM ai_usage_attempt a
                 ), reported AS (
                     SELECT r.request_id, a.id AS attempt_id,
                 """ + (includePending ? "a.operation_id, a.purpose, a.created_at, a.settled_at, a.state, a.usage_source, a.context_breakdown,\n" : "") + """
@@ -52,15 +62,15 @@ public class ChatUsageRepository {
                             END END AS input,
                         CASE WHEN a.state = 'SETTLED' AND a.usage_source = 'provider' AND a.output_tokens >= 0
                             THEN a.output_tokens END AS output,
-                        CASE WHEN a.state = 'SETTLED' AND a.usage_source = 'provider' AND a.cache_read_tokens >= 0
-                            THEN a.cache_read_tokens END AS cache_read,
+                        CASE WHEN a.state = 'SETTLED' AND a.usage_source = 'provider' AND a.cache_read_known >= 0
+                            THEN a.cache_read_known END AS cache_read,
                         CASE WHEN a.state = 'SETTLED' AND a.usage_source = 'provider' AND a.input_tokens >= 0
                             AND (a.cache_read_included_in_input = 1
-                                OR a.cache_read_included_in_input = 0 AND a.cache_read_tokens >= 0 AND a.cache_write_tokens >= 0
+                                OR a.cache_read_included_in_input = 0 AND a.cache_read_known >= 0 AND a.cache_write_tokens >= 0
                                 OR a.cache_read_included_in_input IS NULL
                                     AND COALESCE(a.cache_read_tokens, 0) = 0 AND COALESCE(a.cache_write_tokens, 0) = 0)
                             THEN 1 ELSE 0 END AS input_complete
-                    FROM receipts r JOIN ai_usage_attempt a ON a.operation_id = r.operation_id
+                    FROM receipts r JOIN attempts a ON a.operation_id = r.operation_id
                     WHERE a.purpose IN ('CHAT', 'CONTEXT_COMPACT') AND a.state IN ('SETTLED', 'UNKNOWN'
                 """ + (includePending ? ", 'SENT'" : "") + """
                     )

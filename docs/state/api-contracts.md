@@ -222,14 +222,17 @@ SSE 事件格式：`event:<name>` + `data:<json>`；事件名：
 
 | 事件 | 载荷 | 说明 |
 |---|---|---|
-| `text` | `{ text }` | 回答增量；身份由本连接 metadata 确认 |
-| `reasoning` | `{ text }` | 思考增量 |
+| `text` | `{ text }` | 回答增量，在每次模型响应期间实时发送；身份由本连接 metadata 确认 |
+| `reasoning` | `{ text }` | 思考增量，同样实时发送 |
 | `metadata` | 含 `requestId`、`planId`、`recovery?`、`contextCompaction?` 等 | 本轮计划、恢复与压缩状态；前端据此登记请求 ID |
 | `tool_activity` | `{requestId, sessionId, toolActivities, phase}` | 有界活动快照；phase 为 tools / answer，精确读取等待期间可为 waiting |
-| `done` | 普通 chat 响应字段，额外含 reasoning | 顶层含 requestId/sessionId/status/persistenceStatus/stateDurable、finishReason、toolActivities、recovery?、contextCompaction? 及上下文/用量字段 |
+| `process` | `{requestId, sessionId, processSegments, reply, reasoning}` | 一次响应以工具调用结束时发送：步骤全量快照，以及回答 / 思考区应回到的已确认前缀 |
+| `done` | 普通 chat 响应字段，额外含 reasoning | 顶层含 requestId/sessionId/status/persistenceStatus/stateDurable、finishReason、toolActivities、processSegments、recovery?、contextCompaction? 及上下文/用量字段 |
 | `error` | `{message, partial, requestId?, sessionId?, code?, persistenceStatus?, stateDurable?, toolActivities?, recovery?, contextCompaction?}` | 如实保留身份、保存状态、恢复原因、已确认活动与压缩成功事实 |
 
 若流在没有 `done` / `error` 的情况下 EOF，客户端必须用 `requestId` 查询轮次状态，不能把占位内容当作完成。
+
+过程步骤 `processSegments` 的每项为 `{anchor, reasoning, text, truncated}`：一次以工具调用结束的模型响应留下的思考与过渡正文，anchor 是步骤结束时已有的工具活动数（展示在序号更大的工具行之前）。全部步骤文本合计最多 65,536 UTF-8 字节、256 步，超出时最后一步 `truncated=true`。步骤只用于展示，随 result metadata 加密保存，不进入发给模型的消息、摘要来源或工具回执；最终 `reply` / `reasoning` 仍只含最后一次响应。客户端收到 `process` 后整体替换步骤，并把回答 / 思考区重置为事件中的 `reply` / `reasoning`。普通与流式结果、`GET /ai/turns/{requestId}`、历史助手消息和运行快照同样返回该字段，已清理内容或旧记录为空数组；v2 重新订阅先补发一帧 `process`，再补发当前步骤已累计的增量。
 
 SSE 每 10 秒发送注释心跳，不再固定五分钟关闭。v2 任务由后端持有，断连只取消订阅，任务继续；客户端从运行快照或同 requestId 查询恢复，停止必须显式调用。旧 v1 保留断连取消的兼容行为。关闭模型正文流式不关闭活动事件。`finishReason` 包含 `budget_stages/executions/output/time/context/repeated`、`request_timeout`、`request_timeout_idle`、`stream_error` 等；达限后的「继续」使用新 requestId 和可见后续消息，不自动重放原工具。
 
@@ -536,6 +539,7 @@ runtime 响应为 `{sessions:[{sessionId,requestId,status,phase?,paused?,queueCo
 - `latest:{requestId,inputTokens,contextWindow,model,cacheReadTokens,outputTokens}` 保留当前代里最近一次回报输入的请求实测或 null，用于请求对账。圆环和顶部使用 `current.tokens / 该快照 contextWindow`，而非多次请求的累计；只有最后请求的输入而缺少该次输出也不是完整占用。图形封顶 100%，总量及实际百分比允许超过窗口。
 - `cumulative:{requests,inputTokens,outputTokens,cacheReadTokens,cacheMissTokens,totalTokens,inputComplete,outputComplete,cacheReadComplete,cacheMissComplete,totalComplete}` 来自持久化账本，包含该会话所有对应 CHAT / CONTEXT_COMPACT 的已结算 / UNKNOWN 请求及旧重试回执，排除标题、长期记忆维护、其它会话和未发送预留。输入归一化后包括缓存读写，total 为输入加输出；OpenAI 包含桶不再相加，Anthropic 独立桶加回。原始计费账本保持。
 - 缺失数字为 null，部分回报仍返回已知 subtotal 并令对应 Complete=false，前端显示 `≥`；没有请求也不造全零。只有累计输入与命中都完整且输入大于 0 才计算命中率。旧缓存口径无法从独立日账本核实时保持未知；上下文换代 / 正文清理不改变已发生的累计，500 条驻留限制不截断统计。聚合使用 Long。
+- 缓存命中字段缺失的推断：同一 `target_fingerprint` 只要存在任何回报过缓存命中数的记录，即视为该目标在零命中时省略字段，其已结算且回报了输入的请求按 0 命中、全部输入计为未命中，并视为完整；从未回报过的目标保持 null。推断只在读取时进行，会话累计、单轮累计与逐请求分页一致，不改写已保存记录和计费账本；缓存写入字段缺失仍按不完整处理。OpenAI 风格用量在命中字段缺失而 `prompt_cache_miss_tokens` 存在时，以输入减未命中得到命中数。
 - 历史助手消息的 `usage` 使用同一份本轮累计和完整性字段，包含旧原地重试尝试；用户消息的 `page:{title,link?}` 保留提交时的业务页面。没有对应请求 / 页面记录时不返回，不补估算。
 
 - 会话置顶（v0.8）：`PUT /ai/sessions/{id}` 接受布尔 `pinned`，会话视图返回 `pinnedAt`（ISO 时刻或 null）。重复置顶保留最初的时刻，置顶不改变 `updatedAt`；列表接口的顺序不变，置顶分组与排序由前端按 `pinnedAt` 升序处理。

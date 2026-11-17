@@ -375,6 +375,39 @@ describe('AiAssistant 流式会话状态', () => {
     expect(apiPost.mock.calls.some((call) => call[0] === '/api/ai/chat')).toBe(false);
   });
 
+  it('工具步骤的思考与过渡正文实时显示，工具开始时移入过程，结束后折叠且只留最终回答', async () => {
+    renderAssistant();
+    await send('复习计划怎么安排');
+    await waitFor(() => expect(streamCallbacks?.onProcess).toBeTruthy());
+    act(() => {
+      streamCallbacks!.onReasoning('先确认复习目标');
+      streamCallbacks!.onText('我先查一下记忆。');
+    });
+    const answer = document.querySelector('.chat-message.assistant.is-latest')!;
+    expect(answer.querySelector(':scope > .chat-reasoning-body, :scope > .chat-reasoning')).toHaveTextContent('先确认复习目标');
+    expect(screen.getByText('我先查一下记忆。')).toBeVisible();
+    expect(answer.querySelector('.ai-tool-activity')).toBeNull();
+
+    const segments = [{ anchor: 0, reasoning: '先确认复习目标', text: '我先查一下记忆。', truncated: false }];
+    act(() => {
+      streamCallbacks!.onProcess!({ requestId: turnRequestId(), segments, reply: '', reasoning: '' });
+      streamCallbacks!.onToolActivity!({ requestId: turnRequestId(), toolActivities: [activity], phase: 'tools' });
+    });
+    expect(answer.querySelector(':scope > .chat-reasoning')).toBeNull();
+    const process = answer.querySelector('.ai-tool-activity')!;
+    expect(process.querySelector('.ai-tool-segment')).toHaveTextContent('我先查一下记忆。');
+    expect([...process.querySelectorAll('.ai-tool-list > li')].map((item) => item.className)).toEqual(['ai-tool-segment', 'ai-tool-row']);
+    expect(screen.getAllByText('我先查一下记忆。')).toHaveLength(1);
+
+    act(() => streamCallbacks!.onText('根据记忆，先看内存管理。'));
+    expect(screen.getByText('根据记忆，先看内存管理。')).toBeVisible();
+    act(() => streamCallbacks!.onDone({ requestId: turnRequestId(), status: 'COMPLETED', reply: '根据记忆，先看内存管理。', reasoning: '',
+      toolActivities: [activity], processSegments: segments, stateDurable: true }));
+    expect(screen.getByRole('button', { name: /1 次工具调用/ })).toHaveAttribute('aria-expanded', 'false');
+    expect(screen.getByText('我先查一下记忆。')).not.toBeVisible();
+    expect(screen.getByText('根据记忆，先看内存管理。')).toBeVisible();
+  });
+
   it('工具更新不拉回底部，历史占位回流保留当前正文和手动折叠选择', async () => {
     renderAssistant();
     await send('检索后继续回答');

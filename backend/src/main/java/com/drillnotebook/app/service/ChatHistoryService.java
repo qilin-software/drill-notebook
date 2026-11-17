@@ -146,6 +146,7 @@ public class ChatHistoryService {
             ChatMessageCipher.Read meta = cipher.read(row.resultMetaCipher(), row.resultMetaCrypto(), password);
             if (meta.status() == ChatMessageCipher.ReadStatus.DECRYPTED) {
                 item.put("toolActivities", ToolActivity.readMeta(meta.value(), false));
+                item.put("processSegments", com.drillnotebook.app.model.ProcessSegment.readMeta(meta.value()));
                 try {
                     var decoded = new com.fasterxml.jackson.databind.ObjectMapper().readTree(meta.value());
                     String reason = decoded.path("finishReason").asText("");

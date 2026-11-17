@@ -207,7 +207,8 @@ class SessionContextUsageTest {
         observe(first, 0, 0, 0);
         assertEquals(0, number(cumulative(), "totalTokens"));
         assertEquals(true, cumulative().get("totalComplete"));
-        observe(first, "openai", "CHAT", new UsageRepository.ActualUsage("provider", 50, null, null, null, true));
+        // 从未回报过缓存字段的目标：缺失仍是未回报，不能当成 0 命中。
+        observe(first, "gateway-without-cache", "CHAT", new UsageRepository.ActualUsage("provider", 50, null, null, null, true));
         assertEquals(50, number(cumulative(), "inputTokens"));
         assertEquals(0, number(cumulative(), "outputTokens"));
         assertEquals(false, cumulative().get("outputComplete"));
@@ -245,11 +246,45 @@ class SessionContextUsageTest {
         assertEquals(700, number(detail, "inputTokens"));
         assertEquals(false, detail.get("inputComplete"));
         assertEquals(false, detail.get("totalComplete"));
-        observe(operation, "anthropic", "CHAT", new UsageRepository.ActualUsage("provider", 0, 0, null, 30, false));
+        observe(operation, "anthropic-without-cache-read", "CHAT", new UsageRepository.ActualUsage("provider", 0, 0, null, 30, false));
         assertEquals(730, number(cumulative(), "inputTokens"));
         assertEquals(750, number(cumulative(), "totalTokens"));
         assertEquals(false, cumulative().get("cacheReadComplete"));
         assertEquals(false, cumulative().get("totalComplete"));
+    }
+
+    @Test void missingCacheFieldCountsAsZeroHitOnlyForTargetsThatReportedItBefore() throws Exception {
+        String operation = turn(sessionId);
+        observe(operation, 1000, 800, 10);
+        String inferred = observe(operation, "openai", "CHAT", new UsageRepository.ActualUsage("provider", 400, 5, null, null, true));
+        assertEquals(1400, number(cumulative(), "inputTokens"));
+        assertEquals(800, number(cumulative(), "cacheReadTokens"));
+        assertEquals(600, number(cumulative(), "cacheMissTokens"));
+        assertEquals(true, cumulative().get("cacheReadComplete"));
+        assertEquals(true, cumulative().get("cacheMissComplete"));
+        assertNull(jdbc.queryForObject("SELECT cache_read_tokens FROM ai_usage_attempt WHERE id = ?", Integer.class, inferred),
+                "只在读取时推断，不改写已保存的用量");
+        var entries = (List<?>) new ChatUsageRepository(source).requestPage(sessionId, operation, null).get("items");
+        var detail = entries.stream().map(entry -> (Map<?, ?>) entry)
+                .filter(entry -> inferred.equals(entry.get("attemptId"))).findFirst().orElseThrow();
+        assertEquals(0, number(detail, "cacheReadTokens"));
+        assertEquals(400, number(detail, "cacheMissTokens"));
+
+        // 缓存读是独立桶的口径同样适用；缓存写入缺失仍视为不完整。
+        observe(operation, "anthropic", "CHAT", new UsageRepository.ActualUsage("provider", 100, 20, 600, 0, false));
+        observe(operation, "anthropic", "CHAT", new UsageRepository.ActualUsage("provider", 50, 5, null, 0, false));
+        assertEquals(2150, number(cumulative(), "inputTokens"));
+        assertEquals(1400, number(cumulative(), "cacheReadTokens"));
+        assertEquals(750, number(cumulative(), "cacheMissTokens"));
+        assertEquals(true, cumulative().get("inputComplete"));
+        assertEquals(true, cumulative().get("cacheMissComplete"));
+
+        observe(operation, "silent-gateway", "CHAT", new UsageRepository.ActualUsage("provider", 300, 5, null, null, true));
+        assertEquals(2450, number(cumulative(), "inputTokens"));
+        assertEquals(1400, number(cumulative(), "cacheReadTokens"));
+        assertEquals(750, number(cumulative(), "cacheMissTokens"));
+        assertEquals(false, cumulative().get("cacheReadComplete"));
+        assertEquals(false, cumulative().get("cacheMissComplete"));
     }
 
     @Test void schema20MigrationVerifiesOldBucketSemanticsAgainstActualChargedLedger() throws Exception {

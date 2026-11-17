@@ -22,6 +22,7 @@ import org.junit.jupiter.api.Test;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -306,6 +307,22 @@ class AiUpstreamClientTest {
                 usage.outputTokens(), usage.cacheReadTokens(), usage.cacheWriteTokens(),
                 usage.cacheReadIncludedInInput());
         assertEquals(2100, actual.chargedTokens());
+    }
+
+    @Test
+    void 只回报未命中数时由输入反推命中数() throws Exception {
+        AiUpstreamClient.Usage missOnly = AiUpstreamClient.usageOfChatCompletion(mapper.readTree(
+                "{\"usage\":{\"prompt_tokens\":2000,\"completion_tokens\":100,\"prompt_cache_miss_tokens\":2000}}"));
+        assertEquals(0, missOnly.cacheReadTokens());
+        AiUpstreamClient.Usage partial = AiUpstreamClient.usageOfChatCompletion(mapper.readTree(
+                "{\"usage\":{\"prompt_tokens\":2000,\"completion_tokens\":100,\"prompt_cache_miss_tokens\":500}}"));
+        assertEquals(1500, partial.cacheReadTokens());
+        AiUpstreamClient.Usage explicit = AiUpstreamClient.usageOfChatCompletion(mapper.readTree(
+                "{\"usage\":{\"prompt_tokens\":2000,\"prompt_cache_hit_tokens\":300,\"prompt_cache_miss_tokens\":500}}"));
+        assertEquals(300, explicit.cacheReadTokens(), "已回报的命中数优先");
+        AiUpstreamClient.Usage absent = AiUpstreamClient.usageOfChatCompletion(mapper.readTree(
+                "{\"usage\":{\"prompt_tokens\":2000,\"completion_tokens\":100}}"));
+        assertNull(absent.cacheReadTokens(), "两个字段都没有时仍是未回报");
     }
 
     @Test

@@ -194,6 +194,64 @@ class MemoryToolChatPathTest {
         return (List<ToolActivity>) event.get("toolActivities");
     }
 
+    @Test
+    void toolStepStreamsLiveThenMovesIntoPersistedProcessSegments() throws Exception {
+        String thought = "先确认用户的复习目标";
+        String commentary = "我先查一下记忆。";
+        try (ToolFixtureServer commented = new ToolFixtureServer().commentary(thought, commentary)) {
+            ai.saveConfig(TestModelLimits.config("provider", "custom", "endpoint", commented.baseUrl(), "model", "stub-model",
+                    "apiKey", "stub-key", "tools", true, "streaming", true));
+            enableUseConsent();
+            List<String> order = Collections.synchronizedList(new ArrayList<>());
+            List<Map<String, Object>> events = Collections.synchronizedList(new ArrayList<>());
+            Map<String, Object> request = body("复习计划怎么安排");
+            AiService.ChatResult result = ai.chatStream(request, (type, text) -> {
+                order.add(type + ":" + text);
+                return true;
+            }, event -> {
+                if (event.containsKey("processSegments")) order.add("process");
+                else if (event.containsKey("toolActivities")) order.add("activity");
+                events.add(event);
+            });
+
+            assertEquals("COMPLETED", result.status());
+            assertEquals(FINAL, result.text(), "过渡正文不并入最终回答");
+            int process = order.indexOf("process");
+            assertTrue(process > 0, "工具步骤结束时必须发出过程事件");
+            assertTrue(order.indexOf("reasoning:" + thought) >= 0 && order.indexOf("reasoning:" + thought) < process,
+                    "思考在响应期间实时下发，不等工具结束");
+            assertTrue(order.indexOf("text:" + commentary) >= 0 && order.indexOf("text:" + commentary) < process);
+            assertTrue(process < order.indexOf("activity"), "步骤先移入过程，再出现对应工具行");
+            assertTrue(order.indexOf("text:根据记忆，") > process, "最终回答在过程之后继续流式下发");
+
+            var expected = List.of(new com.drillnotebook.app.model.ProcessSegment(0, thought, commentary, false));
+            var processEvent = events.stream().filter(event -> event.containsKey("processSegments")).findFirst().orElseThrow();
+            assertEquals(expected, processEvent.get("processSegments"));
+            assertEquals("", processEvent.get("reply"), "回答区回到已确认前缀");
+            assertEquals("", processEvent.get("reasoning"));
+            String requestId = String.valueOf(request.get("requestId"));
+            assertEquals(expected, result.resultView().get("processSegments"));
+            assertEquals(expected, wiring.turnService().processSegments(requestId, PASSWORD));
+            assertEquals(expected, wiring.turnService().status(requestId, PASSWORD).get("processSegments"));
+            assertEquals(FINAL, wiring.turnService().status(requestId, PASSWORD).get("reply"));
+            assertTrue(commented.bodies().get(1).contains(commentary), "发给模型的助手工具消息不变");
+            assertFalse(dbContains(commentary), "过程文本只能加密保存");
+        }
+    }
+
+    @Test
+    void answerWithoutToolCallLeavesNoProcessSegments() throws Exception {
+        ai.saveConfig(TestModelLimits.config("provider", "custom", "endpoint", server.baseUrl(), "model", "stub-model",
+                "apiKey", "stub-key", "tools", true, "streaming", true));
+        List<Map<String, Object>> events = new ArrayList<>();
+        Map<String, Object> request = body("复习计划怎么安排");
+        AiService.ChatResult result = ai.chatStream(request, (type, text) -> true, events::add);
+
+        assertEquals("COMPLETED", result.status());
+        assertTrue(events.stream().noneMatch(event -> event.containsKey("processSegments")), "工具响应没有思考和正文时不产生步骤");
+        assertEquals(List.of(), wiring.turnService().processSegments(String.valueOf(request.get("requestId")), PASSWORD));
+    }
+
     @ParameterizedTest
     @ValueSource(booleans = {false, true})
     void defaultBudgetHandlesFiftyStagesAndOneHundredExecutionsWithCompleteHistory(boolean streaming) throws Exception {
@@ -629,6 +687,7 @@ class MemoryToolChatPathTest {
         private final List<String> bodies = Collections.synchronizedList(new ArrayList<>());
         private final String toolCall;
         private final String toolSse;
+        private String commentarySse = "";
         private int repeatBatchSize;
         private int outputTokens = 5;
 
@@ -665,6 +724,13 @@ class MemoryToolChatPathTest {
             return List.copyOf(bodies);
         }
 
+        /** 工具调用之前先流出思考与过渡正文，复现真实模型「先说一句再查」的响应。 */
+        ToolFixtureServer commentary(String reasoning, String text) {
+            commentarySse = "data: {\"choices\":[{\"delta\":{\"reasoning_content\":" + jsonString(reasoning) + "}}]}\n\n"
+                    + "data: {\"choices\":[{\"delta\":{\"content\":" + jsonString(text) + "}}]}\n\n";
+            return this;
+        }
+
         /** 有工具定义就继续查；撤下工具后才输出回答，复现真实模型耗尽轮次的路径。 */
         ToolFixtureServer repeatTools(int batchSize) {
             repeatBatchSize = batchSize;
@@ -698,7 +764,7 @@ class MemoryToolChatPathTest {
             if (repeatBatchSize > 0) continuation = !new ObjectMapper().readTree(body).has("tools");
             boolean stream = body.contains("\"stream\":true");
             if (stream) {
-                byte[] payload = (continuation ? FINAL_SSE : repeatBatchSize > 0 ? repeatedToolReply(true) : toolSse).getBytes(StandardCharsets.UTF_8);
+                byte[] payload = (continuation ? FINAL_SSE : repeatBatchSize > 0 ? repeatedToolReply(true) : commentarySse + toolSse).getBytes(StandardCharsets.UTF_8);
                 exchange.getResponseHeaders().set("Content-Type", "text/event-stream");
                 exchange.sendResponseHeaders(200, payload.length);
                 try (OutputStream out = exchange.getResponseBody()) {

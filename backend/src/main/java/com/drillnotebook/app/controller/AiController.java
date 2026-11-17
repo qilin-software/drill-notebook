@@ -107,7 +107,7 @@ public class AiController {
         return ai.chat(body);
     }
 
-    /** 流式聊天（SSE）：event=metadata|tool_activity|text|reasoning|done|error，data 为 JSON。 */
+    /** 流式聊天（SSE）：event=metadata|tool_activity|process|text|reasoning|done|error，data 为 JSON。 */
     @PostMapping(value = "/chat/stream", produces = org.springframework.http.MediaType.TEXT_EVENT_STREAM_VALUE)
     public org.springframework.web.servlet.mvc.method.annotation.SseEmitter chatStream(@RequestBody Map<String, Object> body) {
         if(dispatch!=null && Integer.valueOf(2).equals(body.get("protocolVersion"))) return managedStream(body);
@@ -154,9 +154,10 @@ public class AiController {
                     try {
                         // 首个 metadata 只是 prepared/not_sent：发送状态与最终 planId 以后端结果为准（§4.2）
                         emitter.send(org.springframework.web.servlet.mvc.method.annotation.SseEmitter.event()
-                                .name(metadata.containsKey("toolActivities") ? "tool_activity" : "metadata")
+                                .name(metadata.containsKey("processSegments") ? "process"
+                                        : metadata.containsKey("toolActivities") ? "tool_activity" : "metadata")
                                 .data(mapperValueToJson(metadata)));
-                        if (metadata.containsKey("toolActivities")) produced[0] = true;
+                        if (metadata.containsKey("toolActivities") || metadata.containsKey("processSegments")) produced[0] = true;
                     } catch (Exception sendError) {
                         disconnect.run();
                         throw new IllegalStateException("对话连接已中断", sendError);
