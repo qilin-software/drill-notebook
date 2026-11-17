@@ -63,15 +63,17 @@ const run = async (frames: string[], hooks: Partial<StreamCallbacks> = {}): Prom
 };
 
 describe('aiStream metadata 事件', () => {
-  it('压缩元数据只交付运行状态，不把摘要正文当作回答进展', async () => {
+  it('压缩元数据只交付经过类型验证的运行与成功状态', async () => {
     const captured = await run([
       'event:metadata\ndata:{"requestId":"r-compact","contextCompaction":{"running":true,"summary":"PRIVATE"}}\n\n',
-      'event:metadata\ndata:{"requestId":"r-compact","contextCompaction":{"running":false}}\n\n',
+      'event:metadata\ndata:{"requestId":"r-compact","contextCompaction":{"running":false,"completed":true,"summary":"PRIVATE"}}\n\n',
+      'event:metadata\ndata:{"requestId":"r-compact","contextCompaction":{"running":false,"completed":"true"}}\n\n',
       'event:metadata\ndata:{"requestId":"r-compact","contextCompaction":{"running":"true"}}\n\n',
       'event:done\ndata:{"reply":"ok","requestId":"r-compact"}\n\n'
     ]);
     expect(captured.metadata).toEqual([
       { requestId: 'r-compact', contextCompaction: { running: true } },
+      { requestId: 'r-compact', contextCompaction: { running: false, completed: true } },
       { requestId: 'r-compact', contextCompaction: { running: false } },
       { requestId: 'r-compact' }
     ]);
@@ -128,6 +130,26 @@ describe('aiStream metadata 事件', () => {
 });
 
 describe('aiStream done 事件', () => {
+  it('实时错误和已保存终态保留发送阶段，不把未发送的主请求当成供应商失败', async () => {
+    const failure = { code: 'CONTEXT_STORAGE_FAILED', message: '本地检查点保存失败，主模型请求尚未发出。', diagnostics: {
+      stage: 'COMPACTING', mainRequestAttempted: false, compactionRequestAttempted: true
+    } };
+    const error = await run([`event:error\ndata:${JSON.stringify({ requestId: 'r-local', sessionId: 10, message: failure.message,
+      code: failure.code, stateDurable: true, persistenceStatus: 'saved', failure })}\n\n`]);
+    const done = await run([`event:done\ndata:${JSON.stringify({ requestId: 'r-local', reply: '', status: 'FAILED', failure })}\n\n`]);
+    expect(error.failure?.failure).toEqual(failure);
+    expect(done.done?.failure).toEqual(failure);
+    expect(error.deltas).toEqual([]);
+  });
+
+  it('旧错误及未知阶段仍显示具体原因，不推断主请求已经发送', async () => {
+    const failure = { code: 'REQUEST_FAILED', message: '保留旧报错' };
+    const captured = await run([`event:done\ndata:${JSON.stringify({ reply: '', status: 'FAILED', failure: { ...failure,
+      diagnostics: { stage: 'UNKNOWN_STAGE', mainRequestAttempted: true, compactionRequestAttempted: false, private: 'PRIVATE' } } })}\n\n`]);
+    expect(captured.done?.failure).toEqual(failure);
+    expect(JSON.stringify(captured.done)).not.toContain('PRIVATE');
+  });
+
   it('done 带统一结果的字段集，徽标与检查器不必再发第二次请求', async () => {
     const captured = await run([
       'event:done\ndata:{"protocolVersion":2,"requestId":"r-1","sessionId":10,"status":"COMPLETED",'

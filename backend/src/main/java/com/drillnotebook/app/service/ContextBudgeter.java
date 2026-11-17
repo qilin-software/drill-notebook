@@ -157,7 +157,7 @@ public class ContextBudgeter {
             List<Object> userBlocks = new ArrayList<>();
             userBlocks.add(textContent(turn.userText()));
             for (Image image : turn.images()) userBlocks.add(imageContent(image));
-            turnMessages.add(message("user", userBlocks));
+            turnMessages.add(ContextEvidence.authored(message("user", userBlocks), turn.userText()));
             int[] replyPosition = {0, 0};
             for (var step : turn.steps()) {
                 appendReplyThrough(turnMessages, turn.assistantText(), turn.supplements(), replyPosition, step.replyOffset());
@@ -189,7 +189,7 @@ public class ContextBudgeter {
             var supplement = supplements.get(state[1]++);
             int at = Math.min(end, Math.max(state[0], supplement.replyOffset()));
             if (at > state[0]) messages.add(message("assistant", List.of(textContent(answer.substring(state[0], at)))));
-            messages.add(message("user", List.of(textContent(supplement.contextText())))); state[0] = at;
+            messages.add(ContextEvidence.authored(message("user", List.of(textContent(supplement.contextText()))), supplement.userText())); state[0] = at;
         }
         if (end > state[0]) messages.add(message("assistant", List.of(textContent(answer.substring(state[0], end)))));
         state[0] = end;

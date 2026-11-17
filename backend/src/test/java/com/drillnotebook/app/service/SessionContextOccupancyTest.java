@@ -216,6 +216,35 @@ class SessionContextOccupancyTest {
         assertNull(read());
     }
 
+    @Test void anUnsentTurnKeepsThePreviousActualFrameDuringPreparationAndAfterFailure() throws Exception {
+        Turn previous = turn();
+        var input = audit("上一次实际外发的完整请求");
+        save(previous, snapshot(input).withOutput(84));
+        var before = read();
+        var pending = wiring.turnService().begin(new ChatTurnService.BeginInput(
+                UuidV7.generate(System.currentTimeMillis() + ++sequence), 2, sessionId,
+                "发送前准备失败的提问", "", List.of(), Map.of())).lease();
+        assertNotNull(read(), "新轮次尚未实际发送，不应抹掉上一份模型窗口");
+        assertEquals(before.get("requestId"), read().get("requestId"));
+        assertEquals(tokens(before), tokens(read()));
+        wiring.turnService().abandon(pending, "context_rejected");
+        assertNotNull(read(), "准备失败没有新模型请求，应继续显示上一份实际窗口");
+        assertEquals(before.get("requestId"), read().get("requestId"));
+        assertEquals(tokens(before), tokens(read()));
+        assertEquals(false, read().get("active"));
+    }
+
+    @Test void anUnsentFailureDoesNotMaskAnEditThatInvalidatedThePreviousFrame() throws Exception {
+        Turn previous = turn();
+        save(previous, snapshot(audit("编辑前的实际请求")));
+        wiring.metadata().bumpHistoryRevision(sessionId);
+        var pending = wiring.turnService().begin(new ChatTurnService.BeginInput(
+                UuidV7.generate(System.currentTimeMillis() + ++sequence), 2, sessionId,
+                "编辑后的提问", "", List.of(), Map.of())).lease();
+        wiring.turnService().abandon(pending, "context_rejected");
+        assertNull(read(), "追加失败轮次不能让已被编辑作废的快照恢复有效");
+    }
+
     @Test void anotherSessionsFrameIsNeverUsed() throws Exception {
         long other = wiring.sessions().create("其它会话", null);
         Turn foreign = turn(other, 1, "另一会话");
@@ -232,6 +261,29 @@ class SessionContextOccupancyTest {
                 valid.replace(TokenEstimator.VERSION, "future-estimator"))) {
             jdbc.update("UPDATE ai_chat_turn SET result_meta_crypto = ? WHERE id = ?", bad, current.id());
             assertNull(read(), "损坏快照不能回退成全库统计");
+        }
+    }
+
+    @Test void finalizationDoesNotRebaseAnOldRequestOntoAnEditedHistory() throws Exception {
+        var lease = wiring.turnService().begin(new ChatTurnService.BeginInput(
+                UuidV7.generate(System.currentTimeMillis() + ++sequence), 2, sessionId,
+                "按当前资料回答", "", List.of(), Map.of())).lease();
+        wiring.turnService().recordModelContext(lease, audit("发送时的资料"));
+        lease.handle().modelContextOutputTokens(20);
+        wiring.metadata().bumpHistoryRevision(sessionId);
+        wiring.turnService().finalizeTurn(lease, ChatTurnService.UpstreamReply.of("旧资料的回答", null, "stop"), null);
+        assertNull(read(), "完成事务只能登记自身追加，不能让旧请求自动变成编辑后的窗口");
+    }
+
+    @Test void aCorruptModernFrameCannotBeRebuiltFromAnOldUsageAuditAfterAnEdit() throws Exception {
+        Turn current = turn();
+        var input = audit("编辑前已发送的请求");
+        request(current, input, 7);
+        var metadata = mapper.writeValueAsString(Map.of("modelContext", snapshot(input).withOutput(7)));
+        wiring.metadata().bumpHistoryRevision(sessionId);
+        for (var corrupt : List.of(metadata.replace("\"schemaVersion\":1", "\"schemaVersion\":99"), "not-json", "[]", "{\"modelContext\":null}")) {
+            jdbc.update("UPDATE ai_chat_turn SET result_meta_crypto=? WHERE id=?", corrupt, current.id());
+            assertNull(read(), "损坏的新快照不能借旧用量账本伪造当前历史版本");
         }
     }
 

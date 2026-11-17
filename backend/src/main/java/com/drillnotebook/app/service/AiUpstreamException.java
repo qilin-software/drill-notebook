@@ -36,6 +36,12 @@ public final class AiUpstreamException extends IllegalArgumentException {
     public boolean retryable() { return retryable; }
     public Long retryAt() { return retryAt; }
     public AiUpstreamClient.Result partial() { return partial; }
+    public boolean contextWindowExceeded() {
+        String detail = getMessage().toLowerCase(Locale.ROOT);
+        return detail.contains("context_length_exceeded") || detail.contains("prompt_too_long")
+                || detail.contains("prompt is too long") || detail.contains("maximum context length")
+                || detail.contains("context window") && (detail.contains("exceed") || detail.contains("too large"));
+    }
     public AiUpstreamException withPartial(AiUpstreamClient.Result value) {
         return new AiUpstreamException(kind, retryable, getMessage(), retryAt, value, busyNeedsAdvice);
     }

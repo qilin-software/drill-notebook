@@ -194,10 +194,14 @@ class WebToolChatPathTest {
         var builder = new AiUpstreamClient(null, json);
         when(main.prepare(any(), anyList(), anyList(), anyBoolean(), anyInt(), anyString())).thenAnswer(call ->
                 builder.prepare(call.getArgument(0), call.getArgument(1), call.getArgument(2), call.getArgument(3), call.getArgument(4), call.getArgument(5)));
-        when(main.callPrepared(any(), any(), any(), anyInt(), any(), any())).thenAnswer(call -> {
+        when(main.callPrepared(any(), any(), any(), anyInt(), any(), any(), any())).thenAnswer(call -> {
             mainTargets.add(call.getArgument(0));
             com.drillnotebook.app.model.PreparedRequest prepared = call.getArgument(1);
-            java.util.function.Consumer<com.drillnotebook.app.model.PreparedRequest> sent = call.getArgument(5);
+            java.util.function.Consumer<com.drillnotebook.app.model.PreparedRequest> before = call.getArgument(5);
+            if (before != null) before.accept(prepared);
+            ActiveTurnRegistry.Handle handle = call.getArgument(4);
+            handle.requestAttempted(prepared.context().kind());
+            java.util.function.Consumer<com.drillnotebook.app.model.PreparedRequest> sent = call.getArgument(6);
             if (sent != null) sent.accept(prepared);
             requests.add(json.valueToTree(prepared.body()));
             var usage = new AiUpstreamClient.Usage("provider", 10, 5, null, null);

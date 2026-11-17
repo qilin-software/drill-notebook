@@ -66,6 +66,24 @@ afterEach(() => {
 });
 
 describe('useAiChatTurn 请求体', () => {
+  it('已受理的本地准备失败保留具体诊断并结束原轮，不再次投递提示词', async () => {
+    const turn = renderTurn();
+    await act(async () => turn.result.current.send({ sessionId: 10, userText: '原地等待回答的问题' }));
+    const id = turnId();
+    const failure = { code: 'CONTEXT_STORAGE_FAILED', message: '本地保存失败，主模型请求尚未发出。', diagnostics: {
+      stage: 'COMPACTING' as const, mainRequestAttempted: false, compactionRequestAttempted: true
+    } };
+    act(() => {
+      callbacks!.onMetadata!({ requestId: id, contextCompaction: { running: true } });
+      callbacks!.onError({ requestId: id, sessionId: 10, code: failure.code, message: failure.message,
+        failure, partial: false, stateDurable: true, persistenceStatus: 'saved' });
+    });
+    expect(turn.result.current.busy).toBe(false);
+    expect(events.at(-1)).toMatchObject({ type: 'failure', requestId: id, view: { status: 'FAILED', failure } });
+    expect(streamChatMock).toHaveBeenCalledTimes(1);
+    expect(apiPost.mock.calls.filter(([url]) => url === '/api/ai/chat')).toHaveLength(0);
+  });
+
   it('压缩开始与结束保留同一轮身份，其他轮的元数据不会改变当前状态', async () => {
     const turn = renderTurn();
     await act(async () => turn.result.current.send({ sessionId: 10, userText: '继续长会话' }));
@@ -73,11 +91,11 @@ describe('useAiChatTurn 请求体', () => {
     act(() => {
       callbacks!.onMetadata!({ requestId: 'another-turn', contextCompaction: { running: true } });
       callbacks!.onMetadata!({ requestId: id, contextCompaction: { running: true } });
-      callbacks!.onMetadata!({ requestId: id, contextCompaction: { running: false } });
+      callbacks!.onMetadata!({ requestId: id, contextCompaction: { running: false, completed: true } });
     });
     expect(events.filter(event => event.type === 'compaction')).toEqual([
       { type: 'compaction', requestId: id, running: true },
-      { type: 'compaction', requestId: id, running: false }
+      { type: 'compaction', requestId: id, running: false, completed: true }
     ]);
     expect(turn.result.current.busy).toBe(true);
     expect(streamChatMock).toHaveBeenCalledTimes(1);
@@ -270,6 +288,27 @@ describe('useAiChatTurn 失败出口', () => {
     expect(turn.result.current.busy).toBe(false);
   });
 
+  it('备用通道受理后失败：读回同一轮的具体错误，不撤回为未开始也不再发送', async () => {
+    let turnGets = 0;
+    apiGet.mockImplementation((url: string) => {
+      if (!url.startsWith('/api/ai/turns/')) return Promise.resolve({});
+      if (++turnGets === 1) return Promise.reject(new ApiError('TURN_NOT_FOUND', '本轮尚未受理', 404));
+      return Promise.resolve({ requestId: turnId(), sessionId: 10, status: 'FAILED', active: false,
+        failure: { code: 'CONTEXT_SUMMARY_INVALID', message: '压缩摘要格式无效，请重试' }, stateDurable: true, persistenceStatus: 'saved' });
+    });
+    apiPost.mockRejectedValue(new ApiError('CONTEXT_SUMMARY_INVALID', '压缩摘要格式无效，请重试', 502));
+    const turn = renderTurn();
+    await act(async () => turn.result.current.send({ sessionId: 10, userText: '继续原提问', retryOf: 'original-turn' }));
+    await act(async () => callbacks!.onError({ message: '流式连接失败', partial: false }));
+    await waitFor(() => expect(turn.result.current.busy).toBe(false));
+    expect(apiPost.mock.calls.filter(([url]) => url === '/api/ai/chat')).toHaveLength(1);
+    expect(streamChatMock).toHaveBeenCalledTimes(1);
+    expect(events.at(-1)).toMatchObject({ type: 'status', requestId: turnId(), status: {
+      status: 'FAILED', failure: { code: 'CONTEXT_SUMMARY_INVALID', message: '压缩摘要格式无效，请重试' }
+    } });
+    expect(events.some(event => event.type === 'failure' && event.notStarted)).toBe(false);
+  });
+
   it('会话被占住（SESSION_BUSY × TURN_NOT_FOUND 互相成立）：补完只有一次，不陷入请求风暴', async () => {
     const macrotask = (): Promise<void> => new Promise((resolve) => {
       window.setTimeout(resolve, 0);
@@ -300,7 +339,7 @@ describe('useAiChatTurn 失败出口', () => {
 
     expect(chatPosts).toBe(1);
     expect(turnGets).toBe(2);
-    expect(events.at(-1)).toMatchObject({ type: 'failure', message: '该会话已有一轮正在进行' });
+    expect(events.at(-1)).toMatchObject({ type: 'failure', message: '该会话已有一轮正在进行', notStarted: true });
     expect(turn.result.current.busy).toBe(false);
   });
 

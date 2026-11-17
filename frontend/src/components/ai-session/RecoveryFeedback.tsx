@@ -3,7 +3,7 @@ import { RotateCw, CircleAlert } from 'lucide-react';
 import { recoveryLabel } from '../../lib/aiRecovery';
 import type { AiRecovery } from '../../lib/aiRecovery';
 
-export function RecoveryFeedback({ value, active, onStop }: { value: AiRecovery; active?: boolean; onStop: () => void }): JSX.Element {
+export function RecoveryFeedback({ value, active, failureMessage, onStop }: { value: AiRecovery; active?: boolean; failureMessage?: string; onStop: () => void }): JSX.Element {
   const [now, setNow] = useState(Date.now());
   const waiting = active && value.state === 'waiting' && typeof value.nextRetryAt === 'number';
   useEffect(() => {
@@ -21,7 +21,7 @@ export function RecoveryFeedback({ value, active, onStop }: { value: AiRecovery;
       <span role="status" aria-live="polite">{label}</span>
       {running && <button type="button" onClick={onStop}>停止</button>}
     </div>
-    <pre className="ai-recovery-error">{value.error}</pre>
+    <pre className="ai-recovery-error">{!active && failureMessage ? failureMessage : value.error}</pre>
     {running && <span className="ai-recovery-wait">{waiting && remaining > 0
       ? `${remaining >= 10 ? Math.ceil(remaining) : remaining.toFixed(1)} 秒后重试` : '正在连接…'}</span>}
   </div>;

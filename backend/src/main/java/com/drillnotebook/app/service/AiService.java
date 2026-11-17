@@ -579,7 +579,11 @@ public class AiService {
             if ("CHAT".equals(kind)) call.lease().handle().modelContext(null);
             var context = new RequestContextAnalyzer(mapper)
                     .analyze(wire, AiModelLimits.contextWindow(call.config()), kind, toolNames);
-            if ("CHAT".equals(kind)) chatTurns.recordModelContext(call.lease(), context);
+            if ("CHAT".equals(kind)) {
+                var sent = call.dispatch().plan();
+                if (sent == null) chatTurns.recordModelContext(call.lease(), context);
+                else chatTurns.recordModelContext(call.lease(), context, sent.contextGeneration(), sent.historyRevision());
+            }
             if (attempt != null) chatTurns.recordUsageContext(attempt, context);
         } catch (RuntimeException | java.sql.SQLException error) {
             log.warn("请求上下文组成未记录: {}", error.getClass().getSimpleName());
@@ -780,6 +784,7 @@ public class AiService {
                 String attempt = chatTurns.startUsage(lease, chatTarget(config), dispatch.planId());
                 try {
                     result = new AiUpstreamClient.Result(mockReply(dispatch.messages()), null, "stop");
+                    dispatch.markSent();
                 } finally {
                     chatTurns.settleUsage(attempt, null);
                 }
@@ -787,7 +792,9 @@ public class AiService {
                 result = runTurn(new TurnCall(config, lease, dispatch, dispatch.messages(), target, false, null,
                         memoryUseRequested, chatToolsActive, request.userText(), null, settings, PageSnapshot.from(body.get("pageSnapshot"))));
             }
-            ChatContextPlan sent = dispatch.markSent();
+            rememberEmptyResponse(lease, result);
+            ChatContextPlan sent = dispatch.resultPlan();
+            lease.handle().requestStage(com.drillnotebook.app.model.AiRequestDiagnostics.Stage.FINALIZING);
             ChatTurnService.FinalResult done = chatTurns.finalizeTurn(lease,
                     ChatTurnService.UpstreamReply.of(result), auditFor(sent, dispatch.legacy()));
             finalized = true;
@@ -801,7 +808,7 @@ public class AiService {
             // begin() 成功之后，配置解密、检索、组装、发送任一失败都必须把这一轮收成终态并释放句柄，
             // 否则孤儿清扫会因句柄仍在而跳过它，会话被一个永远不会完成的 RUNNING 永久占住（§7.2.1）
             if (!finalized) {
-                chatTurns.abandon(lease, "request_failed");
+                chatTurns.abandon(lease, failureReason(error), error);
             }
             throw error;
         }
@@ -831,18 +838,19 @@ public class AiService {
     public static final class StreamFailure extends RuntimeException {
         private final String requestId;
         private final long sessionId;
-        private final String code;
+        private final ChatTurnService.Failure failure;
         private final String persistenceStatus;
         private final boolean stateDurable;
         private List<ToolActivity> toolActivities = List.of();
         private com.drillnotebook.app.model.AiRecovery recovery;
+        private com.drillnotebook.app.model.ContextCompaction contextCompaction = com.drillnotebook.app.model.ContextCompaction.NONE;
 
-        StreamFailure(String requestId, long sessionId, String code, String persistenceStatus, boolean stateDurable,
+        StreamFailure(String requestId, long sessionId, ChatTurnService.Failure failure, String persistenceStatus, boolean stateDurable,
                       RuntimeException cause) {
-            super(cause.getMessage(), cause);
+            super(failure.message(), cause);
             this.requestId = requestId;
             this.sessionId = sessionId;
-            this.code = code;
+            this.failure = failure;
             this.persistenceStatus = persistenceStatus;
             this.stateDurable = stateDurable;
         }
@@ -856,8 +864,10 @@ public class AiService {
         }
 
         public String code() {
-            return code;
+            return failure.code();
         }
+
+        public ChatTurnService.Failure failure() { return failure; }
 
         public String persistenceStatus() {
             return persistenceStatus;
@@ -871,6 +881,7 @@ public class AiService {
             return toolActivities;
         }
         public com.drillnotebook.app.model.AiRecovery recovery() { return recovery; }
+        public com.drillnotebook.app.model.ContextCompaction contextCompaction() { return contextCompaction; }
     }
 
     /**
@@ -956,13 +967,17 @@ public class AiService {
             AiUpstreamClient.Result result = runTurn(new TurnCall(config, lease, dispatch, dispatch.messages(),
                     target, upstream.streaming(), listener, memoryUseRequested, chatToolsActive, request.userText(),
                     metadataSender, settings, PageSnapshot.from(body.get("pageSnapshot"))));
+            rememberEmptyResponse(lease, result);
             // 正文与思考链都为空才算无效；只有思考链（如流式中断在思考阶段）也照常落库，但不算完成
-            ChatContextPlan sent = dispatch.markSent();
+            ChatContextPlan sent = dispatch.resultPlan();
+            lease.handle().requestStage(com.drillnotebook.app.model.AiRequestDiagnostics.Stage.FINALIZING);
             ChatTurnService.FinalResult done = chatTurns.finalizeTurn(lease,
                     ChatTurnService.UpstreamReply.of(result), auditFor(sent, dispatch.legacy()));
             finalized = true;
             lastFinal = done;
             maybeAutoTitle(request, done, config);
+            if ("saved".equals(done.persistenceStatus()) && done.stateDurable())
+                lease.handle().requestStage(com.drillnotebook.app.model.AiRequestDiagnostics.Stage.SENDING);
             if (!"saved".equals(done.persistenceStatus()) || !done.stateDurable()) {
                 throw new IllegalArgumentException("本轮回复未能保存，请检查本地存储后重试");
             }
@@ -974,22 +989,41 @@ public class AiService {
         } catch (RuntimeException error) {
             // 与普通路径同一收尾责任：begin() 之后（配置解密、组装、组装后复核、发送）任一失败都要
             // 结算用量、把轮次收成 FAILED 并释放句柄，不能留下没人会放的活跃句柄（§7.2.1）
-            String code = error instanceof ChatTurnRejectException reject ? reject.code() : null;
+            var detail = ChatTurnService.Failure.from(error, lease.handle());
+            lease.handle().failure(detail);
+            log.warn("AI 轮次失败 requestId={} stage={} mainRequestAttempted={} compactionRequestAttempted={} code={} exception={}",
+                    lease.requestId(), detail.diagnostics() == null ? null : detail.diagnostics().stage(),
+                    lease.handle().requestDiagnostics().mainRequestAttempted(), lease.handle().requestDiagnostics().compactionRequestAttempted(),
+                    detail.code(), error.getClass().getSimpleName());
             if (!finalized) {
                 chatTurns.settleUsage(attempt, null);
-                lastFinal = chatTurns.abandon(lease, "request_failed");
+                lastFinal = chatTurns.abandon(lease, failureReason(error), error);
             }
             // 收尾事实跟着异常一起出去：error 帧要带 persistenceStatus/stateDurable（§4.2 末段），
             // 只带一句 message 的话，前端无法区分"这轮已作废"和"这轮可能还在跑"。
-            StreamFailure failure = new StreamFailure(lease.requestId(), lease.sessionId(), code,
+            StreamFailure failure = new StreamFailure(lease.requestId(), lease.sessionId(), detail,
                     lastFinal == null ? "failed" : lastFinal.persistenceStatus(),
                     lastFinal != null && lastFinal.stateDurable(), error);
             // 保存失败时，仍向当前客户端交代内存中已经确认的写入；未结束的操作只报未知。
             failure.toolActivities = lease.handle().toolActivities().stream()
                     .map(item -> "RUNNING".equals(item.state()) ? item.unknown() : item).toList();
             failure.recovery = lease.handle().recovery();
+            failure.contextCompaction = lease.handle().contextCompaction().settled();
             throw failure;
         }
+    }
+
+    private static String failureReason(RuntimeException error) {
+        if (error instanceof ChatTurnRejectException rejected)
+            return List.of("STORAGE_UNAVAILABLE", "CONTEXT_STORAGE_FAILED").contains(rejected.code()) ? "context_storage_failed" : "context_rejected";
+        return "request_failed";
+    }
+
+    private static void rememberEmptyResponse(ChatTurnService.Lease lease, AiUpstreamClient.Result result) {
+        if (lease.handle().failure() == null && result.terminalObserved() && result.text().isBlank()
+                && !result.captureLimited() && !result.downstreamGone() && !lease.handle().cancelRequested())
+            lease.handle().failure(new ChatTurnService.Failure("EMPTY_RESPONSE",
+                    "AI 服务返回内容为空（模型可能只返回了思考过程，请重试或换模型）", lease.handle().requestDiagnostics()));
     }
 
     /** 流式收尾：把这一轮的统一结果与身份一起交出，done 帧与普通响应共用 {@link #chatResponse} 的字段集。 */
@@ -1038,9 +1072,14 @@ public class AiService {
             if (next != null) plan = next;
         }
 
+        private ChatContextPlan lastSentPlan;
+
         ChatContextPlan markSent() {
-            return plan == null ? null : plan.withDispatchState(ContextAudit.DISPATCH_SENT);
+            lastSentPlan = plan == null ? null : plan.withDispatchState(ContextAudit.DISPATCH_SENT);
+            return lastSentPlan;
         }
+
+        ChatContextPlan resultPlan() { return lastSentPlan == null ? plan : lastSentPlan; }
     }
 
     private Dispatch prepare(Map<String, Object> body, TurnRequest request, ChatTurnService.Lease lease,
@@ -1071,20 +1110,16 @@ public class AiService {
                     AiModelLimits.output(config, Math.min(settings.requestOutputTokens(), contextWindowOf(config) / 2)),
                     chatTarget(config), apiFormatOf(config), config.model());
             return call.notice() == null ? plan : plan.withExtraNotices(List.of("RETRIEVAL_UNAVAILABLE"));
-        } catch (ChatTurnRejectException error) {
-            chatTurns.abandon(lease, "context_rejected");
-            throw error;
         } catch (java.sql.SQLException error) {
-            chatTurns.abandon(lease, "context_storage_failed");
             throw new ChatTurnRejectException(503, "STORAGE_UNAVAILABLE", "上下文暂时读不到，本轮未外发", Map.of());
         }
     }
 
     /** 发送前复核（§4.5）：版本变了就丢掉旧计划，返回可重试的 CONTEXT_CHANGED，绝不把旧 metadata 绑到新请求。 */
     private void requirePlanStillCurrent(Dispatch dispatch, ChatTurnService.Lease lease) {
-        if (dispatch.plan() == null || contexts.matches(dispatch.plan())) return;
-        chatTurns.abandon(lease, "context_changed");
-        throw new ChatTurnRejectException(409, "CONTEXT_CHANGED", "会话内容或授权已变化，请重新发送本轮",
+        if (dispatch.plan() == null || contexts.matchesForDispatch(dispatch.plan())) return;
+        // The owner catches and finalizes once, with the concrete error; early finalization would lose it.
+        throw new ChatTurnRejectException(409, "CONTEXT_CHANGED", "会话内容或授权已变化，请重试本轮",
                 Map.of("retryable", true));
     }
 
@@ -1283,6 +1318,8 @@ public class AiService {
         result.put("reply", reply);
         result.put("toolActivities", chatTurns.toolActivities(requestId, masterPassword));
         result.put("recovery", chatTurns.recovery(requestId, masterPassword).orElse(null));
+        result.put("failure", chatTurns.failure(requestId, masterPassword).orElse(null));
+        result.put("contextCompaction", chatTurns.contextCompaction(requestId, masterPassword));
         if (plan != null) {
             result.put("citations", plan.citations());
             result.put("memoryContext", plan.memoryContext());
@@ -1404,6 +1441,7 @@ public class AiService {
         var prefix=new StringBuilder();var prefixReasoning=new StringBuilder();
         try{return runTurnLoop(call,prefix,prefixReasoning);}
         catch(RuntimeException error){
+            call.lease().handle().failure(ChatTurnService.Failure.from(error, call.lease().handle()));
             if(prefix.isEmpty()&&prefixReasoning.isEmpty())throw error;
             return combine(prefix,prefixReasoning,new AiUpstreamClient.Result("","","stream_error",false,false,false,AiUpstreamClient.Usage.unknown()));
         }
@@ -1451,6 +1489,8 @@ public class AiService {
         AiRetryPolicy retry = new AiRetryPolicy(call.settings().retry());
         com.drillnotebook.app.model.PreparedRequest pendingPrepared = null;
         AiUpstreamClient.Upstream pendingTarget = null;
+        int contextRecoveryAttempts = 0;
+        int contextInputCeiling = 0;
         while (true) {
             if (call.lease().handle().cancelRequested()) return new AiUpstreamClient.Result(prefix.toString(), prefixReasoning.toString(), "aborted");
             requirePlanStillCurrent(call.dispatch(), call.lease());
@@ -1478,21 +1518,17 @@ public class AiService {
             int seconds = limits.requestSeconds();
             if (seconds <= 0) return combine(prefix,prefixReasoning,budgetStopped("budget_time"));
             int requested = stopReason == null ? Math.min(call.target().maxTokens(), Math.max(256, AiModelLimits.contextWindow(call.config()) / 2)) : finalReserve;
-            int budget = pendingTarget == null ? limits.allocation(requested, tools.isEmpty() ? 0 : finalReserve) : pendingTarget.maxTokens();
-            if (budget <= 0) return combine(prefix,prefixReasoning,budgetStopped(stopReason == null ? "budget_output" : stopReason));
-            int expectedBudget = budget;
-            budget=limits.reserve(budget);
-            if (pendingTarget != null && budget != expectedBudget) {
-                limits.release(budget);
-                return combine(prefix,prefixReasoning,budgetStopped("budget_output"));
-            }
-            if(budget<=0) return combine(prefix,prefixReasoning,budgetStopped("budget_output"));
-            AiUpstreamClient.Upstream target = withMaxTokens(call.target(), budget);
-            String attempt = null;
+            int allocation = pendingTarget == null ? limits.allocation(requested, tools.isEmpty() ? 0 : finalReserve) : pendingTarget.maxTokens();
+            if (allocation <= 0) return combine(prefix,prefixReasoning,budgetStopped(stopReason == null ? "budget_output" : stopReason));
+            // Reserve the actual main request only after compaction has finished using the shared ledger.
+            int budget = 0;
+            AiUpstreamClient.Upstream target = withMaxTokens(call.target(), allocation);
+            var attempt = new java.util.concurrent.atomic.AtomicReference<String>();
             if (buffer != null) buffer.clear();
             long start = System.currentTimeMillis();
             AiUpstreamClient.Result result;
-            boolean permit=false, invoked=false;
+            boolean permit=false;
+            var invoked = new java.util.concurrent.atomic.AtomicBoolean();
             final var sending=supplements;
             var acknowledged=new java.util.concurrent.atomic.AtomicBoolean();
             var attemptText=new StringBuilder();var attemptReasoning=new StringBuilder();
@@ -1510,26 +1546,64 @@ public class AiService {
             };
             try {
                 if (pendingPrepared == null) {
+                    call.lease().handle().requestStage(com.drillnotebook.app.model.AiRequestDiagnostics.Stage.PREPARING);
                     if (contextCoordinator != null && call.dispatch().plan() != null) {
                         var acceptedPlan = call.dispatch().plan();
-                        var view = contextCoordinator.prepare(acceptedPlan, call.lease(), messages, target, tools, call.stream(),
-                                AiModelLimits.contextWindow(call.config()), call.settings().context(), upstream(),
-                                (summaryTarget, summaryRequest) -> runCompaction(call, limits, finalReserve, summaryTarget, summaryRequest),
-                                () -> contexts.matches(acceptedPlan));
+                        var compactionBudget = new AiCompactionBudget(limits, finalReserve);
+                        ContextCoordinator.View view;
+                        boolean completedCompaction = false;
+                        try {
+                            view = contextCoordinator.prepare(acceptedPlan, call.lease(), messages, target, tools, call.stream(),
+                                    AiModelLimits.contextWindow(call.config()), call.settings().context(), upstream(),
+                                    new ContextCoordinator.SummaryCaller() {
+                                        public int allocation(int requested) { return compactionBudget.allocation(requested); }
+                                        public AiUpstreamClient.Result call(AiUpstreamClient.Upstream summaryTarget, com.drillnotebook.app.model.PreparedRequest summaryRequest) {
+                                            return runCompaction(call, limits, compactionBudget, summaryTarget, summaryRequest);
+                                        }
+                                    },
+                                     () -> contexts.matchesForDispatch(acceptedPlan), contextInputCeiling);
+                            if (view.compressed()) {
+                                completedCompaction = true;
+                                chatTurns.recordContextCompactionSuccess(call.lease());
+                            }
+                            // A usable fallback resumes the answer phase; a summary error is no longer current.
+                            if ((completedCompaction || call.lease().handle().contextCompacting())
+                                    && call.lease().handle().recovery() != null) emitRecovery(call, null);
+                        } finally {
+                            if (call.lease().handle().contextCompacting() || completedCompaction) emitCompaction(call, false);
+                        }
                         messages = new ArrayList<>(view.messages());
-                        pendingPrepared = view.prepared();
+                        int remaining = limits.allocation(allocation, tools.isEmpty() ? 0 : finalReserve);
+                        boolean toolsReduced = false;
+                        if (remaining < 256 && !tools.isEmpty()) {
+                            stopReason = "budget_output"; tools = List.of(); toolsReduced = true;
+                            messages.add(Map.of("role", "system", "content", "本轮工具已停止（budget_output）。请依据已有结果给出最终回答，不再调用工具。"));
+                            remaining = limits.allocation(finalReserve, 0);
+                        }
+                        if (remaining <= 0) throw new ChatTurnRejectException(409, "CONTEXT_COMPACTION_BUDGET", "压缩后没有剩余回答预算，原历史已保留", Map.of());
+                        target = withMaxTokens(call.target(), remaining);
+                        pendingPrepared = remaining == allocation && !toolsReduced ? view.prepared()
+                                : upstream().prepare(target, messages, tools, call.stream(), AiModelLimits.contextWindow(call.config()), "CHAT");
+                        var finalWindow = ContextWindowBudget.of(AiModelLimits.contextWindow(call.config()), target.maxTokens(), call.settings().context()).reducedTo(contextInputCeiling);
+                        finalWindow.requireFits(pendingPrepared.context().estimatedInputTokens());
                         var next = acceptedPlan.withPreparedView(messages, pendingPrepared.context(),
-                                ContextWindowBudget.of(AiModelLimits.contextWindow(call.config()), budget, call.settings().context()).hardInput(),
+                                finalWindow.hardInput(),
                                 view.checkpoint() == null ? null : view.checkpoint().row().revision(),
                                 view.checkpoint() == null ? List.of() : view.checkpoint().sources(), view.notices());
                         if (view.checkpoint() == null) next = next.withContinuationRevision(acceptedPlan.continuationRevision());
                         call.dispatch().refreshPlan(next);
                     } else {
                         pendingPrepared = upstream().prepare(target, messages, tools, call.stream(), AiModelLimits.contextWindow(call.config()), "CHAT");
-                        ContextWindowBudget.of(AiModelLimits.contextWindow(call.config()), budget, call.settings().context()).requireFits(pendingPrepared.context().estimatedInputTokens());
+                        ContextWindowBudget.of(AiModelLimits.contextWindow(call.config()), allocation, call.settings().context()).requireFits(pendingPrepared.context().estimatedInputTokens());
                     }
                     pendingTarget = target;
                 } else target = pendingTarget;
+                call.lease().handle().requestStage(com.drillnotebook.app.model.AiRequestDiagnostics.Stage.SENDING);
+                budget = limits.reserve(target.maxTokens());
+                if (budget != target.maxTokens()) {
+                    limits.release(budget); budget = 0;
+                    return combine(prefix,prefixReasoning,budgetStopped("budget_output"));
+                }
                 seconds = limits.requestSeconds();
                 if (seconds <= 0 || call.lease().handle().cancelRequested()) throw new IllegalStateException("会话已停止或超时");
                 requirePlanStillCurrent(call.dispatch(), call.lease());
@@ -1540,17 +1614,20 @@ public class AiService {
                     seconds=limits.requestSeconds();
                     if(seconds<=0 || call.lease().handle().cancelRequested()) throw new IllegalStateException("会话已停止或超时");
                 }
-                attempt=chatTurns.startUsage(call.lease(),
-                        UsageRepository.targetFingerprint(target.baseUrl(), target.apiFormat(), target.model()),
-                        call.dispatch().planId());
-                invoked=true;
                 var recovery = retry.starting();
                 if (recovery != null) emitRecovery(call, recovery);
                 if(steering!=null&&!sending.isEmpty())steering.sending(sending);
-                final String sentAttempt = attempt;
+                final var sentTarget = target;
                 result = upstream().callPrepared(target, pendingPrepared, receiver, seconds, call.lease().handle(), prepared -> {
-                    recordRequestContext(sentAttempt, prepared.body(), call, "CHAT", toolsByName.keySet());
                     emitMetadata(call.activitySender(), call.dispatch(), call.lease());
+                    // The permit wait and metadata delivery can outlive the earlier revision check.
+                    requirePlanStillCurrent(call.dispatch(), call.lease());
+                }, prepared -> {
+                    call.dispatch().markSent();
+                    if (invoked.compareAndSet(false, true)) attempt.set(chatTurns.startUsage(call.lease(),
+                            UsageRepository.targetFingerprint(sentTarget.baseUrl(), sentTarget.apiFormat(), sentTarget.model()),
+                            call.dispatch().planId()));
+                    recordRequestContext(attempt.get(), prepared.body(), call, "CHAT", toolsByName.keySet());
                 });
                 if(steering!=null&&!sending.isEmpty()&&(result.terminalObserved()||!result.text().isBlank()||!result.toolCalls().isEmpty())&&acknowledged.compareAndSet(false,true))steering.received(sending);
                 supplements=List.of();
@@ -1558,23 +1635,43 @@ public class AiService {
                 AiUpstreamException upstreamError = error instanceof AiUpstreamException failure ? failure : null;
                 var partial = upstreamError == null ? null : upstreamError.partial();
                 var usage = partial == null ? null : partial.usage();
+                boolean emptyContextRefusal = upstreamError != null && upstreamError.contextWindowExceeded()
+                        && (partial == null || partial.text().isBlank() && (partial.reasoning() == null || partial.reasoning().isBlank())
+                            && partial.toolCalls().isEmpty() && partial.thinkingBlocks().isEmpty() && !partial.captureLimited() && !partial.downstreamGone())
+                        && attemptText.isEmpty() && attemptReasoning.isEmpty()
+                        && responseTextTokens.tokens() == 0 && responseReasoningTokens.tokens() == 0
+                        && (usage == null || usage.outputTokens() == null || usage.outputTokens() == 0);
                 boolean rejected = upstreamError != null && partial == null
-                        && (upstreamError.kind() == AiUpstreamException.Kind.NETWORK || upstreamError.getMessage().startsWith("HTTP "));
-                if (invoked && !rejected) limits.consume(usage, budget); else limits.release(budget);
-                if (attempt != null) chatTurns.settleUsage(attempt, usage);
-                recordTurnContext(call, usage);
-                recordModelOutput(call, partial);
+                        && (upstreamError.kind() == AiUpstreamException.Kind.NETWORK || upstreamError.getMessage().startsWith("HTTP "))
+                        || emptyContextRefusal && (usage == null || !usage.hasAny());
+                if (invoked.get() && !rejected) limits.consume(usage, budget); else limits.release(budget);
+                chatTurns.settleUsage(attempt.get(), usage);
+                if (invoked.get()) {
+                    recordTurnContext(call, usage);
+                    recordModelOutput(call, partial);
+                }
                 if (buffer != null && partial != null) {
                     replay(call, buffer, partial);
                     prefix.append(partial.text()); prefixReasoning.append(partial.reasoning() == null ? "" : partial.reasoning());
                 } else { prefix.append(attemptText); prefixReasoning.append(attemptReasoning); }
-                if (upstreamError != null) {
+                if (upstreamError != null && invoked.get()) {
                     // 等待时释放全局上游并发槽，其他会话仍能正常请求。
                     if (permit) { SessionExecution.UPSTREAM.release(); permit = false; }
                     // 插话交付未确认时不能自动重发同一份补充指令。
                     if (steering != null && !sending.isEmpty() && !acknowledged.get()) {
                         emitRecovery(call, retry.view(upstreamError, "failed", null));
                         throw error;
+                    }
+                    // Only a refused request with no generated output can be rebuilt. Closed tool steps stay in messages.
+                    if (emptyContextRefusal
+                            && contextCoordinator != null && call.dispatch().plan() != null && call.settings().context().autoCompact()
+                            && pendingPrepared != null && contextRecoveryAttempts < 2) {
+                        requirePlanStillCurrent(call.dispatch(), call.lease());
+                        contextRecoveryAttempts++;
+                        contextInputCeiling = Math.max(1, (int) ((long) pendingPrepared.context().estimatedInputTokens() * 3 / 4));
+                        pendingPrepared = null; pendingTarget = null;
+                        supplements = List.of();
+                        continue;
                     }
                     if (retry.canRetry(upstreamError)) {
                         if (!awaitRetry(call, limits, retry, upstreamError)) {
@@ -1602,16 +1699,18 @@ public class AiService {
                 throw error;
             } catch(InterruptedException error) {
                 Thread.currentThread().interrupt(); limits.release(budget);
-                if(attempt!=null) chatTurns.settleUsage(attempt,null);
+                chatTurns.settleUsage(attempt.get(),null);
                 throw new IllegalStateException("会话已中断",error);
             } finally {
                 if(permit) SessionExecution.UPSTREAM.release();
             }
-            limits.consume(result.usage(), budget);
+            if (invoked.get()) limits.consume(result.usage(), budget); else limits.release(budget);
             pendingPrepared = null; pendingTarget = null;
-            chatTurns.settleUsage(attempt, result.usage());
-            recordTurnContext(call, result.usage());
-            recordModelOutput(call, result);
+            chatTurns.settleUsage(attempt.get(), result.usage());
+            if (invoked.get()) {
+                recordTurnContext(call, result.usage());
+                recordModelOutput(call, result);
+            }
             log.info("AI 请求：耗时 {}ms textLen={} reasoningLen={} finish={} terminal={} captureLimited={}",
                     System.currentTimeMillis() - start,
                     result.text() == null ? 0 : result.text().length(),
@@ -1643,6 +1742,7 @@ public class AiService {
             // 已关闭工具后供应商仍返回调用，不能执行或把空内容当作完成。
             if (tools.isEmpty()) return combine(prefix,prefixReasoning,budgetStopped(stopReason == null ? "unexpected_tool_calls" : stopReason));
             if(!limits.tryStage()) { limits.stop("budget_stages"); continue; }
+            call.lease().handle().requestStage(com.drillnotebook.app.model.AiRequestDiagnostics.Stage.TOOLS);
             var stepMessages = new ArrayList<Map<String, Object>>();
             stepMessages.add(assistantToolMessage(result));
             var step = contextEntries == null || call.dispatch().plan() == null ? null
@@ -1715,49 +1815,70 @@ public class AiService {
                 messages, true, null, offset, characters).forCurrent();
     }
 
-    /** Compaction shares the accepted target, cancellation, time, output allocation and concurrency permit. */
-    private AiUpstreamClient.Result runCompaction(TurnCall call, AiTurnBudget limits, int finalReserve,
+    /** Frozen summary retries have their own lifecycle within the same turn's bounded budget. */
+    private AiUpstreamClient.Result runCompaction(TurnCall call, AiTurnBudget limits, AiCompactionBudget compactionBudget,
             AiUpstreamClient.Upstream target, com.drillnotebook.app.model.PreparedRequest prepared) {
-        int requested = target.maxTokens();
-        if (limits.allocation(requested, finalReserve) < requested) throw new ChatTurnRejectException(409,
-                "CONTEXT_COMPACTION_BUDGET", "剩余输出预算不足以压缩上下文，原历史已保留", Map.of());
-        int reserved = limits.reserve(requested);
-        if (reserved != requested) { limits.release(reserved); throw new IllegalStateException("上下文压缩预算不足"); }
-        String attempt = null;
-        boolean permit = false, invoked = false;
-        try {
-            while (SessionExecution.CURRENT.get() != null && !(permit = SessionExecution.UPSTREAM.tryAcquire(100, java.util.concurrent.TimeUnit.MILLISECONDS))) {
-                if (call.lease().handle().cancelRequested() || limits.secondsLeft() <= 0) throw new IllegalStateException("上下文压缩已停止或超时");
+        var retry = new AiRetryPolicy(call.settings().retry());
+        if (!call.lease().handle().contextCompacting()) emitCompaction(call, true);
+        while (true) {
+            int requested = target.maxTokens();
+            if (compactionBudget.allocation(requested) < requested) throw new ChatTurnRejectException(409,
+                    "CONTEXT_COMPACTION_BUDGET", "剩余输出预算不足以压缩上下文，原历史已保留", Map.of());
+            int reserved = limits.reserve(requested);
+            if (reserved != requested) { limits.release(reserved); throw new IllegalStateException("上下文压缩预算不足"); }
+            var attempt = new java.util.concurrent.atomic.AtomicReference<String>();
+            boolean permit = false, settled = false;
+            var invoked = new java.util.concurrent.atomic.AtomicBoolean();
+            try {
+                while (SessionExecution.CURRENT.get() != null && !(permit = SessionExecution.UPSTREAM.tryAcquire(100, java.util.concurrent.TimeUnit.MILLISECONDS))) {
+                    if (call.lease().handle().cancelRequested() || compactionBudget.requestSeconds() <= 0)
+                        throw new ChatTurnRejectException(409, "CONTEXT_COMPACTION_TIMEOUT", "上下文压缩已停止或超时，原历史已保留", Map.of());
+                }
+                int seconds = compactionBudget.requestSeconds();
+                if (seconds <= 0 || call.lease().handle().cancelRequested()) throw new ChatTurnRejectException(409,
+                        "CONTEXT_COMPACTION_TIMEOUT", "上下文压缩已停止或超时，原历史已保留", Map.of());
+                requirePlanStillCurrent(call.dispatch(), call.lease());
+                var recovery = retry.starting();
+                if (recovery != null) emitRecovery(call, recovery);
+                var result = upstream().callPrepared(target, prepared, null, seconds, call.lease().handle(),
+                        request -> requirePlanStillCurrent(call.dispatch(), call.lease()), request -> {
+                            if (invoked.compareAndSet(false, true)) attempt.set(chatTurns.startUsage(call.lease(),
+                                    UsageRepository.targetFingerprint(target.baseUrl(), target.apiFormat(), target.model()),
+                                    call.dispatch().planId(), UsageRepository.PURPOSE_CONTEXT_COMPACT));
+                            recordRequestContext(attempt.get(), request.body(), call, "CONTEXT_COMPACT", Set.of());
+                        });
+                if (!result.terminalObserved() && !result.downstreamGone() && !result.captureLimited()
+                        && !call.lease().handle().cancelRequested())
+                    throw AiUpstreamException.disconnected("deadline".equals(result.finishReason()) ? "上下文摘要请求超时" : "上下文摘要响应中断", result);
+                chatTurns.settleUsage(attempt.get(), result.usage());
+                if (invoked.get()) limits.consume(result.usage(), reserved); else limits.release(reserved);
+                settled = true;
+                if (call.lease().handle().recovery() != null) emitRecovery(call, null);
+                return result;
+            } catch (InterruptedException error) {
+                Thread.currentThread().interrupt(); limits.release(reserved);
+                chatTurns.settleUsage(attempt.get(), null);
+                throw new IllegalStateException("上下文压缩已中断", error);
+            } catch (RuntimeException error) {
+                var failure = error instanceof AiUpstreamException e ? e : null;
+                var partial = failure == null ? null : failure.partial();
+                var usage = partial == null ? null : partial.usage();
+                boolean rejected = failure != null && partial == null && (failure.kind() == AiUpstreamException.Kind.NETWORK
+                        || failure.getMessage().startsWith("HTTP "));
+                if (!settled) {
+                    if (invoked.get() && !rejected) limits.consume(usage, reserved); else limits.release(reserved);
+                    chatTurns.settleUsage(attempt.get(), usage);
+                }
+                if (permit) { SessionExecution.UPSTREAM.release(); permit = false; }
+                if (failure != null && retry.canRetry(failure) && !call.lease().handle().cancelRequested()
+                        && compactionBudget.allocation(requested) >= requested
+                        && awaitRetry(call, limits, retry, failure, compactionBudget::millisLeft)) continue;
+                if (failure != null && !failure.contextWindowExceeded())
+                    emitRecovery(call, retry.view(failure, call.lease().handle().cancelRequested() ? "stopped" : "failed", null));
+                throw error;
+            } finally {
+                if (permit) SessionExecution.UPSTREAM.release();
             }
-            int seconds = limits.requestSeconds();
-            if (seconds <= 0 || call.lease().handle().cancelRequested()) throw new IllegalStateException("上下文压缩已停止或超时");
-            requirePlanStillCurrent(call.dispatch(), call.lease());
-            emitCompaction(call, true);
-            attempt = chatTurns.startUsage(call.lease(), UsageRepository.targetFingerprint(target.baseUrl(), target.apiFormat(), target.model()),
-                    call.dispatch().planId(), UsageRepository.PURPOSE_CONTEXT_COMPACT);
-            final String summaryAttempt = attempt;
-            invoked = true;
-            var result = upstream().callPrepared(target, prepared, null, seconds, call.lease().handle(),
-                    request -> recordRequestContext(summaryAttempt, request.body(), call, "CONTEXT_COMPACT", Set.of()));
-            chatTurns.settleUsage(attempt, result.usage());
-            limits.consume(result.usage(), reserved);
-            return result;
-        } catch (InterruptedException error) {
-            Thread.currentThread().interrupt(); limits.release(reserved);
-            if (attempt != null) chatTurns.settleUsage(attempt, null);
-            throw new IllegalStateException("上下文压缩已中断", error);
-        } catch (RuntimeException error) {
-            var failure = error instanceof AiUpstreamException e ? e : null;
-            var partial = failure == null ? null : failure.partial();
-            var usage = partial == null ? null : partial.usage();
-            boolean rejected = failure != null && partial == null && (failure.kind() == AiUpstreamException.Kind.NETWORK
-                    || failure.getMessage().startsWith("HTTP "));
-            if (invoked && !rejected) limits.consume(usage, reserved); else limits.release(reserved);
-            if (attempt != null) chatTurns.settleUsage(attempt, usage);
-            throw error;
-        } finally {
-            if (permit) SessionExecution.UPSTREAM.release();
-            emitCompaction(call, false);
         }
     }
 
@@ -1765,7 +1886,7 @@ public class AiService {
         call.lease().handle().contextCompacting(running);
         if (call.activitySender() == null) return;
         try { call.activitySender().accept(Map.of("sessionId", call.lease().sessionId(), "requestId", call.lease().requestId(),
-                "phase", running ? "compacting" : "answer", "contextCompaction", Map.of("running", running))); }
+                "phase", running ? "compacting" : "answer", "contextCompaction", call.lease().handle().contextCompaction())); }
         catch (RuntimeException error) { call.lease().handle().requestCancel(); throw error; }
     }
 
@@ -1884,23 +2005,30 @@ public class AiService {
         var event = new LinkedHashMap<String, Object>();
         event.put("requestId", call.lease().requestId()); event.put("sessionId", call.lease().sessionId());
         event.put("recovery", recovery);
-        event.put("phase", recovery == null ? "answer" : "network".equals(recovery.kind()) ? "network" : "reconnecting");
+        event.put("phase", call.lease().handle().contextCompacting() ? "compacting"
+                : recovery == null ? "answer" : "network".equals(recovery.kind()) ? "network" : "reconnecting");
         try { call.activitySender().accept(event); }
         catch (RuntimeException failure) { call.lease().handle().requestCancel(); throw failure; }
     }
 
     private static boolean awaitRetry(TurnCall call, AiTurnBudget limits, AiRetryPolicy retry, AiUpstreamException error) {
-        long delay = Math.min(retry.delay(error, System.currentTimeMillis()), limits.secondsLeft() * 1000);
+        return awaitRetry(call, limits, retry, error, () -> limits.secondsLeft() * 1000);
+    }
+
+    private static boolean awaitRetry(TurnCall call, AiTurnBudget limits, AiRetryPolicy retry, AiUpstreamException error,
+                                      java.util.function.LongSupplier millisLeft) {
+        if (millisLeft.getAsLong() <= 0) return false;
+        long delay = Math.min(retry.delay(error, System.currentTimeMillis()), millisLeft.getAsLong());
         long until = System.currentTimeMillis() + delay;
         emitRecovery(call, retry.view(error, "waiting", until));
         Object wake = new Object();
         call.lease().handle().bindAbortHook(() -> { synchronized (wake) { wake.notifyAll(); } });
         try {
             synchronized (wake) {
-                while (!call.lease().handle().cancelRequested() && limits.secondsLeft() > 0 && System.currentTimeMillis() < until)
+                while (!call.lease().handle().cancelRequested() && millisLeft.getAsLong() > 0 && System.currentTimeMillis() < until)
                     wake.wait(Math.min(100, Math.max(1, until - System.currentTimeMillis())));
             }
-            if (call.lease().handle().cancelRequested() || limits.secondsLeft() <= 0) return false;
+            if (call.lease().handle().cancelRequested() || millisLeft.getAsLong() <= 0) return false;
             retry.pending(error);
             return true;
         } catch (InterruptedException interrupted) {

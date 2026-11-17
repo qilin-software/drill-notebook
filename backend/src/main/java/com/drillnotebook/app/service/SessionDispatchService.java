@@ -436,6 +436,9 @@ public class SessionDispatchService {
                 failure.put("persistenceStatus",sf.persistenceStatus()); failure.put("stateDurable",sf.stateDurable());
                 failure.put("toolActivities",sf.toolActivities());
                 failure.put("recovery",sf.recovery());
+                failure.put("code",sf.code());
+                failure.put("contextCompaction",sf.contextCompaction());
+                failure.put("failure",sf.failure());
             }
             synchronized(run) { run.event("error",failure); run.done.completeExceptionally(e); }
         } finally {

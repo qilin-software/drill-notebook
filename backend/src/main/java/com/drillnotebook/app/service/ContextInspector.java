@@ -195,8 +195,7 @@ public class ContextInspector {
         if (coordinator == null || policy == null) return placeholder("SOURCE_CHANGED");
         var loaded = coordinator.load(audited.sessionId(), audited.contextGeneration(), policy.current().revision(), audited.id(), password, policy.useEligibility().allowed());
         if (loaded.isEmpty() || !String.valueOf(loaded.get().row().revision()).equals(item.version())) return placeholder("SOURCE_CHANGED");
-        try { return text(mapper.writeValueAsString(loaded.get().summary())); }
-        catch (com.fasterxml.jackson.core.JsonProcessingException error) { return placeholder("SOURCE_CHANGED"); }
+        return text(coordinator.modelContent(loaded.get()));
     }
 
     private Map<String, Object> stepPreview(TurnRow audited, ContextAudit.Selected item, String password) throws SQLException {

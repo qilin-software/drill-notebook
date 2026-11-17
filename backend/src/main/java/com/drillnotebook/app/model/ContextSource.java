@@ -44,6 +44,7 @@ public record ContextSource(String kind, String id, long turnId, String requestI
     public static Map<String, Object> untag(Map<String, Object> message) {
         var copy = new LinkedHashMap<>(message);
         copy.remove(TAG);
+        copy.remove("_contextUserText");
         // Anthropic signed state is translated by its adapter, never sent as an OpenAI extension.
         return copy;
     }

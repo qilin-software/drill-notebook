@@ -234,12 +234,20 @@ public class AiUpstreamClient {
     public Result callPrepared(Upstream upstream, com.drillnotebook.app.model.PreparedRequest prepared,
             StreamListener listener, int timeoutSeconds, ActiveTurnRegistry.Handle handle,
             java.util.function.Consumer<com.drillnotebook.app.model.PreparedRequest> onSend) {
+        return callPrepared(upstream, prepared, listener, timeoutSeconds, handle, null, onSend);
+    }
+
+    /** Validate immediately before dispatch; observe only after the HTTP client accepted the request. */
+    public Result callPrepared(Upstream upstream, com.drillnotebook.app.model.PreparedRequest prepared,
+            StreamListener listener, int timeoutSeconds, ActiveTurnRegistry.Handle handle,
+            java.util.function.Consumer<com.drillnotebook.app.model.PreparedRequest> beforeSend,
+            java.util.function.Consumer<com.drillnotebook.app.model.PreparedRequest> onSend) {
         long requestStarted = System.nanoTime();
         boolean unsupported = cacheUnsupported(upstream);
         Upstream effective = unsupported ? upstream.withCacheBreakpoints(false) : upstream;
         if (unsupported) prepared = withoutCache(prepared);
         try {
-            return callOnce(effective, prepared, listener, timeoutSeconds, handle, onSend);
+            return callOnce(effective, prepared, listener, timeoutSeconds, handle, beforeSend, onSend);
         } catch (IllegalArgumentException error) {
             if (effective.cacheBreakpoints() && isCacheUnsupported(error.getMessage())) {
                 rememberCacheUnsupported(upstream);
@@ -247,7 +255,7 @@ public class AiUpstreamClient {
                 int remaining = timeoutSeconds - (int) ((System.nanoTime() - requestStarted) / 1_000_000_000L);
                 if (remaining <= 0) return new Result("", "", "deadline", false, false, false, Usage.unknown());
                 var fallback = withoutCache(prepared);
-                return callOnce(upstream.withCacheBreakpoints(false), fallback, listener, remaining, handle, onSend);
+                return callOnce(upstream.withCacheBreakpoints(false), fallback, listener, remaining, handle, beforeSend, onSend);
             }
             throw error;
         }
@@ -300,7 +308,12 @@ public class AiUpstreamClient {
 
     private Result callOnce(Upstream upstream, com.drillnotebook.app.model.PreparedRequest prepared,
                             StreamListener listener, int timeoutSeconds, ActiveTurnRegistry.Handle handle,
+                            java.util.function.Consumer<com.drillnotebook.app.model.PreparedRequest> beforeSend,
                             java.util.function.Consumer<com.drillnotebook.app.model.PreparedRequest> onSend) {
+        if (handle != null && "CHAT".equals(prepared.context().kind()))
+            handle.requestStage(com.drillnotebook.app.model.AiRequestDiagnostics.Stage.SENDING);
+        else if (handle != null && "CONTEXT_COMPACT".equals(prepared.context().kind()))
+            handle.requestStage(com.drillnotebook.app.model.AiRequestDiagnostics.Stage.COMPACTING);
         boolean anthropic = upstream.anthropic();
         boolean stream = prepared.stream();
         String target = anthropic ? anthropicMessagesUrl(upstream.baseUrl()) : chatCompletionsUrl(upstream.baseUrl());
@@ -325,9 +338,18 @@ public class AiUpstreamClient {
         }
         HttpResponse<InputStream> response;
         try {
-            if (onSend != null) onSend.accept(prepared);
+            if (beforeSend != null) beforeSend.accept(prepared);
+            if (stopped(handle, deadline)) {
+                deadline.cancel();
+                if (handle != null) handle.bindAbortHook(null);
+                return new Result("", "", reason(handle, deadline), false, false,
+                        handle != null && handle.cancelRequested(), Usage.unknown());
+            }
+            if (handle != null) handle.requestAttempted(prepared.context().kind());
             var pending = http.sendAsync(httpRequest, HttpResponse.BodyHandlers.ofInputStream());
+            pending.thenAccept(received -> deadline.attach(received.body()));
             deadline.attach(pending);
+            if (onSend != null) onSend.accept(prepared);
             response = pending.get();
         } catch (java.util.concurrent.CancellationException | java.util.concurrent.ExecutionException error) {
             deadline.cancel();
@@ -343,6 +365,12 @@ public class AiUpstreamClient {
             if (handle != null) handle.bindAbortHook(null);
             Thread.currentThread().interrupt();
             return new Result("", "", "aborted", false, false, true, Usage.unknown());
+        } catch (RuntimeException error) {
+            // A local validation/observer failure must not leave a watchdog or transport attached to the turn.
+            deadline.expire();
+            deadline.cancel();
+            if (handle != null) handle.bindAbortHook(null);
+            throw error;
         }
         long responseReceivedAt = System.currentTimeMillis();
         InputStream body = response.body();

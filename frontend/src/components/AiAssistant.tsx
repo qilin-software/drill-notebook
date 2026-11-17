@@ -5,6 +5,7 @@ import { Button, Input, Message, Select, Space, Typography } from '@arco-design/
 import { ArrowDown, Copy, Download, FilePlus2, FileText, MoreHorizontal, PanelLeft, Paperclip, Pin, RotateCw, Send, Sparkles, Square, X } from 'lucide-react';
 import { SessionNavigation, type SessionNavigationHandle } from './ai-session/SessionNavigation';
 import { RecoveryFeedback } from './ai-session/RecoveryFeedback';
+import { ContextCompactionStatus } from './ai-session/ContextCompactionStatus';
 import { ConversationNavigation } from './ai-session/ConversationNavigation';
 import { getRoundPreview } from '../lib/conversationNavigation';
 import type { RoundPreview } from '../lib/conversationNavigation';
@@ -439,11 +440,14 @@ export function AiAssistant(): JSX.Element {
         usage: useMirror ? mirror?.usage : row.usage,
         roundNumber: row.roundNumber,
         recovery: useMirror ? mirror?.recovery : row.recovery ?? mirror?.recovery,
+        failure: useMirror ? mirror?.failure : row.turnStatus === 'COMPLETED' ? undefined : row.failure ?? mirror?.failure,
         page: row.page ?? snapshots.get(`user:${row.requestId}`)?.page,
         content: useMirror || !row.content ? mirror?.content ?? row.content : row.content,
         reasoning: useMirror ? mirror?.reasoning : row.reasoning ?? mirror?.reasoning,
         supplements: useMirror ? mirror?.supplements : row.supplements ?? mirror?.supplements,
         streaming: mirror?.streaming,
+        contextCompacting: useMirror ? mirror?.contextCompacting : false,
+        contextCompaction: useMirror ? mirror?.contextCompaction : row.contextCompaction ?? mirror?.contextCompaction,
         toolActivities: useMirror ? mirror?.toolActivities
           : settleToolActivities(mergeToolActivities(mirror?.toolActivities, row.toolActivities)),
         toolPhase: mirror?.toolPhase,
@@ -809,9 +813,10 @@ export function AiAssistant(): JSX.Element {
     });
   };
 
-  /** 失败/状态未知时的收口：有内容就定稿保留，零生成的空占位撤掉，绝不留下转圈的气泡。 */
-  const settleOrDropAssistant = (notice?: TurnNotice, activities?: ToolActivity[], recovery?: AiRecovery | null): void => {
-    const key = turnTargetRef.current?.assistantKey;
+  /** 失败/状态未知时保留正文或报错及原轮次身份；只有没有任何可展示事实的空占位才撤掉。 */
+  const settleOrDropAssistant = (notice?: TurnNotice, activities?: ToolActivity[], recovery?: AiRecovery | null, discardUnstartedRetry = false): void => {
+    const target = turnTargetRef.current;
+    const key = target?.assistantKey;
     if (!key) return;
     setMessages((current) => {
       const next = [...current];
@@ -822,20 +827,23 @@ export function AiAssistant(): JSX.Element {
       const reasoning = typeof last.reasoning === 'string' ? last.reasoning : '';
       const toolActivities = settleToolActivities(mergeToolActivities(last.toolActivities, activities));
       const finalRecovery = recovery === undefined ? last.recovery : recovery;
-      if (!text.trim() && !reasoning.trim() && !toolActivities.length && !finalRecovery) {
+      const finalNotice = finalRecovery ? undefined : notice ?? last.notice;
+      if (discardUnstartedRetry && last.retryOf
+        || !text.trim() && !reasoning.trim() && !toolActivities.length && !finalRecovery && !finalNotice && !last.contextCompaction?.completed) {
         next.splice(index, 1);
         // 未产生新回答时撤回本地重试身份；服务端历史决定原轮次是否已经替换。
         if (last.retryOf) {
-          const userKey = turnTargetRef.current?.userKey;
+          const userKey = target?.userKey;
           for (let at = 0; at < next.length; at++) {
             if (next[at]._key === userKey) next[at] = { ...next[at], requestId: last.retryOf, retryOf: undefined };
           }
         }
-        turnTargetRef.current = null;
+        if (turnTargetRef.current === target) turnTargetRef.current = null;
         return next;
       }
       next[index] = { ...last, content: text, reasoning: reasoning || undefined, streaming: false,
-        notice: finalRecovery ? undefined : notice, toolActivities, recovery: finalRecovery, contextCompacting: false };
+        notice: finalNotice, toolActivities, recovery: finalRecovery, contextCompacting: false,
+        contextCompaction: last.contextCompaction ? { ...last.contextCompaction, running: false } : undefined };
       return next;
     });
   };
@@ -877,16 +885,19 @@ export function AiAssistant(): JSX.Element {
         const originalAnswer = history.messages.find(row => row.role === 'assistant' && (row.requestId === event.requestId || row.requestId === snapshot.retryOf));
         const index = next.findIndex((item) => item.role === 'assistant' && (item.requestId === event.requestId || originalAnswer && item.id === originalAnswer.id));
         const previous = index < 0 ? undefined : next[index];
-        if (!running && !previous && !snapshot.reply && !snapshot.reasoning && !snapshot.toolActivities?.length && !snapshot.recovery) return next;
+        if (!running && snapshot.status === 'COMPLETED' && !previous && !snapshot.reply && !snapshot.reasoning && !snapshot.toolActivities?.length && !snapshot.recovery && !snapshot.contextCompaction?.completed) return next;
         const item: ChatMessage = { ...previous, id: originalAnswer?.id ?? previous?.id, role: 'assistant', content: snapshot.reply ?? previous?.content ?? '',
           reasoning: snapshot.reasoning ?? previous?.reasoning, requestId: event.requestId, retryOf: snapshot.retryOf ?? previous?.retryOf ?? undefined, streaming: running,
           supplements: snapshot.supplements ?? previous?.supplements,
           recovery: snapshot.recovery === undefined ? previous?.recovery : snapshot.recovery,
+          failure: snapshot.status === 'COMPLETED' ? undefined : snapshot.failure ?? previous?.failure,
           toolActivities: running ? mergeToolActivities(previous?.toolActivities, snapshot.toolActivities)
             : settleToolActivities(mergeToolActivities(previous?.toolActivities, snapshot.toolActivities)),
-          toolPhase: snapshot.phase === 'tools' ? 'tools' : 'answer', contextCompacting: running && snapshot.phase === 'compacting',
+          toolPhase: snapshot.phase === 'tools' ? 'tools' : 'answer', contextCompacting: running && (snapshot.contextCompaction?.running ?? snapshot.phase === 'compacting'),
+          contextCompaction: { running: running && (snapshot.contextCompaction?.running ?? snapshot.phase === 'compacting'),
+            completed: snapshot.contextCompaction?.completed ?? previous?.contextCompaction?.completed ?? originalAnswer?.contextCompaction?.completed },
           notice: running ? undefined : snapshot.status === 'COMPLETED'
-            ? executionStopNotice(snapshot.finishReason) : statusNotice(snapshot), _key: previous?._key ?? (originalAnswer ? `h${originalAnswer.id}` : `a-${event.requestId}`) };
+            ? executionStopNotice(snapshot.finishReason) : snapshot.failure ? statusNotice(snapshot) : previous?.notice ?? statusNotice(snapshot), _key: previous?._key ?? (originalAnswer ? `h${originalAnswer.id}` : `a-${event.requestId}`) };
         if (index < 0) next.push(item); else next[index] = item;
         return next;
       });
@@ -902,6 +913,9 @@ export function AiAssistant(): JSX.Element {
       // 取消后的确认按原 requestId 回填，不能套用指向新一轮的 turnTargetRef。
       setMessages((current) => current.map((item) => item.role === 'assistant' && item.requestId === event.requestId
         ? { ...item, recovery: event.status.recovery === undefined ? item.recovery : event.status.recovery,
+          failure: event.status.status === 'COMPLETED' ? undefined : event.status.failure ?? item.failure,
+          contextCompaction: event.status.contextCompaction ? { ...event.status.contextCompaction, running: false } : item.contextCompaction,
+          contextCompacting: false,
           toolActivities: settleToolActivities(mergeToolActivities(item.toolActivities, event.status.toolActivities)) }
         : item));
       if (event.status.status && event.status.status !== 'RUNNING') invalidateSessionLists(true);
@@ -910,7 +924,8 @@ export function AiAssistant(): JSX.Element {
     stampTurnIdentity(event.requestId);
     switch (event.type) {
       case 'compaction':
-        patchAssistant(() => ({ contextCompacting: event.running }));
+        patchAssistant((prev) => ({ contextCompacting: event.running,
+          contextCompaction: { running: event.running, completed: event.completed ?? prev.contextCompaction?.completed } }));
         return;
       case 'supplements':
         patchAssistant(() => ({ supplements: event.supplements }));
@@ -943,24 +958,32 @@ export function AiAssistant(): JSX.Element {
           // 本轮身份与统一结果快照：徽标和检查器只认 requestId，历史行现在也带它（§4.5）
           requestId: event.requestId,
           turn: { ...event.view, requestId: event.requestId },
+          failure: event.view.failure,
           toolActivities: settleToolActivities(mergeToolActivities(prev?.toolActivities, event.view.toolActivities)),
           streaming: false,
-          contextCompacting: false
+          contextCompacting: false,
+          contextCompaction: { running: false, completed: event.view.contextCompaction?.completed ?? prev?.contextCompaction?.completed }
         }));
         invalidateSessionLists(true);
         return;
       }
       case 'failure':
-        // 这一轮真的开始过或已产出内容：保留已生成的部分，把服务端错误如实提示给用户（§7.3、§7.2 第 6 条）。
-        if (!event.view.recovery) Message.error(event.message || '生成中断，请重试');
-        settleOrDropAssistant(outcomeNotice(event.view), event.view.toolActivities, event.view.recovery);
+        // 具体错误保留在原回答内，刷新后仍可读回并重新生成。
+        if (event.notStarted && turnTargetRef.current?.retryUserMessageId !== undefined) Message.error(event.message);
+        patchAssistant((previous) => ({ failure: event.view.failure,
+          contextCompaction: event.view.contextCompaction ? { ...event.view.contextCompaction, running: false } : previous.contextCompaction }));
+        settleOrDropAssistant(event.view.failure ? outcomeNotice(event.view)
+          : { code: 'REQUEST_FAILED', message: event.message || outcomeNotice(event.view)?.message || '生成中断，请重试' },
+          event.view.toolActivities, event.view.recovery, event.notStarted === true);
         invalidateSessionLists(event.view.stateDurable === true);
         return;
       case 'status': {
         const settled = event.status.status !== undefined && event.status.status !== 'RUNNING';
+        patchAssistant((previous) => ({ failure: event.status.status === 'COMPLETED' ? undefined : event.status.failure ?? previous.failure,
+          contextCompaction: event.status.contextCompaction ? { ...event.status.contextCompaction, running: false } : previous.contextCompaction }));
         // 已经 COMPLETED 就别再说"不完整"：这时交给 refetch 拿服务端那份正文
         const notice = event.status.status === 'COMPLETED' ? executionStopNotice(event.status.finishReason) : statusNotice(event.status);
-        settleOrDropAssistant(notice ? { code: notice.code, message: event.message ?? notice.message } : undefined, event.status.toolActivities, event.status.recovery);
+        settleOrDropAssistant(notice ? { code: notice.code, message: event.status.failure ? notice.message : event.message ?? notice.message } : undefined, event.status.toolActivities, event.status.recovery);
         invalidateSessionLists(settled);
         return;
       }
@@ -1419,7 +1442,7 @@ export function AiAssistant(): JSX.Element {
                   data-conversation-round={item.role === 'user' ? item.roundNumber : undefined}
                   className={`chat-message ${item.role}${isAssistant && item._key === lastAssistantKey ? ' is-latest' : ''}${item.id !== undefined && item.id === highlightedMessage ? ' is-jump-target' : ''}`}>
                   {isAssistant && item.model ? <p className="chat-turn-model">{item.model}{item.reasoningEffort ? ` · 思考 ${item.reasoningEffort}` : ''}</p> : null}
-                  {isAssistant && item.streaming && item.contextCompacting ? <p className="chat-turn-model" role="status">正在压缩上下文…</p> : null}
+                  {isAssistant ? <ContextCompactionStatus state={item.contextCompaction ?? (item.contextCompacting ? { running: true } : undefined)} /> : null}
                   {isAssistant && item.reasoning ? (
                     <details className="chat-reasoning" open={item.streaming}>
                       <summary>思考过程{item.streaming ? '（生成中…）' : ''}</summary>
@@ -1448,7 +1471,7 @@ export function AiAssistant(): JSX.Element {
                     ? <button type="button" className="chat-bound-page" title="提交时的业务页面，点击在主窗口查看" onClick={() => { void openMaterial(item.page!.link!); }}><FileText size={12} />{item.page.title}</button>
                     : <span className="chat-bound-page" title="提交时的业务页面"><FileText size={12} />{item.page.title}</span>) : null}
                   {item.streaming && !item.contextCompacting && !item.toolActivities?.length ? <span className="chat-stream-cursor" aria-hidden="true" /> : null}
-                  {isAssistant && item.recovery ? <RecoveryFeedback value={item.recovery} active={item.streaming} onStop={stopGeneration} /> : null}
+                  {isAssistant && item.recovery ? <RecoveryFeedback value={item.recovery} active={item.streaming} failureMessage={item.failure?.message} onStop={stopGeneration} /> : null}
                   {item.notice && !item.recovery ? (
                     <div className="ai-retrieval-notice">
                       {item.notice.message ?? '笔记检索暂时不可用，本次回答未使用笔记内容'}

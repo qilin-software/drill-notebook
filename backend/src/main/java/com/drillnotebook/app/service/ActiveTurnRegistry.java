@@ -33,10 +33,12 @@ public class ActiveTurnRegistry {
         private volatile Runnable abortHook;
         private volatile List<ToolActivity> toolActivities = List.of();
         private volatile AiRecovery recovery;
-        private volatile boolean contextCompacting;
+        private volatile com.drillnotebook.app.model.ContextCompaction contextCompaction = com.drillnotebook.app.model.ContextCompaction.NONE;
         /** 当前轮尚未落库的回复长度；只保存数值，不保留流式正文。 */
         private volatile ContextTokens contextTokens = new ContextTokens(0, null);
         private volatile ModelContextSnapshot modelContext;
+        private volatile com.drillnotebook.app.model.AiRequestDiagnostics requestDiagnostics = com.drillnotebook.app.model.AiRequestDiagnostics.INITIAL;
+        private volatile ChatTurnService.Failure failure;
 
         Handle(String requestId, long sessionId) {
             this.requestId = requestId;
@@ -61,8 +63,18 @@ public class ActiveTurnRegistry {
 
         public AiRecovery recovery() { return recovery; }
         public void recovery(AiRecovery value) { recovery = value; }
-        public boolean contextCompacting() { return contextCompacting; }
-        public void contextCompacting(boolean value) { contextCompacting = value; }
+        public boolean contextCompacting() { return contextCompaction.running(); }
+        public void contextCompacting(boolean value) { contextCompaction = contextCompaction.withRunning(value); }
+        public com.drillnotebook.app.model.ContextCompaction contextCompaction() { return contextCompaction; }
+        public void contextCompactionSucceeded() { contextCompaction = contextCompaction.succeeded(); }
+
+        public com.drillnotebook.app.model.AiRequestDiagnostics requestDiagnostics() { return requestDiagnostics; }
+        public synchronized void requestStage(com.drillnotebook.app.model.AiRequestDiagnostics.Stage stage) {
+            requestDiagnostics = requestDiagnostics.withStage(stage);
+        }
+        public synchronized void requestAttempted(String kind) { requestDiagnostics = requestDiagnostics.attempted(kind); }
+        public ChatTurnService.Failure failure() { return failure; }
+        public void failure(ChatTurnService.Failure value) { failure = value; }
 
         public ContextTokens contextTokens() { return contextTokens; }
         public ModelContextSnapshot modelContext() { return modelContext; }

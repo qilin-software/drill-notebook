@@ -273,25 +273,85 @@ public class ChatTurnService {
      * 落库失败绝不当成成功：先重读，仍 RUNNING 就用不依赖正文加密的短事务置 FAILED，
      * 连 FAILED 都写不进才打开降级门闩（§7.2.1）。
      */
+    public record Failure(String code, String message,
+                          @com.fasterxml.jackson.annotation.JsonInclude(com.fasterxml.jackson.annotation.JsonInclude.Include.NON_NULL)
+                          com.drillnotebook.app.model.AiRequestDiagnostics diagnostics) {
+        public Failure(String code, String message) { this(code, message, null); }
+        public Failure {
+            code = code != null && code.matches("[A-Z][A-Z0-9_]{0,79}") ? code : "REQUEST_FAILED";
+            message = AiUpstreamException.safe(message, null);
+            if (message.isBlank()) message = "本轮生成失败，请重试";
+        }
+        public static Failure from(RuntimeException error) {
+            return new Failure(error instanceof ChatTurnRejectException rejected ? rejected.code() : null, error.getMessage());
+        }
+        public static Failure from(RuntimeException error, ActiveTurnRegistry.Handle handle) {
+            if (handle.failure() != null) return handle.failure();
+            var diagnostics = handle.requestDiagnostics();
+            String code = error instanceof ChatTurnRejectException rejected ? rejected.code() : null;
+            String prefix = "";
+            switch (diagnostics.stage()) {
+                case PREPARING -> {
+                    if (code == null) code = "REQUEST_PREPARATION_FAILED";
+                    prefix = "本地请求准备失败。";
+                }
+                case COMPACTING -> {
+                    if (code == null) code = "CONTEXT_COMPACTION_FAILED";
+                    prefix = "上下文压缩失败。";
+                }
+                case SENDING -> {
+                    if (!diagnostics.mainRequestAttempted()) {
+                        if (code == null) code = "REQUEST_PREPARATION_FAILED";
+                        prefix = "本地请求构建失败。";
+                    }
+                }
+                case TOOLS -> { if (code == null) code = "TOOL_EXECUTION_FAILED"; prefix = "本地工具处理失败。"; }
+                case FINALIZING -> { if (code == null) code = "RESULT_PERSISTENCE_FAILED"; prefix = "本地回答收尾失败。"; }
+            }
+            if (!diagnostics.mainRequestAttempted() && diagnostics.stage() != com.drillnotebook.app.model.AiRequestDiagnostics.Stage.FINALIZING)
+                prefix += "主模型请求尚未发出。";
+            return new Failure(code, prefix.isEmpty() ? error.getMessage() : prefix + "\n" + java.util.Objects.toString(error.getMessage(), ""), diagnostics);
+        }
+        public static Failure read(com.fasterxml.jackson.databind.JsonNode node) {
+            if (node == null || !node.isObject() || !node.path("code").isTextual() || !node.path("message").isTextual()) return null;
+            com.drillnotebook.app.model.AiRequestDiagnostics diagnostics = null;
+            var progress = node.path("diagnostics");
+            if (progress.path("stage").isTextual() && progress.path("mainRequestAttempted").isBoolean()
+                    && progress.path("compactionRequestAttempted").isBoolean()) {
+                try {
+                    diagnostics = new com.drillnotebook.app.model.AiRequestDiagnostics(
+                            com.drillnotebook.app.model.AiRequestDiagnostics.Stage.valueOf(progress.path("stage").asText()),
+                            progress.path("mainRequestAttempted").asBoolean(), progress.path("compactionRequestAttempted").asBoolean());
+                } catch (IllegalArgumentException ignored) { /* Older or unknown diagnostics do not invalidate the saved error. */ }
+            }
+            return new Failure(node.path("code").asText(), node.path("message").asText(), diagnostics);
+        }
+    }
+
     public FinalResult finalizeTurn(Lease lease, UpstreamReply reply, Map<String, Object> audit) {
+        return finalizeTurn(lease, reply, audit, lease.handle().failure());
+    }
+
+    private FinalResult finalizeTurn(Lease lease, UpstreamReply reply, Map<String, Object> audit, Failure failure) {
         String status = classify(lease, reply);
+        if (ChatTurnRepository.STATUS_COMPLETED.equals(status)) failure = null;
         var recovery = lease.handle().recovery();
         if (recovery != null) lease.handle().recovery(ChatTurnRepository.STATUS_COMPLETED.equals(status) ? null
                 : recovery.ended(lease.handle().cancelRequested() || "aborted".equals(reply.finishReason()) ? "stopped" : "failed"));
         try {
             String text = reply.text() == null ? "" : reply.text();
             // 安全报错需要稳定的助手消息身份，空正文也以密文占位，历史才能读回该轮元数据。
-            ChatMessageCipher.Encrypted content = text.isEmpty() && lease.handle().recovery() == null
+            ChatMessageCipher.Encrypted content = text.isEmpty() && failure == null && lease.handle().recovery() == null && !lease.handle().contextCompaction().completed()
                     ? null : cipher.encrypt(text, lease.masterPassword());
             ChatMessageCipher.Encrypted reasoning = reply.reasoning() == null || reply.reasoning().isEmpty()
                     ? null : cipher.encrypt(reply.reasoning(), lease.masterPassword());
             ChatMessageCipher.Encrypted result = cipher.encrypt(resultMeta(status, reply, audit,
-                            lease.handle().toolActivities(), lease.handle().recovery()),
+                            lease.handle().toolActivities(), lease.handle().recovery(), lease.handle().contextCompaction().settled(), failure),
                     lease.masterPassword());
             var modelContext = lease.handle().modelContext();
             if (modelContext != null) {
                 // 终态事务只推进一次历史版本；保存同一份请求 / 响应快照，不改用整段历史正文重算。
-                long revision = sessions.read(lease.sessionId()).orElseThrow().historyRevision() + 1;
+                long revision = modelContext.historyRevision() + 1;
                 result = cipher.withModelContext(result, modelContext.atRevision(revision));
             }
             TerminalOutcome outcome = turns.finalizeTurn(lease.requestId(),
@@ -316,7 +376,7 @@ public class ChatTurnService {
 
     /** 无正文失败也保存已经取得的安全上游报错；配置/组装失败沿用最小收尾。 */
     public FinalResult abandon(Lease lease, String reason) {
-        if (lease.handle().recovery() != null) {
+        if (lease.handle().recovery() != null || lease.handle().contextCompaction().completed()) {
             return finalizeTurn(lease, new UpstreamReply("", "", reason, false, false,
                     lease.handle().cancelRequested(), AiUpstreamClient.Usage.unknown()), Map.of());
         }
@@ -331,10 +391,17 @@ public class ChatTurnService {
         }
     }
 
+    /** Accepted requests keep a bounded, encrypted error and an assistant identity even before any model output. */
+    public FinalResult abandon(Lease lease, String reason, RuntimeException error) {
+        return finalizeTurn(lease, new UpstreamReply("", "", reason, false, false,
+                lease.handle().cancelRequested(), AiUpstreamClient.Usage.unknown()), Map.of(), Failure.from(error, lease.handle()));
+    }
+
     // ---------- 用量独立结算（contracts §2.6、执行方案 §7.2.1） ----------
 
     /**
-     * 外发之前登记 attempt 并置 SENT：CHAT 只计量、不占后台 20 次/30K 限额，所以预留为 0。
+     * HTTP 客户端接受发送后登记 attempt 并置 SENT；mock 路径在本地执行时登记。
+     * CHAT 只计量、不占后台 20 次/30K 限额，所以预留为 0。
      *
      * <p>记账失败绝不拦住用户的聊天——回复比统计表重要；此时返回 null，后续结算静默跳过。</p>
      *
@@ -383,7 +450,11 @@ public class ChatTurnService {
 
     public void recordModelContext(Lease lease, com.drillnotebook.app.model.RequestContextAudit input) throws SQLException {
         var state = sessions.read(lease.sessionId()).orElseThrow();
-        lease.handle().modelContext(ModelContextSnapshot.from(input, state.contextGeneration(), state.historyRevision()));
+        recordModelContext(lease, input, state.contextGeneration(), state.historyRevision());
+    }
+
+    public void recordModelContext(Lease lease, com.drillnotebook.app.model.RequestContextAudit input, long generation, long revision) {
+        lease.handle().modelContext(ModelContextSnapshot.from(input, generation, revision));
     }
 
     public ModelContextSnapshot currentModelContext(String requestId) {
@@ -449,9 +520,9 @@ public class ChatTurnService {
         body.put("startedAt", turn.startedAt());
         body.put("finishedAt", turn.finishedAt());
         body.put("active", registry.isActive(requestId));
-        boolean compacting = registry.find(requestId).map(ActiveTurnRegistry.Handle::contextCompacting).orElse(false);
-        body.put("contextCompaction", Map.of("running", compacting));
-        if (compacting) body.put("phase", "compacting");
+        var compaction = turn.contentDeletedAt() == null ? contextCompaction(requestId, masterPassword) : com.drillnotebook.app.model.ContextCompaction.NONE;
+        body.put("contextCompaction", compaction);
+        if (compaction.running()) body.put("phase", "compacting");
         body.put("retryOf", turn.retryOf());
         body.put("contentDeleted", turn.contentDeletedAt() != null);
         ChatMessageCipher.Read reply = readPart(turn.assistantMessageId(), false, masterPassword);
@@ -464,7 +535,20 @@ public class ChatTurnService {
         body.put("toolActivities", turn.contentDeletedAt() == null
                 ? toolActivities(requestId, masterPassword) : List.of());
         body.put("recovery", turn.contentDeletedAt() == null ? recovery(requestId, masterPassword).orElse(null) : null);
+        body.put("failure", turn.contentDeletedAt() == null ? failure(requestId, masterPassword).orElse(null) : null);
         return body;
+    }
+
+    public Optional<Failure> failure(String requestId, String masterPassword) {
+        try {
+            var meta = turns.findResultMeta(requestId);
+            if (meta.isEmpty()) return Optional.empty();
+            var read = cipher.read(meta.get().cipher(), meta.get().crypto(), masterPassword);
+            if (read.status() != ChatMessageCipher.ReadStatus.DECRYPTED) return Optional.empty();
+            return Optional.ofNullable(Failure.read(mapper.readTree(read.value()).path("failure")));
+        } catch (SQLException | com.fasterxml.jackson.core.JsonProcessingException | ChatCryptoException error) {
+            return Optional.empty();
+        }
     }
 
     /** UI activity metadata remains separate from the encrypted, bounded model-visible tool steps. */
@@ -472,15 +556,39 @@ public class ChatTurnService {
         List<ToolActivity> boundedActivities = List.copyOf(activities.subList(0,
                 Math.min(activities.size(), ToolActivity.MAX_ENTRIES)));
         lease.handle().toolActivities(boundedActivities);
+        saveRunningProgress(lease);
+    }
+
+    public void recordContextCompactionSuccess(Lease lease) {
+        lease.handle().contextCompactionSucceeded();
+        saveRunningProgress(lease);
+    }
+
+    private void saveRunningProgress(Lease lease) {
         try {
             ChatMessageCipher.Encrypted encrypted = cipher.encrypt(
-                    mapper.writeValueAsString(Map.of("schemaVersion", 1, "toolActivities", boundedActivities)),
+                    mapper.writeValueAsString(Map.of("schemaVersion", 1, "toolActivities", lease.handle().toolActivities(),
+                            "contextCompaction", lease.handle().contextCompaction().settled())),
                     lease.masterPassword());
             if (!turns.saveRunningResultMeta(lease.requestId(), encrypted.cipher(), encrypted.meta())) {
                 throw new IllegalStateException("轮次已经结束，不能继续执行工具");
             }
         } catch (SQLException | com.fasterxml.jackson.core.JsonProcessingException | ChatCryptoException error) {
-            throw new IllegalStateException("工具活动未能保存，本轮已停止", error);
+            throw new IllegalStateException("本轮进度未能保存，本轮已停止", error);
+        }
+    }
+
+    public com.drillnotebook.app.model.ContextCompaction contextCompaction(String requestId, String masterPassword) {
+        var active = registry.find(requestId);
+        if (active.isPresent()) return active.get().contextCompaction();
+        try {
+            var columns = turns.findResultMeta(requestId);
+            if (columns.isEmpty()) return com.drillnotebook.app.model.ContextCompaction.NONE;
+            var read = cipher.read(columns.get().cipher(), columns.get().crypto(), masterPassword);
+            if (read.status() != ChatMessageCipher.ReadStatus.DECRYPTED) return com.drillnotebook.app.model.ContextCompaction.NONE;
+            return com.drillnotebook.app.model.ContextCompaction.read(mapper.readTree(read.value()).path("contextCompaction"));
+        } catch (SQLException | com.fasterxml.jackson.core.JsonProcessingException ignored) {
+            return com.drillnotebook.app.model.ContextCompaction.NONE;
         }
     }
 
@@ -888,7 +996,8 @@ public class ChatTurnService {
     }
 
     private String resultMeta(String status, UpstreamReply reply, Map<String, Object> audit,
-                              List<ToolActivity> activities, com.drillnotebook.app.model.AiRecovery recovery) {
+                               List<ToolActivity> activities, com.drillnotebook.app.model.AiRecovery recovery,
+                                com.drillnotebook.app.model.ContextCompaction compaction, Failure failure) {
         Map<String, Object> meta = new LinkedHashMap<>();
         meta.put("schemaVersion", 1);
         meta.put("status", status);
@@ -905,6 +1014,8 @@ public class ChatTurnService {
         if (audit != null) meta.put("audit", audit);
         if (!activities.isEmpty()) meta.put("toolActivities", activities);
         if (recovery != null) meta.put("recovery", recovery);
+        if (compaction.completed()) meta.put("contextCompaction", compaction);
+        if (failure != null) meta.put("failure", failure);
         return bounded(meta);
     }
 
@@ -1019,6 +1130,8 @@ public class ChatTurnService {
             minimal.put("truncatedMeta", true);
             if (meta.containsKey("toolActivities")) minimal.put("toolActivities", meta.get("toolActivities"));
             if (meta.containsKey("recovery")) minimal.put("recovery", meta.get("recovery"));
+            if (meta.containsKey("contextCompaction")) minimal.put("contextCompaction", meta.get("contextCompaction"));
+            if (meta.containsKey("failure")) minimal.put("failure", meta.get("failure"));
             return mapper.writeValueAsString(minimal);
         } catch (Exception error) {
             return "{\"truncatedMeta\":true}";

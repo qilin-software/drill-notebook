@@ -42,6 +42,39 @@ class AiUpstreamClientTest {
         return new AiUpstreamClient.Deadline(3600);
     }
 
+    @Test void cancellationAtTheDispatchGuardNeverSendsOrNotifiesTheObserver() throws Exception {
+        var requests = new java.util.concurrent.atomic.AtomicInteger();
+        HttpServer server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        server.createContext("/", exchange -> { requests.incrementAndGet(); exchange.close(); });
+        server.start();
+        try {
+            var handle = new ActiveTurnRegistry().acquire("cancel-at-guard", 1L).orElseThrow();
+            var target = new AiUpstreamClient.Upstream("http://127.0.0.1:" + server.getAddress().getPort(), "", "stub", "chat_completions", 128, false);
+            var prepared = client.prepare(target, List.of(Map.of("role", "user", "content", "test")), List.of(), false, 8000, "CHAT");
+            var observed = new java.util.concurrent.atomic.AtomicBoolean();
+            var result = client.callPrepared(target, prepared, null, 30, handle,
+                    request -> handle.requestCancel(), request -> observed.set(true));
+            assertEquals("aborted", result.finishReason());
+            assertFalse(observed.get());
+            assertFalse(handle.requestDiagnostics().mainRequestAttempted());
+            assertEquals(0, requests.get());
+            org.junit.jupiter.api.Assertions.assertNull(org.springframework.test.util.ReflectionTestUtils.getField(handle, "abortHook"));
+        } finally { server.stop(0); }
+    }
+
+    @Test void aLocalGuardFailureReleasesTheDeadlineAndDoesNotNotifyTheSendObserver() {
+        var handle = new ActiveTurnRegistry().acquire("failed-guard", 1L).orElseThrow();
+        var target = new AiUpstreamClient.Upstream("http://127.0.0.1:1", "", "stub", "chat_completions", 128, false);
+        var prepared = client.prepare(target, List.of(Map.of("role", "user", "content", "test")), List.of(), false, 8000, "CHAT");
+        var observed = new java.util.concurrent.atomic.AtomicBoolean();
+        var cause = new IllegalStateException("fixture context changed");
+        assertEquals(cause, assertThrows(IllegalStateException.class, () -> client.callPrepared(target, prepared, null, 30, handle,
+                request -> { throw cause; }, request -> observed.set(true))));
+        assertFalse(observed.get());
+        assertFalse(handle.requestDiagnostics().mainRequestAttempted());
+        org.junit.jupiter.api.Assertions.assertNull(org.springframework.test.util.ReflectionTestUtils.getField(handle, "abortHook"));
+    }
+
     @Test void cancellationInterruptsTheWaitForResponseHeaders() throws Exception {
         var arrived = new java.util.concurrent.CountDownLatch(1);
         var release = new java.util.concurrent.CountDownLatch(1);

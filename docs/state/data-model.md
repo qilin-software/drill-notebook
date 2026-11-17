@@ -148,7 +148,7 @@ v21 的 `cache_read_included_in_input` 为 1 / 0 / null：1 表示原输入已�
 | `ai_context_checkpoint` | 当前会话唯一续接摘要 | session_id 主键且级联删除；记录 revision / generation / history / policy、memory boundary / revision、生成目标与策略；加密载荷内含结构化摘要、真实来源覆盖和 memorySensitive |
 | `ai_context_compaction_lease` | 压缩互斥与输入指纹 | session_id 主键且级联删除，租约标识 / 输入指纹 / 过期时刻，RUNNING / SUCCEEDED / FAILED；相同输入防重复执行 |
 
-原始消息与附件沿用旧表。新步骤保留实际提供给模型的有界调用 / 结果及必要协议状态，不保存网络原始 HTML、请求头或密钥。步骤载荷最多 2 MiB，摘要载荷最多 512 KiB、覆盖最多 4,096 个来源；密文及加密元数据按真实字节进入历史容量账本。步骤保存与轮次身份 / 容量更新同事务，检查点替换计净增量，不重复计费。
+原始消息与附件沿用旧表。新步骤保留实际提供给模型的有界调用 / 结果及必要协议状态，不保存网络原始 HTML、请求头或密钥。步骤载荷最多 2 MiB，续接检查点载荷最多 16 MiB、覆盖最多 65,536 个精确来源；continuation-v2 / payload schema 2 将模型 summary 与程序管理的 retained 分离，完整写入回执和带来源的用户原话一起加密，旧策略从合格原历史重建（不增加表或 schema 版本）；密文及加密元数据按真实字节进入历史容量账本。步骤保存与轮次身份 / 容量更新同事务，检查点替换计净增量，不重复计费。
 
 检查点只由上下文协调器在最终视图预检后发布一次，覆盖绑定 TURN / STEP / LEGACY / ANCHOR 的版本和指纹；模型网络调用不占数据库写事务。原地重试、清理、换代和记忆撤回使相关检查点失效，清理同时释放容量。记忆敏感步骤在授权撤回后被遮蔽，不继续进入模型请求。
 

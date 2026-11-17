@@ -198,7 +198,7 @@ describe('EditorBubbleMenu 行内公式', () => {
     await waitFor(() => expect(JSON.stringify(editor.getJSON())).toContain('x^3'));
     expect(editor.state.selection.empty).toBe(true);
     expect(editor.state.selection.from).toBe(2);
-    expect(document.activeElement).toBe(editor.view.dom);
+    await waitFor(() => expect(editor.view.dom).toHaveFocus());
   });
 
   it('点别处失焦只负责保存，不把焦点抢回编辑器', async () => {

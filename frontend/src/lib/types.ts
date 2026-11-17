@@ -238,7 +238,9 @@ export interface RetrievalOptions {
 export type TurnResult = ChatResultView & { requestId: string };
 
 export interface ChatMessage {
+  failure?: import('./aiStream').ChatFailure | null;
   contextCompacting?: boolean;
+  contextCompaction?: import('./aiStream').ContextCompaction;
   recovery?: import('./aiRecovery').AiRecovery | null;
   roundNumber?: number;
   supplements?: import('./chatQueue').ChatSupplement[];

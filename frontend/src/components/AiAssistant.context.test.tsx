@@ -142,7 +142,7 @@ beforeEach(() => {
 });
 
 describe('AiAssistant 记忆徽标与上下文检查器', () => {
-  it('压缩时显示状态，结束后回到当前回答并清除压缩提示', async () => {
+  it('压缩时显示图标和状态，成功后保留已自动压缩标识', async () => {
     let finish!: (value: StreamDonePayload) => void;
     apiPost.mockImplementation((url: string) => url === '/api/ai/chat'
       ? new Promise<StreamDonePayload>(resolve => { finish = resolve; }) : Promise.resolve({}));
@@ -153,13 +153,46 @@ describe('AiAssistant 记忆徽标与上下文检查器', () => {
     await waitFor(() => expect(streamControl.callbacks).not.toBeNull());
     act(() => streamControl.callbacks!.onMetadata!({ requestId: chatRequestId(), contextCompaction: { running: true } }));
     expect(await screen.findByText('正在压缩上下文…')).toBeTruthy();
+    expect(document.querySelector('.context-compaction-status svg')).not.toBeNull();
     expect(document.querySelector('.chat-stream-cursor')).toBeNull();
-    act(() => streamControl.callbacks!.onMetadata!({ requestId: chatRequestId(), contextCompaction: { running: false } }));
+    act(() => streamControl.callbacks!.onMetadata!({ requestId: chatRequestId(), contextCompaction: { running: false, completed: true } }));
+    expect(await screen.findByText('上下文已自动压缩')).toBeTruthy();
     await act(async () => finish({ reply: '压缩后继续回答', reasoning: '', protocolVersion: 2,
       requestId: chatRequestId(), sessionId: 10, status: 'COMPLETED', stateDurable: true, persistenceStatus: 'saved' }));
     expect(await screen.findByText('压缩后继续回答')).toBeTruthy();
     expect(screen.queryByText('正在压缩上下文…')).toBeNull();
+    expect(screen.getAllByText('上下文已自动压缩')).toHaveLength(1);
     expect(apiPost.mock.calls.filter(([url]) => url === '/api/ai/chat')).toHaveLength(1);
+  });
+
+  it('只收到压缩结束时不误报成功', async () => {
+    let finish!: (value: StreamDonePayload) => void;
+    apiPost.mockImplementation((url: string) => url === '/api/ai/chat'
+      ? new Promise<StreamDonePayload>(resolve => { finish = resolve; }) : Promise.resolve({}));
+    renderAssistant();
+    await waitFor(() => expect(screen.getByRole('button', { name: '发送' })).toBeEnabled());
+    fireEvent.change(screen.getByPlaceholderText(/提问/), { target: { value: '继续长会话' } });
+    fireEvent.click(screen.getByRole('button', { name: '发送' }));
+    await waitFor(() => expect(streamControl.callbacks).not.toBeNull());
+    act(() => streamControl.callbacks!.onMetadata!({ requestId: chatRequestId(), contextCompaction: { running: true } }));
+    act(() => streamControl.callbacks!.onMetadata!({ requestId: chatRequestId(), contextCompaction: { running: false, completed: false } }));
+    await act(async () => finish({ reply: '原上下文继续回答', reasoning: '', requestId: chatRequestId(), status: 'COMPLETED' }));
+    expect(await screen.findByText('原上下文继续回答')).toBeTruthy();
+    expect(screen.queryByText('上下文已自动压缩')).toBeNull();
+    expect(screen.queryByText('正在压缩上下文…')).toBeNull();
+  });
+
+  it('重新读取历史仍显示该轮已自动压缩', async () => {
+    const originalGet = apiGet.getMockImplementation()!;
+    apiGet.mockImplementation((url: string) => url.includes('/history') ? Promise.resolve(historyPage([
+      { id: 201, role: 'user', content: '继续长会话', requestId: TURN_ID, turnStatus: 'COMPLETED' },
+      { id: 202, role: 'assistant', content: '历史回答', requestId: TURN_ID, turnStatus: 'COMPLETED',
+        contextCompaction: { running: false, completed: true } }
+    ])) : originalGet(url));
+    renderAssistant();
+    expect(await screen.findByText('历史回答')).toBeTruthy();
+    expect(screen.getAllByText('上下文已自动压缩')).toHaveLength(1);
+    expect(screen.queryByText('正在压缩上下文…')).toBeNull();
   });
   it('计数来自本轮 done，徽标出现前没有额外请求', async () => {
     renderAssistant();

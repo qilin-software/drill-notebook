@@ -223,7 +223,7 @@ class ChatUpstreamDispatchTest {
         AiService.StreamFailure failure = assertThrows(AiService.StreamFailure.class, () -> ai.chatStream(body, null));
         assertInstanceOf(IllegalArgumentException.class, failure.getCause());
         assertEquals(requestId, failure.requestId(), "error 帧要能对上用户刚发起的那一轮");
-        assertEquals("failed", failure.persistenceStatus());
+        assertEquals("saved", failure.persistenceStatus(), "生成失败的具体报错与助手身份已正常保存");
 
         Map<String, Object> status = wiring.turnService().status(requestId);
         assertEquals("FAILED", status.get("status"), "begin() 之后的失败必须把轮次收成终态（§7.2.1）");

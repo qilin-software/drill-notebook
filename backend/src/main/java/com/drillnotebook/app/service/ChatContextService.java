@@ -267,20 +267,32 @@ public class ChatContextService {
 
     /** Tool access reports its specific denial; final model sends also require live memory access. */
     private boolean matches(ChatContextPlan plan, boolean requireMemoryAccess) {
+        try { return matchesCurrent(plan, requireMemoryAccess); }
+        catch (SQLException error) { return false; }
+    }
+
+    /** Dispatch must distinguish a local read failure from an actual revision or authorization change. */
+    public boolean matchesForDispatch(ChatContextPlan plan) {
+        try { return matchesCurrent(plan, true); }
+        catch (SQLException error) {
+            var failure = new ChatTurnRejectException(503, "CONTEXT_STORAGE_FAILED",
+                    "发送前的本地上下文复核失败，原历史已保留。\n" + AiUpstreamException.safe(error.getMessage(), null), Map.of("retryable", true));
+            failure.initCause(error);
+            throw failure;
+        }
+    }
+
+    private boolean matchesCurrent(ChatContextPlan plan, boolean requireMemoryAccess) throws SQLException {
         if (plan == null) return false;
-        try {
-            Snapshot current = snapshot(plan.sessionId());
-            return current.historyRevision() == plan.historyRevision()
+        Snapshot current = snapshot(plan.sessionId());
+        return current.historyRevision() == plan.historyRevision()
                     && current.contextGeneration() == plan.contextGeneration()
                     && java.util.Objects.equals(current.summaryRevision(), plan.summaryRevision())
                     && java.util.Objects.equals(current.vaultEpoch(), plan.vaultEpoch())
                     && java.util.Objects.equals(current.vaultRevision(), plan.vaultRevision())
                     && current.policyRevision() == plan.policyRevision()
                     && (!requireMemoryAccess || !plan.memoriesAllowed() || policy.useEligibility().allowed())
-                    && (coordinator == null || Objects.equals(coordinator.revision(plan.sessionId()), plan.continuationRevision()));
-        } catch (SQLException error) {
-            return false;
-        }
+                && (coordinator == null || Objects.equals(coordinator.revision(plan.sessionId()), plan.continuationRevision()));
     }
 
     /**
