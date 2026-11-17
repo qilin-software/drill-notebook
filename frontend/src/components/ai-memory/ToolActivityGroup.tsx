@@ -1,15 +1,32 @@
 import { useEffect, useId, useRef, useState } from 'react';
+import type { ReactNode } from 'react';
 import { Check, ChevronRight, CircleMinus, LoaderCircle, TriangleAlert } from 'lucide-react';
 import { isDeletionTool, isWebTool, toolLabel, webRouteText, toolDuration, toolGroupTitle, toolResultText, toolStartedAt, toolTone } from '../../lib/toolActivity';
 import type { ToolActivity, ToolPhase } from '../../lib/toolActivity';
+import type { ProcessSegment } from '../../lib/processSegment';
 
 interface Props {
   activities: ToolActivity[];
   active?: boolean;
   phase?: ToolPhase;
+  /** 已结束步骤的思考与过渡正文，按 anchor 插在对应工具行之前。 */
+  segments?: ProcessSegment[];
+  /** 过渡正文的渲染方式；不提供时按纯文本显示。 */
+  renderText?: (value: string) => ReactNode;
   onDisclosure?: () => void;
   onOpenSession?: (link: string) => void;
   onOpenMaterial?: (link: string) => void;
+}
+
+function SegmentItem({ segment, renderText }: { segment: ProcessSegment; renderText?: (value: string) => ReactNode }): JSX.Element {
+  return <li className="ai-tool-segment">
+    {segment.reasoning.trim() ? <details className="chat-reasoning">
+      <summary>思考过程</summary>
+      <div className="chat-reasoning-body">{segment.reasoning}</div>
+    </details> : null}
+    {segment.text.trim() ? <div className="ai-tool-commentary">{renderText ? renderText(segment.text) : segment.text}</div> : null}
+    {segment.truncated ? <p className="ai-tool-segment-note">（过程文本过长，后续未保存）</p> : null}
+  </li>;
 }
 
 function StatusIcon({ tone }: { tone: ReturnType<typeof toolTone> }): JSX.Element {
@@ -18,7 +35,7 @@ function StatusIcon({ tone }: { tone: ReturnType<typeof toolTone> }): JSX.Elemen
 }
 
 /** 折叠选择与服务端快照分开保存，事件更新不会抢走用户正在看的详情。 */
-export function ToolActivityGroup({ activities, active = false, phase, onDisclosure, onOpenSession, onOpenMaterial }: Props): JSX.Element | null {
+export function ToolActivityGroup({ activities, active = false, phase, segments = [], renderText, onDisclosure, onOpenSession, onOpenMaterial }: Props): JSX.Element | null {
   const id = useId();
   const historyOnMount = useRef(!active);
   const [manualOpen, setManualOpen] = useState<boolean | null>(null);
@@ -57,6 +74,14 @@ export function ToolActivityGroup({ activities, active = false, phase, onDisclos
     });
   };
 
+  // 步骤排在序号大于其 anchor 的第一条工具行之前；没有后续工具行的步骤排在末尾。
+  const segmentsBefore = (row: ToolActivity, index: number): ProcessSegment[] => {
+    const previous = index === 0 ? -1 : activities[index - 1].sequence;
+    return segments.filter((segment) => segment.anchor >= previous && segment.anchor < row.sequence);
+  };
+  const lastSequence = activities[activities.length - 1].sequence;
+  const trailingSegments = segments.filter((segment) => segment.anchor >= lastSequence);
+
   return <section className="ai-tool-activity" aria-label="工具调用记录">
     <button type="button" className="ai-tool-heading" aria-expanded={open} aria-controls={`${id}-rows`}
       onClick={(event) => toggle(event.currentTarget, () => setManualOpen(!open))}>
@@ -69,7 +94,10 @@ export function ToolActivityGroup({ activities, active = false, phase, onDisclos
     </button>
     <div id={`${id}-rows`} hidden={!open}>
       <ol className="ai-tool-list">
-        {activities.map((row) => <li key={row.sequence} className="ai-tool-row">
+        {activities.flatMap((row, index) => [
+          ...segmentsBefore(row, index).map((segment, offset) =>
+            <SegmentItem key={`segment-${row.sequence}-${offset}`} segment={segment} renderText={renderText} />),
+          <li key={row.sequence} className="ai-tool-row">
           <button type="button" className="ai-tool-row-button" aria-expanded={details.has(row.sequence)}
             aria-controls={`${id}-${row.sequence}`} onClick={(event) => toggle(event.currentTarget, () => {
               setManualOpen(true);
@@ -97,7 +125,9 @@ export function ToolActivityGroup({ activities, active = false, phase, onDisclos
             {row.sessionLink && row.toolName !== 'delete_session' && onOpenSession ? <><dt>目标会话</dt><dd><button type="button" onClick={() => onOpenSession(row.sessionLink!)}>打开会话 ↗</button></dd></> : null}
             {row.sourceLink && row.toolName !== 'delete_material' && !deletedLinks.has(row.sourceLink) && onOpenMaterial ? <><dt>{row.toolName === 'remove_wrong_question' ? '原题' : '保存位置'}</dt><dd><button type="button" onClick={() => onOpenMaterial(row.sourceLink!)}>{row.toolName === 'remove_wrong_question' ? '查看原题' : '查看资料'} ↗</button></dd></> : null}
           </dl>
-        </li>)}
+        </li>])}
+        {trailingSegments.map((segment, offset) =>
+          <SegmentItem key={`segment-end-${offset}`} segment={segment} renderText={renderText} />)}
       </ol>
       {unknownWrite ? <p className="ai-tool-note">部分写入结果未确认，可到记忆库核对。{written ? '已确认的变更已保留。' : ''}</p> : null}
       {unknownDispatch ? <p className="ai-tool-note">部分消息是否已提交尚未确认，可到会话列表核对。</p> : null}

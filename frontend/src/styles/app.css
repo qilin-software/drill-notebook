@@ -1454,6 +1454,13 @@ html[data-theme='dark'] {
 .ai-tool-chevron.is-open { transform: rotate(90deg); }
 .ai-tool-list { padding: 0 0 0 11px; margin: 3px 0 4px 11px; list-style: none; border-left: 1px solid var(--line); max-height: 480px; overflow-y: auto; overscroll-behavior: contain; }
 .ai-tool-row { min-width: 0; }
+/* 过程里的思考与过渡正文：弱化显示，与工具行同列排布。 */
+.ai-tool-segment { min-width: 0; margin: 4px 0 6px; }
+.ai-tool-segment .chat-reasoning { margin: 0 0 4px; }
+.ai-tool-commentary { color: var(--muted); font-size: 12.5px; line-height: 1.6; overflow-wrap: anywhere; }
+.ai-tool-commentary > :first-child { margin-top: 0; }
+.ai-tool-commentary > :last-child { margin-bottom: 0; }
+.ai-tool-segment-note { margin: 2px 0 0; font-size: 11px; color: var(--muted); }
 .ai-tool-time { flex-shrink: 0; padding-top: 1px; font-variant-numeric: tabular-nums; }
 .ai-tool-details { display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: 4px 10px; margin: 2px 0 10px 28px; font-size: 11px; }
 .ai-tool-details[hidden] { display: none; }

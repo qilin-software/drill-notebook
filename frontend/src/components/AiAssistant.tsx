@@ -43,6 +43,7 @@ import { useUiStore } from '../stores/uiStore';
 import { ToolActivityGroup } from './ai-memory/ToolActivityGroup';
 import { mergeToolActivities, readToolActivities, settleToolActivities } from '../lib/toolActivity';
 import type { ToolActivity } from '../lib/toolActivity';
+import { readProcessSegments } from '../lib/processSegment';
 import { isConfirmedToolMutation, refreshToolMutation } from '../lib/toolMutationEffects';
 import { useChatQueue } from '../hooks/useChatQueue';
 import { ChatQueue } from './ai-session/ChatQueue';
@@ -451,6 +452,8 @@ export function AiAssistant(): JSX.Element {
         toolActivities: useMirror ? mirror?.toolActivities
           : settleToolActivities(mergeToolActivities(mirror?.toolActivities, row.toolActivities)),
         toolPhase: mirror?.toolPhase,
+        processSegments: useMirror ? mirror?.processSegments
+          : row.processSegments ? readProcessSegments(row.processSegments) : mirror?.processSegments,
         createdAt: row.createdAt,
         requestId: useMirror ? mirror?.requestId : row.requestId ?? undefined,
         retryOf: mirror?.retryOf,
@@ -894,6 +897,7 @@ export function AiAssistant(): JSX.Element {
           toolActivities: running ? mergeToolActivities(previous?.toolActivities, snapshot.toolActivities)
             : settleToolActivities(mergeToolActivities(previous?.toolActivities, snapshot.toolActivities)),
           toolPhase: snapshot.phase === 'tools' ? 'tools' : 'answer', contextCompacting: running && (snapshot.contextCompaction?.running ?? snapshot.phase === 'compacting'),
+          processSegments: snapshot.processSegments ? readProcessSegments(snapshot.processSegments) : previous?.processSegments,
           contextCompaction: { running: running && (snapshot.contextCompaction?.running ?? snapshot.phase === 'compacting'),
             completed: snapshot.contextCompaction?.completed ?? previous?.contextCompaction?.completed ?? originalAnswer?.contextCompaction?.completed },
           notice: running ? undefined : snapshot.status === 'COMPLETED'
@@ -938,6 +942,10 @@ export function AiAssistant(): JSX.Element {
       case 'activity':
         patchAssistant((prev) => ({ toolActivities: mergeToolActivities(prev.toolActivities, event.activities), toolPhase: event.phase }));
         return;
+      case 'process':
+        // 这次响应转去调用工具：已显示的思考与过渡正文移入过程，回答区回到已确认前缀。
+        patchAssistant(() => ({ processSegments: event.segments, content: event.reply, reasoning: event.reasoning || undefined }));
+        return;
       case 'text':
         patchAssistant((prev) => ({ content: `${String(prev.content)}${event.delta}` }));
         return;
@@ -960,6 +968,7 @@ export function AiAssistant(): JSX.Element {
           turn: { ...event.view, requestId: event.requestId },
           failure: event.view.failure,
           toolActivities: settleToolActivities(mergeToolActivities(prev?.toolActivities, event.view.toolActivities)),
+          processSegments: event.view.processSegments ?? prev?.processSegments,
           streaming: false,
           contextCompacting: false,
           contextCompaction: { running: false, completed: event.view.contextCompaction?.completed ?? prev?.contextCompaction?.completed }
@@ -1443,14 +1452,10 @@ export function AiAssistant(): JSX.Element {
                   className={`chat-message ${item.role}${isAssistant && item._key === lastAssistantKey ? ' is-latest' : ''}${item.id !== undefined && item.id === highlightedMessage ? ' is-jump-target' : ''}`}>
                   {isAssistant && item.model ? <p className="chat-turn-model">{item.model}{item.reasoningEffort ? ` · 思考 ${item.reasoningEffort}` : ''}</p> : null}
                   {isAssistant ? <ContextCompactionStatus state={item.contextCompaction ?? (item.contextCompacting ? { running: true } : undefined)} /> : null}
-                  {isAssistant && item.reasoning ? (
-                    <details className="chat-reasoning" open={item.streaming}>
-                      <summary>思考过程{item.streaming ? '（生成中…）' : ''}</summary>
-                      <div className="chat-reasoning-body">{item.reasoning}</div>
-                    </details>
-                  ) : null}
                   {isAssistant && item.toolActivities?.length ? <ToolActivityGroup
                     activities={item.toolActivities} active={item.streaming} phase={item.toolPhase}
+                    segments={item.processSegments}
+                    renderText={(value) => <MarkdownContent value={value} onSessionLink={setSessionReference} onMaterialLink={openMaterial} />}
                     onOpenSession={(link) => {
                       const target = sessionsQuery.data?.find((entry) => entry.sessionLink === link);
                       if (target) selectSession(target.id);
@@ -1461,6 +1466,12 @@ export function AiAssistant(): JSX.Element {
                     }}
                     onOpenMaterial={openMaterial}
                     onDisclosure={() => { stickyBottomRef.current = false; }} /> : null}
+                  {isAssistant && item.reasoning ? (
+                    <details className="chat-reasoning" open={item.streaming}>
+                      <summary>思考过程{item.streaming ? '（生成中…）' : ''}</summary>
+                      <div className="chat-reasoning-body">{item.reasoning}</div>
+                    </details>
+                  ) : null}
                   {isAssistant && item.supplements?.some((s) => s.state === 'RECEIVED')
                     ? splitReply(text, item.supplements).map((part) => part.role === 'user'
                       ? <div className="chat-supplement" key={part.key}><small>插话 · 已接收</small><MarkdownContent value={part.text} onSessionLink={setSessionReference} onMaterialLink={openMaterial} />

@@ -245,6 +245,7 @@ public class ChatTurnService {
         return switch (started.outcome()) {
             case STARTED -> {
                 handle.toolActivities(retry.activities());
+                handle.processSegments(retry.segments());
                 yield new BeginResult("STARTED",
                         new Lease(requestId, started.turnId(), input.sessionId(), started.userMessageId(),
                                 input.masterPassword(), handle, prepared.sourced(), retry.context()), null, null, null);
@@ -346,7 +347,7 @@ public class ChatTurnService {
             ChatMessageCipher.Encrypted reasoning = reply.reasoning() == null || reply.reasoning().isEmpty()
                     ? null : cipher.encrypt(reply.reasoning(), lease.masterPassword());
             ChatMessageCipher.Encrypted result = cipher.encrypt(resultMeta(status, reply, audit,
-                            lease.handle().toolActivities(), lease.handle().recovery(), lease.handle().contextCompaction().settled(), failure),
+                            lease.handle().toolActivities(), lease.handle().processSegments(), lease.handle().recovery(), lease.handle().contextCompaction().settled(), failure),
                     lease.masterPassword());
             var modelContext = lease.handle().modelContext();
             if (modelContext != null) {
@@ -534,6 +535,8 @@ public class ChatTurnService {
         body.put("reasoningStatus", reasoning.status().name());
         body.put("toolActivities", turn.contentDeletedAt() == null
                 ? toolActivities(requestId, masterPassword) : List.of());
+        body.put("processSegments", turn.contentDeletedAt() == null
+                ? processSegments(requestId, masterPassword) : List.of());
         body.put("recovery", turn.contentDeletedAt() == null ? recovery(requestId, masterPassword).orElse(null) : null);
         body.put("failure", turn.contentDeletedAt() == null ? failure(requestId, masterPassword).orElse(null) : null);
         return body;
@@ -564,10 +567,31 @@ public class ChatTurnService {
         saveRunningProgress(lease);
     }
 
+    /** 过程步骤是界面元数据，与工具活动一起写入检查点，不参与模型上下文。 */
+    public void recordProcessSegments(Lease lease, List<com.drillnotebook.app.model.ProcessSegment> segments) {
+        lease.handle().processSegments(segments);
+        saveRunningProgress(lease);
+    }
+
+    public List<com.drillnotebook.app.model.ProcessSegment> processSegments(String requestId, String masterPassword) {
+        Optional<ActiveTurnRegistry.Handle> active = registry.find(requestId);
+        if (active.isPresent()) return active.get().processSegments();
+        try {
+            Optional<ChatTurnRepository.MetaColumns> meta = turns.findResultMeta(requestId);
+            if (meta.isEmpty()) return List.of();
+            ChatMessageCipher.Read read = cipher.read(meta.get().cipher(), meta.get().crypto(), masterPassword);
+            return read.status() == ChatMessageCipher.ReadStatus.DECRYPTED
+                    ? com.drillnotebook.app.model.ProcessSegment.readMeta(read.value()) : List.of();
+        } catch (SQLException ignored) {
+            return List.of();
+        }
+    }
+
     private void saveRunningProgress(Lease lease) {
         try {
             ChatMessageCipher.Encrypted encrypted = cipher.encrypt(
                     mapper.writeValueAsString(Map.of("schemaVersion", 1, "toolActivities", lease.handle().toolActivities(),
+                            "processSegments", lease.handle().processSegments(),
                             "contextCompaction", lease.handle().contextCompaction().settled())),
                     lease.masterPassword());
             if (!turns.saveRunningResultMeta(lease.requestId(), encrypted.cipher(), encrypted.meta())) {
@@ -828,8 +852,9 @@ public class ChatTurnService {
         return target.requestId();
     }
 
-    private record RetryState(String context, List<ToolActivity> activities) {
-        static final RetryState NONE = new RetryState(null, List.of());
+    private record RetryState(String context, List<ToolActivity> activities,
+                              List<com.drillnotebook.app.model.ProcessSegment> segments) {
+        static final RetryState NONE = new RetryState(null, List.of(), List.of());
     }
 
     /** 原输入必须完全一致；部分输出只作为有界续接数据，已确认的工具活动留在原轮次。 */
@@ -875,7 +900,7 @@ public class ChatTurnService {
                 context.append("部分回答摘录（不完整，仅供参考）：\n").append(RetrievalService.truncateCodepoints(partial.value(), 400));
             }
         }
-        return new RetryState(context.toString(), activities);
+        return new RetryState(context.toString(), activities, processSegments(retryOf, input.masterPassword()));
     }
 
     private void assertCurrentRequest(String requestId) {
@@ -996,7 +1021,8 @@ public class ChatTurnService {
     }
 
     private String resultMeta(String status, UpstreamReply reply, Map<String, Object> audit,
-                               List<ToolActivity> activities, com.drillnotebook.app.model.AiRecovery recovery,
+                               List<ToolActivity> activities, List<com.drillnotebook.app.model.ProcessSegment> segments,
+                               com.drillnotebook.app.model.AiRecovery recovery,
                                 com.drillnotebook.app.model.ContextCompaction compaction, Failure failure) {
         Map<String, Object> meta = new LinkedHashMap<>();
         meta.put("schemaVersion", 1);
@@ -1013,6 +1039,8 @@ public class ChatTurnService {
                         ? 0 : reply.usage().outputTokens()));
         if (audit != null) meta.put("audit", audit);
         if (!activities.isEmpty()) meta.put("toolActivities", activities);
+        // 超过元数据上限而收缩时不保留过程文本，见 bounded。
+        if (!segments.isEmpty()) meta.put("processSegments", segments);
         if (recovery != null) meta.put("recovery", recovery);
         if (compaction.completed()) meta.put("contextCompaction", compaction);
         if (failure != null) meta.put("failure", failure);

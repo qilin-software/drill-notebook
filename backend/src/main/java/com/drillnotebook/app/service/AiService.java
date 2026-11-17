@@ -1317,6 +1317,7 @@ public class AiService {
         result.put("replayed", replayed);
         result.put("reply", reply);
         result.put("toolActivities", chatTurns.toolActivities(requestId, masterPassword));
+        result.put("processSegments", chatTurns.processSegments(requestId, masterPassword));
         result.put("recovery", chatTurns.recovery(requestId, masterPassword).orElse(null));
         result.put("failure", chatTurns.failure(requestId, masterPassword).orElse(null));
         result.put("contextCompaction", chatTurns.contextCompaction(requestId, masterPassword));
@@ -1430,9 +1431,6 @@ public class AiService {
         }
     }
 
-    private record BufferedDelta(String type, String text) {
-    }
-
     /**
      * 普通与 SSE 共用的一轮上游循环：每次请求单独计量、发送前复核计划，工具调用只在内存续写中流转。
      * 轮次的 begin/finalize 仍由调用方各做一次，这里只负责请求级结算。
@@ -1475,13 +1473,13 @@ public class AiService {
             messages.add(Math.max(0, messages.size()-1), Map.of("role", "user", "content",
                     call.pageSnapshot().locator(call.lease().requestId(), toolsByName.containsKey("read_current_page"))));
         }
-        DeltaBuffer buffer = toolMode ? new DeltaBuffer() : null;
         AiTurnBudget limits = SessionExecution.CURRENT.get() == null ? new AiTurnBudget(call.settings())
                 : SessionExecution.CURRENT.get().budget;
         int finalReserve = Math.min(Math.min(call.target().maxTokens(), call.settings().finalOutputTokens()),
                 Math.max(256, AiModelLimits.contextWindow(call.config()) / 4));
         String stopReason = null;
         List<ToolActivity> activities = new ArrayList<>(call.lease().handle().toolActivities());
+        List<com.drillnotebook.app.model.ProcessSegment> segments = call.lease().handle().processSegments();
         var execution=SessionExecution.CURRENT.get();
         var steering=execution==null?null:execution.steering;
         List<SessionExecution.Supplement> supplements=List.of();
@@ -1524,7 +1522,6 @@ public class AiService {
             int budget = 0;
             AiUpstreamClient.Upstream target = withMaxTokens(call.target(), allocation);
             var attempt = new java.util.concurrent.atomic.AtomicReference<String>();
-            if (buffer != null) buffer.clear();
             long start = System.currentTimeMillis();
             AiUpstreamClient.Result result;
             boolean permit=false;
@@ -1540,8 +1537,9 @@ public class AiService {
                 call.lease().handle().modelContextOutputTokens((long) responseTextTokens.tokens() + responseReasoningTokens.tokens());
                 if (call.lease().handle().recovery() != null) emitRecovery(call, null);
                 if(steering!=null&&!sending.isEmpty()&&acknowledged.compareAndSet(false,true))steering.received(sending);
-                if(buffer==null){if("text".equals(type))attemptText.append(text);else if("reasoning".equals(type))attemptReasoning.append(text);}
-                var listener=buffer==null?call.listener():buffer;
+                // 每次响应的增量都实时下发；以工具调用结束的响应稍后整体移入过程步骤。
+                if("text".equals(type))attemptText.append(text);else if("reasoning".equals(type))attemptReasoning.append(text);
+                var listener=call.listener();
                 return listener==null||listener.onDelta(type,text);
             };
             try {
@@ -1650,10 +1648,7 @@ public class AiService {
                     recordTurnContext(call, usage);
                     recordModelOutput(call, partial);
                 }
-                if (buffer != null && partial != null) {
-                    replay(call, buffer, partial);
-                    prefix.append(partial.text()); prefixReasoning.append(partial.reasoning() == null ? "" : partial.reasoning());
-                } else { prefix.append(attemptText); prefixReasoning.append(attemptReasoning); }
+                prefix.append(attemptText); prefixReasoning.append(attemptReasoning);
                 if (upstreamError != null && invoked.get()) {
                     // 等待时释放全局上游并发槽，其他会话仍能正常请求。
                     if (permit) { SessionExecution.UPSTREAM.release(); permit = false; }
@@ -1717,18 +1712,17 @@ public class AiService {
                     result.reasoning() == null ? 0 : result.reasoning().length(),
                     result.finishReason(), result.terminalObserved(), result.captureLimited());
             if ("deadline".equals(result.finishReason())) {
-                return combine(prefix,prefixReasoning,replay(call, buffer, withFinishReason(result, limits.secondsLeft() <= 1 ? "budget_time"
-                        : (result.text().isBlank() && result.reasoning().isBlank() ? "request_timeout_idle" : "request_timeout"))));
+                return combine(prefix,prefixReasoning,withFinishReason(result, limits.secondsLeft() <= 1 ? "budget_time"
+                        : (result.text().isBlank() && result.reasoning().isBlank() ? "request_timeout_idle" : "request_timeout")));
             }
-            if (result.downstreamGone() || result.captureLimited()) return combine(prefix,prefixReasoning,replay(call, buffer, result));
-            if (!result.terminalObserved()) return combine(prefix,prefixReasoning,replay(call, buffer, withFinishReason(result, "stream_error")));
+            if (result.downstreamGone() || result.captureLimited()) return combine(prefix,prefixReasoning,result);
+            if (!result.terminalObserved()) return combine(prefix,prefixReasoning,withFinishReason(result, "stream_error"));
             retry.complete();
             if (call.lease().handle().recovery() != null) emitRecovery(call, null);
             if (!toolMode || result.toolCalls().isEmpty()) {
-                if(combine(prefix,prefixReasoning,result).captureLimited())return combine(prefix,prefixReasoning,replay(call,buffer,result));
+                if(combine(prefix,prefixReasoning,result).captureLimited())return combine(prefix,prefixReasoning,result);
                 var next=steering==null||stopReason!=null||"length".equals(result.finishReason())?List.<SessionExecution.Supplement>of():steering.take(true,prefix.length()+result.text().length());
                 if(!next.isEmpty()){
-                    replay(call,buffer,result);
                     prefix.append(result.text());prefixReasoning.append(result.reasoning()==null?"":result.reasoning());
                     var previousAnswer=new LinkedHashMap<String,Object>();
                     previousAnswer.put("role","assistant");previousAnswer.put("content",result.text().isBlank()?"[已完成当前步骤]":result.text());
@@ -1736,8 +1730,17 @@ public class AiService {
                     messages.addAll(saveModelSegment(call, List.of(previousAnswer), "ASSISTANT_SEGMENT", prefix.length() - result.text().length(), result.text().length()));
                     supplements=next;continue;
                 }
-                return combine(prefix,prefixReasoning,replay(call, buffer, stopReason == null || "length".equals(result.finishReason())
-                        ? result : withFinishReason(result, stopReason)));
+                return combine(prefix,prefixReasoning,stopReason == null || "length".equals(result.finishReason())
+                        ? result : withFinishReason(result, stopReason));
+            }
+            // 这次响应转去调用工具：已实时显示的思考与过渡正文移入过程步骤，回答区回到已确认前缀。
+            if (!result.text().isEmpty() || result.reasoning() != null && !result.reasoning().isEmpty()) {
+                var appended = com.drillnotebook.app.model.ProcessSegment.append(segments, activities.size(), result.reasoning(), result.text());
+                if (appended != segments) {
+                    segments = appended;
+                    chatTurns.recordProcessSegments(call.lease(), segments);
+                }
+                emitProcess(call, segments, prefix.toString(), prefixReasoning.toString());
             }
             // 已关闭工具后供应商仍返回调用，不能执行或把空内容当作完成。
             if (tools.isEmpty()) return combine(prefix,prefixReasoning,budgetStopped(stopReason == null ? "unexpected_tool_calls" : stopReason));
@@ -2250,33 +2253,17 @@ public class AiService {
         }
     }
 
-    private static AiUpstreamClient.Result replay(TurnCall call, DeltaBuffer buffer, AiUpstreamClient.Result result) {
-        if (buffer == null || call.listener() == null) return result;
-        for (BufferedDelta delta : buffer.deltas()) {
-            if (!call.listener().onDelta(delta.type(), delta.text())) {
-                return new AiUpstreamClient.Result(result.text(), result.reasoning(), "aborted",
-                        result.terminalObserved(), result.captureLimited(), true, result.usage(), result.toolCalls());
-            }
-        }
-        return result;
-    }
-
-    /** 工具轮次的增量先缓存；只有确定是最终回答时才回放，工具参数与结果永远不进 SSE。 */
-    private static final class DeltaBuffer implements AiUpstreamClient.StreamListener {
-        private final List<BufferedDelta> deltas = new ArrayList<>();
-
-        @Override
-        public boolean onDelta(String type, String text) {
-            if (text != null && !text.isEmpty()) deltas.add(new BufferedDelta(type, text));
-            return true;
-        }
-
-        void clear() {
-            deltas.clear();
-        }
-
-        List<BufferedDelta> deltas() {
-            return deltas;
+    /** 过程步骤全量 + 回答区应回到的已确认前缀；参数与工具结果永远不进 SSE。 */
+    private static void emitProcess(TurnCall call, List<com.drillnotebook.app.model.ProcessSegment> segments,
+                                    String reply, String reasoning) {
+        if (call.activitySender() == null) return;
+        try {
+            call.activitySender().accept(Map.of("requestId", call.lease().requestId(),
+                    "sessionId", call.lease().sessionId(), "processSegments", List.copyOf(segments),
+                    "reply", reply, "reasoning", reasoning));
+        } catch (RuntimeException error) {
+            call.lease().handle().requestCancel();
+            throw error;
         }
     }
 

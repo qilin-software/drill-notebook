@@ -40,6 +40,7 @@ const run = async (frames: string[], hooks: Partial<StreamCallbacks> = {}): Prom
       },
       onReasoning: hooks.onReasoning ?? (() => undefined),
       onToolActivity: hooks.onToolActivity,
+      onProcess: hooks.onProcess,
       onMetadata: (metadata) => {
         captured.metadata.push(metadata);
         hooks.onMetadata?.(metadata);
@@ -264,5 +265,43 @@ describe('aiStream error 事件与 EOF', () => {
     vi.unstubAllGlobals();
 
     expect(failure).toMatchObject({ message: 'stream cut', requestId: 'r-4', partial: true });
+  });
+});
+
+describe('aiStream process 事件', () => {
+  it('工具步骤结束时交付校验后的过程步骤与回答区前缀，增量顺序保持', async () => {
+    const order: string[] = [];
+    const captured = await run([
+      'event:metadata\ndata:{"requestId":"r-p"}\n\n',
+      'event:reasoning\ndata:{"text":"先想"}\n\n',
+      'event:text\ndata:{"text":"我先查一下"}\n\n',
+      'event:process\ndata:{"requestId":"r-p","sessionId":1,"reply":"","reasoning":"","processSegments":['
+        + '{"anchor":0,"reasoning":"先想","text":"我先查一下","truncated":false,"arguments":"PRIVATE"},'
+        + '{"anchor":-1,"text":"非法锚点"},{"anchor":1,"reasoning":" ","text":""}]}\n\n',
+      'event:text\ndata:{"text":"最终回答"}\n\n',
+      'event:done\ndata:{"requestId":"r-p","reply":"最终回答","processSegments":[{"anchor":0,"reasoning":"先想","text":"我先查一下","truncated":true}]}\n\n'
+    ], {
+      onReasoning: (delta) => order.push(`reasoning:${delta}`),
+      onText: (delta) => order.push(`text:${delta}`),
+      onProcess: (event) => order.push(`process:${JSON.stringify(event)}`)
+    });
+
+    expect(order).toEqual([
+      'reasoning:先想', 'text:我先查一下',
+      'process:{"requestId":"r-p","segments":[{"anchor":0,"reasoning":"先想","text":"我先查一下","truncated":false}],"reply":"","reasoning":""}',
+      'text:最终回答'
+    ]);
+    expect(captured.done).toMatchObject({ reply: '最终回答',
+      processSegments: [{ anchor: 0, reasoning: '先想', text: '我先查一下', truncated: true }] });
+  });
+
+  it('没有 requestId 的 process 帧不构成轮次事件；断流前收到过它算已产出', async () => {
+    const onProcess = vi.fn();
+    const captured = await run([
+      'event:process\ndata:{"processSegments":[{"anchor":0,"text":"x"}],"reply":"","reasoning":""}\n\n',
+      'event:process\ndata:{"requestId":"r-q","processSegments":[{"anchor":0,"text":"x"}],"reply":"","reasoning":""}\n\n'
+    ], { onProcess });
+    expect(onProcess).toHaveBeenCalledTimes(1);
+    expect(captured.noDone).toEqual({ requestId: 'r-q', partial: true });
   });
 });

@@ -33,7 +33,7 @@ docs/
 | 文档 | 内容 |
 |---|---|
 | [state/architecture.md](state/architecture.md) | 项目架构、进程与模块边界、数据与便携约定 |
-| [state/v0.8.3-features.md](state/v0.8.3-features.md) | 当前 v0.8.3：统一上下文管理与窗口阈值压缩已实现，工程验证通过 |
+| [state/v0.8.3-features.md](state/v0.8.3-features.md) | 当前 v0.8.3：上下文管理与压缩、实时流式与过程折叠、缓存用量口径已实现，工程验证通过 |
 | [state/v0.8.1-features.md](state/v0.8.1-features.md) | v0.8.1 功能与既有验证：失败重连、会话内对话跳转、助手模型选择持久化及页面适配 |
 | [state/data-model.md](state/data-model.md) | 当前数据库表与关键约束（schema 22）；完整 DDL 以 `backend/src/main/resources/schema.sql` 为准 |
 | [state/api-contracts.md](state/api-contracts.md) | 核心 REST / SSE 契约与错误格式 |
@@ -59,7 +59,7 @@ docs/
 2. 需求变更直接原地覆盖，不新增「补充决策」文档。
 3. 功能完成后标记结果并同步状态，施工材料保留至本版收尾；**下一版本开始前**统一移入 `docs/archive/<version>/`。归档时保留真实未完成项和验收限制，不以归档代替验收。
 
-当前施工为 [v0.8.3](state/v0.8.3-features.md) 的[上下文管理与压缩](work/ai-context-management/spec.md)，统一地基、结构化摘要、窗口预检、配置与进度已实现；源码分工见[实现说明](work/ai-context-management/implementation.md)，结果见[验证记录](work/ai-context-management/qa.md)。2026-11-15 已将 v0.8.2 清单、三个施工目录和草图共 16 份原文件移入[版本归档](archive/v0.8.2/README.md)。其中 `ai-conversation/` 包含 v0.8.1 与 v0.8.2 的连续施工记录，统一归档后继续供[v0.8.1 历史清单](state/v0.8.1-features.md)引用；原工程验证、匿名探测、实机 / 真实账户边界保留。此前的 [v0.8.0](archive/v0.8.0/README.md)、[v0.7.3](archive/v0.7.3/README.md)与 [v0.7.2](archive/v0.7.2/README.md)归档继续保留，历史测试见[测试清单](test/QA_CHECKLIST.md)。
+当前施工为 [v0.8.3](state/v0.8.3-features.md) 的[上下文管理与压缩](work/ai-context-management/spec.md)，统一地基、结构化摘要、窗口预检、配置与进度已实现；源码分工见[实现说明](work/ai-context-management/implementation.md)，结果见[验证记录](work/ai-context-management/qa.md)。同版的实时流式、过程折叠与缓存用量口径见 [UI/UX](work/ai-live-stream/ui-ux.md)、[规格](work/ai-live-stream/spec.md)和[计划](work/ai-live-stream/plan.md)，已实现，实机观感待验收。2026-11-15 已将 v0.8.2 清单、三个施工目录和草图共 16 份原文件移入[版本归档](archive/v0.8.2/README.md)。其中 `ai-conversation/` 包含 v0.8.1 与 v0.8.2 的连续施工记录，统一归档后继续供[v0.8.1 历史清单](state/v0.8.1-features.md)引用；原工程验证、匿名探测、实机 / 真实账户边界保留。此前的 [v0.8.0](archive/v0.8.0/README.md)、[v0.7.3](archive/v0.7.3/README.md)与 [v0.7.2](archive/v0.7.2/README.md)归档继续保留，历史测试见[测试清单](test/QA_CHECKLIST.md)。
 
 ## 3. 测试文档
 

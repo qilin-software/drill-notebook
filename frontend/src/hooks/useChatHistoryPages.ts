@@ -20,6 +20,7 @@ export interface ChatHistoryMessage {
   supplements?: import('../lib/chatQueue').ChatSupplement[];
   finishReason?: string;
   toolActivities?: import('../lib/toolActivity').ToolActivity[];
+  processSegments?: import('../lib/processSegment').ProcessSegment[];
   id: number;
   role: 'user' | 'assistant' | 'system';
   content: string;

@@ -932,6 +932,9 @@ public class AiUpstreamClient {
         Integer cacheRead = intOrNull(details.path("cached_tokens"));
         // DeepSeek 等网关把命中数放在 usage 顶层；两处都没有才算未回报。
         if (cacheRead == null) cacheRead = intOrNull(usage.path("prompt_cache_hit_tokens"));
+        // 只回报未命中数时由输入反推；命中数是输入的子集，不会小于 0。
+        Integer cacheMiss = intOrNull(usage.path("prompt_cache_miss_tokens"));
+        if (cacheRead == null && cacheMiss != null && input != null) cacheRead = Math.max(0, input - cacheMiss);
         Integer cacheWrite = intOrNull(details.path("cache_write_tokens"));
         if (input == null && output == null && cacheRead == null && cacheWrite == null) return Usage.unknown();
         return new Usage("provider", input, output, cacheRead, cacheWrite, true);

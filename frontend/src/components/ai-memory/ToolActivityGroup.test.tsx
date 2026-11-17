@@ -163,4 +163,28 @@ describe('工具活动折叠和真实结果', () => {
     expect(JSON.stringify(read)).not.toContain('private');
     expect(readToolActivities(null)).toEqual([]);
   });
+  it('过程步骤按锚点插在工具行之前，思考默认收起，结束后整组自动折叠', () => {
+    const second = { ...ended, sequence: 2, toolName: 'read_notebook' as const, count: 1 };
+    const segments = [
+      { anchor: 0, reasoning: '先确认目标', text: '我先查一下记忆。', truncated: false },
+      { anchor: 1, reasoning: '', text: '再读一下笔记。', truncated: false },
+      { anchor: 2, reasoning: '', text: '工具已停止后的说明。', truncated: true }
+    ];
+    const view = render(<ToolActivityGroup activities={[ended, second]} segments={segments} active
+      renderText={(value) => <em>{value}</em>} />);
+    const items = [...document.querySelectorAll('.ai-tool-list > li')];
+    expect(items.map((item) => item.className)).toEqual(
+      ['ai-tool-segment', 'ai-tool-row', 'ai-tool-segment', 'ai-tool-row', 'ai-tool-segment']);
+    expect(items[0]).toHaveTextContent('我先查一下记忆。');
+    expect(items[2]).toHaveTextContent('再读一下笔记。');
+    expect(items[4]).toHaveTextContent('（过程文本过长，后续未保存）');
+    expect(items[0].querySelector('em')).toHaveTextContent('我先查一下记忆。');
+    expect(items[0].querySelector('details')).not.toHaveAttribute('open');
+    expect(screen.getByText('先确认目标')).toBeInTheDocument();
+    expect(items[2].querySelector('details')).toBeNull();
+    expect(screen.getByRole('button', { name: /已检索记忆/ })).toHaveAttribute('aria-expanded', 'true');
+    view.rerender(<ToolActivityGroup activities={[ended, second]} segments={segments} />);
+    expect(screen.getByRole('button', { name: /已检索记忆/ })).toHaveAttribute('aria-expanded', 'false');
+    expect(screen.getByText('我先查一下记忆。')).not.toBeVisible();
+  });
 });

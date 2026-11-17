@@ -67,6 +67,12 @@ public class SessionDispatchService {
         synchronized void event(String name,Map<String,Object> value) {
             if (name.equals("text")) { text.append(value.get("text")); phase="answer"; }
             if (name.equals("reasoning")) { reasoning.append(value.get("text")); phase="thinking"; }
+            if (name.equals("process")) {
+                // 步骤移入过程后，内存里的回答 / 思考回到已确认前缀，重订阅与快照才不会重复显示。
+                text.setLength(0); text.append(Objects.toString(value.get("reply"),""));
+                reasoning.setLength(0); reasoning.append(Objects.toString(value.get("reasoning"),""));
+                var merged=new LinkedHashMap<>(metadata); merged.put("processSegments",value.get("processSegments")); metadata=merged;
+            }
             if (name.equals("metadata") || name.equals("tool_activity")) {
                 var merged=new LinkedHashMap<>(metadata); merged.putAll(value); metadata=merged;
                 if(value.containsKey("phase"))phase=String.valueOf(value.get("phase"));
@@ -414,7 +420,8 @@ public class SessionDispatchService {
                     var row=pending.find(run.receipt.requestId());
                     if(row!=null&&"PENDING".equals(row.state())){pending.state(run.receipt.requestId(),"CONSUMED");payloadCache.remove(run.receipt.requestId());}
                 }
-                run.event(event.containsKey("toolActivities") ? "tool_activity" : "metadata",event);
+                run.event(event.containsKey("processSegments") ? "process"
+                        : event.containsKey("toolActivities") ? "tool_activity" : "metadata",event);
                 if(run.cancelled) turns.cancelActive(run.receipt.requestId());
             });
             state=result.status();
@@ -542,6 +549,8 @@ public class SessionDispatchService {
         synchronized(run) {
             var metadata=new LinkedHashMap<>(run.metadata);metadata.put("requestId",id);metadata.put("sessionId",run.receipt.sessionId());
             subscriber.accept("metadata",metadata);
+            if(run.metadata.containsKey("processSegments")) subscriber.accept("process",Map.of("requestId",id,"sessionId",run.receipt.sessionId(),
+                    "processSegments",run.metadata.get("processSegments"),"reply","","reasoning",""));
             if(!run.text.isEmpty()) subscriber.accept("text",Map.of("text",run.text.toString()));
             if(!run.reasoning.isEmpty()) subscriber.accept("reasoning",Map.of("text",run.reasoning.toString()));
             if(run.metadata.containsKey("toolActivities")) subscriber.accept("tool_activity",run.metadata);

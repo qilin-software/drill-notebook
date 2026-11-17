@@ -32,6 +32,7 @@ public class ActiveTurnRegistry {
         private final AtomicBoolean cancelRequested = new AtomicBoolean();
         private volatile Runnable abortHook;
         private volatile List<ToolActivity> toolActivities = List.of();
+        private volatile List<com.drillnotebook.app.model.ProcessSegment> processSegments = List.of();
         private volatile AiRecovery recovery;
         private volatile com.drillnotebook.app.model.ContextCompaction contextCompaction = com.drillnotebook.app.model.ContextCompaction.NONE;
         /** 当前轮尚未落库的回复长度；只保存数值，不保留流式正文。 */
@@ -105,6 +106,11 @@ public class ActiveTurnRegistry {
 
         public void toolActivities(List<ToolActivity> activities) {
             toolActivities = List.copyOf(activities);
+        }
+
+        public List<com.drillnotebook.app.model.ProcessSegment> processSegments() { return processSegments; }
+        public void processSegments(List<com.drillnotebook.app.model.ProcessSegment> segments) {
+            processSegments = List.copyOf(segments);
         }
 
         /** 用户主动停止：置标志并中断尚未结束的读取；重复点击只有第一次算数。 */

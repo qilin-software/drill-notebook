@@ -246,6 +246,8 @@ export interface ChatMessage {
   supplements?: import('./chatQueue').ChatSupplement[];
   toolActivities?: import('./toolActivity').ToolActivity[];
   toolPhase?: import('./toolActivity').ToolPhase;
+  /** 已结束步骤的思考与过渡正文，展示在折叠的过程里。 */
+  processSegments?: import('./processSegment').ProcessSegment[];
   id?: number;
   role: 'user' | 'assistant' | 'system';
   content: string | ChatContentPart[];

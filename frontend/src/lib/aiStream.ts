@@ -3,8 +3,10 @@ import { readToolActivities } from './toolActivity';
 import type { ToolActivity, ToolPhase } from './toolActivity';
 import { readRecovery } from './aiRecovery';
 import type { AiRecovery } from './aiRecovery';
+import { readProcessSegments } from './processSegment';
+import type { ProcessSegment } from './processSegment';
 
-/** SSE 流式聊天客户端：解析后端 /api/ai/chat/stream 的 text|reasoning|done|error 事件。 */
+/** SSE 流式聊天客户端：解析后端 /api/ai/chat/stream 的 text|reasoning|process|done|error 事件。 */
 
 /** §4.2 的"统一结果"里与本轮上下文有关的几块，done 与 metadata 共用同一份字段集。 */
 export interface MemoryReference {
@@ -69,6 +71,8 @@ export interface ChatResultView {
   supplements?: import('./chatQueue').ChatSupplement[];
   finishReason?: string;
   toolActivities?: ToolActivity[];
+  /** 已结束步骤的思考与过渡正文；全量快照，按发生顺序。 */
+  processSegments?: ProcessSegment[];
   protocolVersion?: number;
   requestId?: string;
   sessionId?: number;
@@ -114,6 +118,8 @@ export interface StreamErrorInfo {
 
 export interface StreamCallbacks {
   onToolActivity?: (event: { requestId: string; toolActivities: ToolActivity[]; phase: ToolPhase }) => void;
+  /** 一次响应转去调用工具：步骤移入过程，回答 / 思考区回到 reply / reasoning。 */
+  onProcess?: (event: { requestId: string; segments: ProcessSegment[]; reply: string; reasoning: string }) => void;
   onText: (delta: string) => void;
   onReasoning: (delta: string) => void;
   /** 发送前的元数据（requestId + 计划态）：拿到后前端才能在"停止"时调用取消接口。 */
@@ -144,6 +150,7 @@ function resultView(payload: Record<string, unknown> | null): ChatResultView {
       if (payload[key] !== undefined) view[key] = payload[key];
     }
     if (Array.isArray(payload.toolActivities)) view.toolActivities = readToolActivities(payload.toolActivities);
+    if (Array.isArray(payload.processSegments)) view.processSegments = readProcessSegments(payload.processSegments);
     const failure = asRecord(payload.failure);
     if (payload.failure === null) view.failure = null;
     else if (typeof failure?.code === 'string' && typeof failure.message === 'string') {
@@ -232,7 +239,7 @@ export async function streamChat(path: string, body: unknown, callbacks: StreamC
       }
       const payload = asRecord(parsed);
       const text = textField(payload, 'text');
-      if (eventName === 'text' || eventName === 'reasoning' || eventName === 'tool_activity') produced = true;
+      if (eventName === 'text' || eventName === 'reasoning' || eventName === 'tool_activity' || eventName === 'process') produced = true;
       else if (eventName === 'done' || eventName === 'error') settled = true;
       if (eventName === 'text') callbacks.onText(text);
       else if (eventName === 'reasoning') callbacks.onReasoning(text);
@@ -249,6 +256,13 @@ export async function streamChat(path: string, body: unknown, callbacks: StreamC
           lastRequestId = requestId;
           callbacks.onToolActivity?.({ requestId, toolActivities: readToolActivities(payload?.toolActivities),
             phase: payload?.phase === 'answer' ? 'answer' : 'tools' });
+        }
+      } else if (eventName === 'process') {
+        const requestId = textField(payload, 'requestId');
+        if (requestId) {
+          lastRequestId = requestId;
+          callbacks.onProcess?.({ requestId, segments: readProcessSegments(payload?.processSegments),
+            reply: textField(payload, 'reply'), reasoning: textField(payload, 'reasoning') });
         }
       } else if (eventName === 'done') {
         callbacks.onDone({ ...resultView(payload), reply: textField(payload, 'reply'),
